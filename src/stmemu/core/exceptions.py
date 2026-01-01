@@ -1,0 +1,2 @@
+class EmuError(Exception):
+    pass
