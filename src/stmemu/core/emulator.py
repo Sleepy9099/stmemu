@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List
 from stmemu.peripherals.core_cm import CortexMCorePeripheral  # add
 from stmemu.core.disasm import ThumbDisassembler
 
@@ -58,6 +58,15 @@ from stmemu.utils.bits import mask_for_size
 
 log = get_logger(__name__)
 
+CondSpec = Tuple[str, str, int]  # (PERIPH, REG, VALUE)
+
+@dataclass
+class PcRegWrite:
+    pc: int
+    peripheral: str
+    register: str
+    value: int
+    cond: Optional[CondSpec] = None
 
 def _u32(b: bytes, off: int) -> int:
     return int.from_bytes(b[off : off + 4], "little", signed=False)
@@ -71,6 +80,7 @@ class Emulator:
     sram_base: int
     sram_size: int
     core_peripheral: Optional[CortexMCorePeripheral] = None
+    pc_reg_writes: list[PcRegWrite] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
@@ -105,6 +115,7 @@ class Emulator:
         self._trace_prev_disasm: str | None = None
         self._trace_prev_mmio_touched: bool = False
         self._trace_stop_after_prev: bool = False
+        self.pc_reg_writes: List[PcRegWrite] = []
 
     def _map_memory(self) -> None:
         # Flash: map enough pages for image (round up)
@@ -139,6 +150,9 @@ class Emulator:
                 # already mapped or overlap; ok
                 pass
 
+    def add_pc_reg_write(self, w: PcRegWrite) -> None:
+         self.pc_reg_writes.append(w)
+         
     def _install_hooks(self) -> None:
         self.uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED, self._hook_unmapped_read)
         self.uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, self._hook_unmapped_write)
@@ -573,6 +587,8 @@ class Emulator:
     def _hook_code(self, uc, address, size, user_data):
         pc = int(address)
 
+        self._apply_pc_reg_writes( int(address))
+
         if self.trace_enabled:
             try:
                 addr = pc & ~1  # Thumb alignment
@@ -679,3 +695,113 @@ class Emulator:
         self._trace_prev_disasm = None
         self._trace_prev_mmio_touched = False
         self._trace_stop_after_prev = False
+
+    def _apply_pc_reg_writes(self, pc: int):
+        if not self.pc_reg_writes:
+            return
+
+        for w in list(self.pc_reg_writes):
+            if pc != w.pc:
+                continue
+
+            per = w.peripheral.upper()
+            reg = w.register.upper()
+
+            # Resolve (periph, reg) -> absolute address
+            p = self.bus.amap.find_peripheral_by_name(per)
+            if p is None:
+                log.warning("ATPC fired @0x%08X but peripheral not found: %s", pc, per)
+                continue
+
+            # Common patterns in your codebase:
+            # - peripheral.registers is iterable of SVD registers with .name and .address_offset
+            # - or you maintain p.registers_by_name
+            r = None
+            if hasattr(p, "registers_by_name"):
+                r = p.registers_by_name.get(reg)
+            else:
+                for rr in getattr(p, "registers", ()):
+                    if getattr(rr, "name", "").upper() == reg:
+                        r = rr
+                        break
+
+            if r is None:
+                log.warning("ATPC fired @0x%08X but register not found: %s.%s", pc, per, reg)
+                continue
+
+            off = getattr(r, "address_offset", None)
+            if off is None:
+                # Some SVD models call it "offset"
+                off = getattr(r, "offset", None)
+            if off is None:
+                log.warning("ATPC fired @0x%08X but reg has no offset: %s.%s", pc, per, reg)
+                continue
+
+            addr = int(p.base_address) + int(off)
+
+            # --- conditional logic ---
+            if w.cond is not None:
+                c_per, c_reg, c_val = w.cond
+                c_per = c_per.upper()
+                c_reg = c_reg.upper()
+
+                cp = self.bus.amap.find_peripheral_by_name(c_per)
+                if cp is None:
+                    log.info(
+                        "ATPC cond @0x%08X: %s.%s == 0x%X ? peripheral missing -> SKIP",
+                        pc, c_per, c_reg, c_val
+                    )
+                    continue
+
+                cr = None
+                if hasattr(cp, "registers_by_name"):
+                    cr = cp.registers_by_name.get(c_reg)
+                else:
+                    for rr in getattr(cp, "registers", ()):
+                        if getattr(rr, "name", "").upper() == c_reg:
+                            cr = rr
+                            break
+
+                if cr is None:
+                    log.info(
+                        "ATPC cond @0x%08X: %s.%s == 0x%X ? reg missing -> SKIP",
+                        pc, c_per, c_reg, c_val
+                    )
+                    continue
+
+                c_off = getattr(cr, "address_offset", None)
+                if c_off is None:
+                    c_off = getattr(cr, "offset", None)
+                if c_off is None:
+                    log.info(
+                        "ATPC cond @0x%08X: %s.%s == 0x%X ? no offset -> SKIP",
+                        pc, c_per, c_reg, c_val
+                    )
+                    continue
+
+                c_addr = int(cp.base_address) + int(c_off)
+
+                # Read current value via the bus (so it matches your MMIO model)
+                cur = self.bus.read(c_addr, 4)
+
+                if int(cur) != int(c_val):
+                    log.info(
+                        "ATPC cond @0x%08X: %s.%s == 0x%X ? current=0x%X -> SKIP",
+                        pc, c_per, c_reg, c_val, cur
+                    )
+                    continue
+                else:
+                    log.info(
+                        "ATPC cond @0x%08X: %s.%s == 0x%X ? current=0x%X -> APPLY",
+                        pc, c_per, c_reg, c_val, cur
+                    )
+
+            # Perform the write through the bus so it updates your peripheral model
+            self.bus.write(addr, 4, int(w.value))
+
+            # --- trace integration: always print when firing ---
+            # This is the part you asked for: "atpc + trace integration (print when firing)"
+            log.info(
+                "ATPC fired @0x%08X: %s.%s <= 0x%X",
+                pc, per, reg, int(w.value)
+            )

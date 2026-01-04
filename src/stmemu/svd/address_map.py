@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, Optional
 
 from stmemu.svd.model import SvdDevice, SvdPeripheral, SvdRegister
 
@@ -15,10 +15,26 @@ class PeripheralRange:
 
 
 @dataclass(frozen=True)
+class AddressRange:
+    base: int
+    end: int
+    peripheral: SvdPeripheral
+
+@dataclass(frozen=True)
 class AddressMap:
     device_name: str
     peripherals: tuple[SvdPeripheral, ...]
-    ranges: tuple[PeripheralRange, ...]
+    ranges: tuple[AddressRange, ...] = ()
+    _by_name: Dict[str, SvdPeripheral] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Build a stable uppercase name -> peripheral map
+        m: Dict[str, SvdPeripheral] = {}
+        for r in self.ranges:
+            p = r.peripheral
+            if p and p.name:
+                m[p.name.upper()] = p
+        object.__setattr__(self, "_by_name", m)
 
     def find_peripheral(self, addr: int) -> Optional[SvdPeripheral]:
         # simple linear scan is fine for MVP; upgrade to bisect later
@@ -34,6 +50,10 @@ class AddressMap:
                 return reg
         return None
 
+    def find_peripheral_by_name(self, name: str) -> Optional[SvdPeripheral]:
+        if not name:
+            return None
+        return self._by_name.get(name.upper())
 
 def build_address_map(device: SvdDevice) -> AddressMap:
     ranges = []

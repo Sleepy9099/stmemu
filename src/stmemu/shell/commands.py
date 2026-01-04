@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from sys import argv
 
-from stmemu.core.emulator import Emulator
+from stmemu.core.emulator import Emulator, PcRegWrite
 from stmemu.peripherals.bus import PeripheralBus
 from stmemu.utils.hexdump import hexdump
 from stmemu.core.disasm import ThumbDisassembler
@@ -402,3 +403,78 @@ class Commands:
 
         return "usage: trace [on|off|mmio|until <pc>]"
 
+    def cmd_atpc(self, argv):
+        # Syntax:
+        #   atpc <pc> PERIPH.REG = <value> [if PERIPH.REG == <value>]
+        #
+        # Examples:
+        #   atpc 0x08003D44 USART3.ISR = 0x40
+        #   atpc 0x08003D44 USART3.ISR = 0x40 if USART3.ISR == 0x0
+
+        if len(argv) < 4:
+            raise ValueError("usage: atpc <pc> PERIPH.REG = <value> [if PERIPH.REG == <value>]")
+
+        pc = self._parse_int(argv[0])
+        periph, reg = self._parse_reg_spec(argv[1])
+
+        if argv[2] != "=":
+            raise ValueError("usage: atpc <pc> PERIPH.REG = <value> [if PERIPH.REG == <value>]")
+
+        value = self._parse_int(argv[3])
+
+        cond = None
+        if len(argv) > 4:
+            # expect: if X == Y
+            if argv[4].lower() != "if":
+                raise ValueError("expected 'if' or end of command")
+            if len(argv) < 8:
+                raise ValueError("usage: ... if PERIPH.REG == <value>")
+
+            c_per, c_reg = self._parse_reg_spec(argv[5])
+
+            op = argv[6]
+            if op not in ("==", "="):
+                raise ValueError("condition must use '==' (or '=')")
+
+            c_val = self._parse_int(argv[7])
+            cond = (c_per, c_reg, c_val)
+
+        # PcRegWrite is in core/emulator.py (import where you already keep it)
+        from stmemu.core.emulator import PcRegWrite
+
+        self.emu.add_pc_reg_write(PcRegWrite(
+            pc=pc,
+            peripheral=periph,
+            register=reg,
+            value=value,
+            cond=cond,
+        ))
+
+        if cond:
+            c_per, c_reg, c_val = cond
+            return f"pc-action added: @0x{pc:X} {periph}.{reg} = 0x{value:X} if {c_per}.{c_reg} == 0x{c_val:X}"
+        return f"pc-action added: @0x{pc:X} {periph}.{reg} = 0x{value:X}"
+
+    def cmd_atpc_list(self, argv):
+        out = []
+        for w in self.emu.pc_reg_writes:
+            out.append(
+                f"@0x{w.pc:X} {w.peripheral}.{w.register} {w.mode} 0x{w.value:X} "
+                f"{'(fired)' if w.fired else ''}"
+            )
+        return "\n".join(out) or "(no pc actions)"
+
+    def cmd_atpc_clear(self, argv):
+        self.emu.pc_reg_writes.clear()
+        return "pc actions cleared"
+
+    def _parse_reg_spec(self, s: str) -> tuple[str, str]:
+        # "USART3.ISR" -> ("USART3", "ISR")
+        if "." not in s:
+            raise ValueError("expected PERIPH.REG")
+        p, r = s.split(".", 1)
+        return p.strip().upper(), r.strip().upper()
+
+    def _parse_int(self, s: str) -> int:
+        s = s.strip()
+        return int(s, 0)  # supports 0x..., decimal
