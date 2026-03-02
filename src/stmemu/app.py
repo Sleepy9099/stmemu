@@ -5,12 +5,10 @@ from pathlib import Path
 from stmemu.utils.logger import get_logger, setup_logging
 from stmemu.svd.svd_loader import load_svd
 from stmemu.svd.address_map import build_address_map
-from stmemu.peripherals.bus import PeripheralBus
-from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.core.loader import load_raw_bin
 from stmemu.core.emulator import Emulator
 from stmemu.shell.shell import StmEmuShell
-from stmemu.peripherals.core_cm import CortexMCorePeripheral
+from stmemu.peripherals.factory import build_default_bus
 
 log = get_logger(__name__)
 
@@ -37,29 +35,14 @@ def run_app(
     device = load_svd(svd_path)
     amap = build_address_map(device)
 
-    bus = PeripheralBus(amap)
-    # Register generic models for all peripherals from SVD by default
-    for p in amap.peripherals:
-        model = GenericRegisterFilePeripheral(p)
-
-        # Break the early boot wait loop:
-        # at PC 0x08003D24 firmware polls PWR register @ offset 0x04 waiting for bit13 to go high.
-        if p.name == "PWR":
-            model.force_bit_after_reads(0x04, 13, reads_before_set=10)
-
-        bus.register_peripheral(p.name, model)
-
-
-    # Register minimal Cortex-M core peripheral model (SCB/NVIC/SysTick region)
-    core = CortexMCorePeripheral(vtor=base_addr)
-    # We don't have an SVD peripheral for this; so we handle it via a special-case in Emulator hooks:
+    bus, core = build_default_bus(amap, flash_base=base_addr)
     emu = Emulator(
         bus=bus,
         flash_base=base_addr,
         flash_image=fw,
         sram_base=sram_base,
         sram_size=sram_size,
-        core_peripheral=core,   # <-- add
+        core_peripheral=core,
     )
 
     emu.boot_from_vector_table(flash_base=base_addr)

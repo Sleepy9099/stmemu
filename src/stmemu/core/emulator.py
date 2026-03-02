@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
-from stmemu.peripherals.core_cm import CortexMCorePeripheral  # add
+from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.core.disasm import ThumbDisassembler
 
-from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
+from unicorn import Uc, UcError, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
 from unicorn.arm_const import (
     UC_ARM_REG_PC,
     UC_ARM_REG_SP,
@@ -54,11 +54,17 @@ except Exception:
 
 from stmemu.peripherals.bus import PeripheralBus
 from stmemu.utils.logger import get_logger
-from stmemu.utils.bits import mask_for_size
-
 log = get_logger(__name__)
 
 CondSpec = Tuple[str, str, int]  # (PERIPH, REG, VALUE)
+EXC_RETURN_HANDLER_MSP = 0xFFFFFFF1
+EXC_RETURN_THREAD_MSP = 0xFFFFFFF9
+EXC_RETURN_THREAD_PSP = 0xFFFFFFFD
+EXC_RETURN_VALUES = {
+    EXC_RETURN_HANDLER_MSP,
+    EXC_RETURN_THREAD_MSP,
+    EXC_RETURN_THREAD_PSP,
+}
 
 @dataclass
 class PcRegWrite:
@@ -90,18 +96,10 @@ class Emulator:
         # Each entry: {"name": str, "start": int, "end": int, "access": "r"|"w"|"rw"}
         self._mmio_breakpoints: list[dict] = []
         self.last_mmio_break: dict | None = None
+        self.last_pc_break: int | None = None
 
         self._map_memory()
         self._install_hooks()
-        self._core = {
-            "vtor": self.flash_base,
-            "demcr": 0,
-            "dwt_ctrl": 0,
-            "cyccnt": 0,
-            "systick_ctrl": 0,
-            "systick_load": 0,
-            "systick_val": 0,
-        }
         self._pc_hist = {}
         self._last_stuck_report = 0
         self.trace_enabled = False
@@ -116,6 +114,9 @@ class Emulator:
         self._trace_prev_mmio_touched: bool = False
         self._trace_stop_after_prev: bool = False
         self.pc_reg_writes: List[PcRegWrite] = []
+        self._exception_stack: list[int] = []
+        self._special_step_consumed = False
+        self._ignore_breakpoint_once: int | None = None
 
     def _map_memory(self) -> None:
         # Flash: map enough pages for image (round up)
@@ -133,14 +134,9 @@ class Emulator:
         self.uc.mem_map(self.sram_base, sram_size, UC_PROT_ALL)
         log.info("Mapped sram : 0x%08X-0x%08X (%d bytes)", self.sram_base, self.sram_base + sram_size, sram_size)
 
-        # Cortex-M System Control Space (SCS): 0xE000E000 - 0xE0100000 (1 MB)
-        # Contains SCB, NVIC, SysTick, etc. Firmware often writes VTOR early.
-        self.uc.mem_map(0xE000E000, 0x00100000, UC_PROT_ALL)
-        log.info("Mapped SCS  : 0x%08X-0x%08X (%d bytes)", 0xE000E000, 0xE000E000 + 0x00100000, 0x00100000)
-
-        for r in self.bus.amap.ranges:
-            base = r.base & ~0xFFF
-            end = (r.end + 0xFFF) & ~0xFFF
+        for mounted in self.bus.mounted_ranges():
+            base = mounted.base & ~0xFFF
+            end = (mounted.end + 0xFFF) & ~0xFFF
             size = end - base
             if size <= 0:
                 continue
@@ -158,10 +154,8 @@ class Emulator:
         self.uc.hook_add(UC_HOOK_MEM_WRITE_UNMAPPED, self._hook_unmapped_write)
         self.uc.hook_add(UC_HOOK_MEM_FETCH_UNMAPPED, self._hook_unmapped_fetch)
         self.uc.hook_add(UC_HOOK_INSN_INVALID, self._hook_insn_invalid)
-        # self.uc.hook_add(UC_HOOK_MEM_READ, self._hook_mem_read, begin=0xE0000000, end=0xE010FFFF)
-        # self.uc.hook_add(UC_HOOK_MEM_WRITE, self._hook_mem_write, begin=0xE0000000, end=0xE010FFFF)
         self.uc.hook_add(UC_HOOK_CODE, self._hook_code)
-        for r in self.bus.amap.ranges:
+        for r in self.bus.mounted_ranges():
             # Unicorn end is inclusive
             self.uc.hook_add(UC_HOOK_MEM_READ, self._hook_mmio_read, begin=r.base, end=r.end - 1)
             self.uc.hook_add(UC_HOOK_MEM_WRITE, self._hook_mmio_write, begin=r.base, end=r.end - 1)
@@ -297,28 +291,26 @@ class Emulator:
             return
 
     def step(self, count: int = 1) -> None:
-        start = self.pc | 1
         self.last_mmio_break = None
+        self.last_pc_break = None
         self._running = True
         try:
-            self.uc.emu_start(start, self.flash_end, count=count)
+            self._execute(count)
         finally:
             self._running = False
         # Flush pending trace output (esp. for trace mmio mode).
         self.flush_trace()
-        self._tick_core(count)
 
     def run(self, max_instructions: int = 100000) -> None:
-        start = self.pc | 1
         self.last_mmio_break = None
+        self.last_pc_break = None
         self._running = True
         try:
-            self.uc.emu_start(start, self.flash_end, count=max_instructions)
+            self._execute(max_instructions)
         finally:
             self._running = False
         # Flush pending trace output (esp. for trace mmio mode).
         self.flush_trace()
-        self._tick_core(max_instructions)
 
     # ---- register helpers
 
@@ -487,105 +479,141 @@ class Emulator:
         except Exception:
             pass
 
-    # Core register addresses (Cortex-M)
-    _SCB_VTOR   = 0xE000ED08
-    _SCB_DEMCR  = 0xE000EDFC
+    def _execute(self, max_instructions: int) -> None:
+        executed = 0
+        self._ignore_breakpoint_once = (self.pc & ~1) if ((self.pc & ~1) in self._breakpoints) else None
+        while executed < max_instructions:
+            if self._handle_exception_return():
+                continue
 
-    _DWT_CTRL   = 0xE0001000
-    _DWT_CYCCNT = 0xE0001004
+            if self._deliver_pending_exception():
+                continue
 
-    _SYST_CSR   = 0xE000E010
-    _SYST_RVR   = 0xE000E014
-    _SYST_CVR   = 0xE000E018
+            start = self.pc | 1
+            self._special_step_consumed = False
+            try:
+                self.uc.emu_start(start, self.flash_end, count=1)
+            except UcError:
+                if not self._special_step_consumed:
+                    raise
+            executed += 1
+            self.bus.tick(1)
 
-    def _tick_core(self, instructions: int = 1) -> None:
-        # crude but effective: advance cycle counter proportional to executed instructions
-        self._core["cyccnt"] = (self._core["cyccnt"] + instructions) & 0xFFFFFFFF
+            if self.last_mmio_break is not None:
+                break
 
-        # SysTick downcounter if enabled
-        if self._core["systick_ctrl"] & 0x1:
-            load = self._core["systick_load"] & 0x00FFFFFF
-            if load == 0:
-                load = 0x00FFFFFF
-            val = self._core["systick_val"] & 0x00FFFFFF
-            val = (val - instructions) % (load + 1)
-            self._core["systick_val"] = val
+    def _deliver_pending_exception(self) -> bool:
+        if self.core_peripheral is None:
+            return False
+        if self._exception_stack:
+            return False
 
-    def _hook_mem_read(self, uc, access, address, size, value, user_data):
-        # Provide dynamic values for core regs; otherwise do nothing (allow normal memory read)
-        if address == self._SCB_VTOR and size == 4:
-            v = self._core["vtor"] & 0xFFFFFFFF
-            uc.mem_write(address, v.to_bytes(4, "little"))
+        primask = False
+        if UC_ARM_REG_PRIMASK is not None:
+            try:
+                primask = bool(int(self.uc.reg_read(UC_ARM_REG_PRIMASK)) & 0x1)
+            except Exception:
+                primask = False
+
+        exc_num = self.core_peripheral.next_pending_exception(primask=primask)
+        if exc_num is None:
+            return False
+
+        handler_addr = self._exception_vector_address(exc_num)
+        if handler_addr in (0, 0xFFFFFFFF):
+            log.warning(
+                "Dropping pending exception %s: handler vector is 0x%08X",
+                self.core_peripheral.exception_name(exc_num),
+                handler_addr,
+            )
+            self.core_peripheral.clear_pending_exception(exc_num)
+            return False
+
+        self._push_exception_frame()
+        self._exception_stack.append(exc_num)
+        self.core_peripheral.enter_exception(exc_num)
+        self.uc.reg_write(UC_ARM_REG_LR, EXC_RETURN_THREAD_MSP)
+        self.uc.reg_write(UC_ARM_REG_PC, handler_addr | 1)
+        log.info(
+            "EXC enter %s -> handler=0x%08X",
+            self.core_peripheral.exception_name(exc_num),
+            handler_addr | 1,
+        )
+        return True
+
+    def _handle_exception_return(self) -> bool:
+        pc = self.pc & 0xFFFFFFFF
+        if pc not in EXC_RETURN_VALUES:
+            return False
+        self._perform_exception_return(pc)
+        return True
+
+    def _perform_exception_return(self, exc_return: int) -> None:
+        del exc_return
+        if not self._exception_stack:
+            log.warning("EXC return requested with empty exception stack")
+            self.uc.reg_write(UC_ARM_REG_PC, self.flash_base | 1)
             return
 
-        if address == self._SCB_DEMCR and size == 4:
-            v = self._core["demcr"] & 0xFFFFFFFF
-            uc.mem_write(address, v.to_bytes(4, "little"))
-            return
+        exc_num = self._exception_stack.pop()
+        self._pop_exception_frame()
+        if self.core_peripheral is not None:
+            self.core_peripheral.exit_exception(exc_num)
+            log.info("EXC return %s", self.core_peripheral.exception_name(exc_num))
 
-        if address == self._DWT_CTRL and size == 4:
-            v = self._core["dwt_ctrl"] & 0xFFFFFFFF
-            uc.mem_write(address, v.to_bytes(4, "little"))
-            return
+    def _exception_vector_address(self, exc_num: int) -> int:
+        base = self.flash_base
+        if self.core_peripheral is not None:
+            base = self.core_peripheral.vtor or self.flash_base
+        data = self.uc.mem_read(base + (int(exc_num) * 4), 4)
+        return _u32(data, 0)
 
-        if address == self._DWT_CYCCNT and size == 4:
-            # tick a little on every read to break spin loops
-            self._tick_core(10)
-            v = self._core["cyccnt"] & 0xFFFFFFFF
-            uc.mem_write(address, v.to_bytes(4, "little"))
-            return
+    def _push_exception_frame(self) -> None:
+        regs = self.read_regs()
+        xpsr = 0x01000000
+        try:
+            xpsr = int(self.uc.reg_read(UC_ARM_REG_CPSR)) & 0xFFFFFFFF
+        except Exception:
+            pass
 
-        if address == self._SYST_CSR and size == 4:
-            v = self._core["systick_ctrl"] & 0xFFFFFFFF
-            uc.mem_write(address, v.to_bytes(4, "little"))
-            return
+        frame = [
+            regs["r0"],
+            regs["r1"],
+            regs["r2"],
+            regs["r3"],
+            regs["r12"],
+            regs["lr"],
+            regs["pc"],
+            xpsr,
+        ]
+        sp = self.sp - (len(frame) * 4)
+        payload = b"".join(int(word & 0xFFFFFFFF).to_bytes(4, "little") for word in frame)
+        self.uc.mem_write(sp, payload)
+        self.uc.reg_write(UC_ARM_REG_SP, sp)
 
-        if address == self._SYST_RVR and size == 4:
-            v = self._core["systick_load"] & 0xFFFFFFFF
-            uc.mem_write(address, v.to_bytes(4, "little"))
-            return
+    def _pop_exception_frame(self) -> None:
+        sp = self.sp
+        data = bytes(self.uc.mem_read(sp, 32))
+        words = [_u32(data, off) for off in range(0, 32, 4)]
+        self.uc.reg_write(UC_ARM_REG_R0, words[0])
+        self.uc.reg_write(UC_ARM_REG_R1, words[1])
+        self.uc.reg_write(UC_ARM_REG_R2, words[2])
+        self.uc.reg_write(UC_ARM_REG_R3, words[3])
+        self.uc.reg_write(UC_ARM_REG_R12, words[4])
+        self.uc.reg_write(UC_ARM_REG_LR, words[5])
+        self.uc.reg_write(UC_ARM_REG_PC, words[6] | 1)
+        try:
+            self.uc.reg_write(UC_ARM_REG_CPSR, words[7])
+        except Exception:
+            pass
+        self.uc.reg_write(UC_ARM_REG_SP, sp + 32)
 
-        if address == self._SYST_CVR and size == 4:
-            self._tick_core(1)
-            v = self._core["systick_val"] & 0xFFFFFFFF
-            uc.mem_write(address, v.to_bytes(4, "little"))
-            return
-
-    def _hook_mem_write(self, uc, access, address, size, value, user_data):
-        if size != 4:
-            return
-
-        if address == self._SCB_VTOR:
-            self._core["vtor"] = int(value) & 0xFFFFFFFF
-            return
-
-        if address == self._SCB_DEMCR:
-            self._core["demcr"] = int(value) & 0xFFFFFFFF
-            return
-
-        if address == self._DWT_CTRL:
-            self._core["dwt_ctrl"] = int(value) & 0xFFFFFFFF
-            return
-
-        if address == self._DWT_CYCCNT:
-            self._core["cyccnt"] = int(value) & 0xFFFFFFFF
-            return
-
-        if address == self._SYST_CSR:
-            self._core["systick_ctrl"] = int(value) & 0xFFFFFFFF
-            return
-
-        if address == self._SYST_RVR:
-            self._core["systick_load"] = int(value) & 0xFFFFFFFF
-            self._core["systick_val"] = int(value) & 0xFFFFFFFF
-            return
-
-        if address == self._SYST_CVR:
-            self._core["systick_val"] = int(value) & 0xFFFFFFFF
-            return
-        
     def _hook_code(self, uc, address, size, user_data):
         pc = int(address)
+        if self._intercept_exc_return(uc, pc, size):
+            return
+        if self._pc_break_if_needed(uc, pc):
+            return
 
         self._apply_pc_reg_writes( int(address))
 
@@ -620,6 +648,42 @@ class Emulator:
         if c == 5000:
             log.error("Likely stuck polling at PC=0x%08X (hit %d times)", address, c)
             uc.emu_stop()
+
+    def _pc_break_if_needed(self, uc, pc: int) -> bool:
+        addr = int(pc) & ~1
+        if self._ignore_breakpoint_once == addr:
+            self._ignore_breakpoint_once = None
+            return False
+        if not self._running or addr not in self._breakpoints:
+            return False
+        self.last_pc_break = addr
+        try:
+            uc.emu_stop()
+        except Exception:
+            pass
+        return True
+
+    def _intercept_exc_return(self, uc, pc: int, size: int) -> bool:
+        if size != 2:
+            return False
+        try:
+            opcode = bytes(uc.mem_read(pc & ~1, 2))
+        except Exception:
+            return False
+        if opcode != b"\x70\x47":
+            return False
+
+        lr = int(uc.reg_read(UC_ARM_REG_LR)) & 0xFFFFFFFF
+        if lr not in EXC_RETURN_VALUES:
+            return False
+
+        self._special_step_consumed = True
+        self._perform_exception_return(lr)
+        try:
+            uc.emu_stop()
+        except Exception:
+            pass
+        return True
 
 
     def _hook_mmio_read(self, uc, access, address, size, value, user_data):

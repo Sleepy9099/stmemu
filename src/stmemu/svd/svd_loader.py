@@ -78,6 +78,13 @@ def load_svd(path: Path) -> SvdDevice:
             offset = _int(_t(r, "addressOffset"), 0) or 0
             size_bits = _int(_t(r, "size"), 32) or 32
             reset_value = _int(_t(r, "resetValue"), None)
+            access = (_t(r, "access") or "read-write").strip().lower()
+            if access in ("read-only", "readonly"):
+                access = "ro"
+            elif access in ("write-only", "writeonce", "write-only once"):
+                access = "wo"
+            else:
+                access = "rw"
 
             fields: list[SvdField] = []
             fnode = r.find("fields")
@@ -95,6 +102,7 @@ def load_svd(path: Path) -> SvdDevice:
                     offset=offset,
                     size_bits=size_bits,
                     reset_value=reset_value,
+                    access=access,
                     fields=tuple(fields),
                 )
             )

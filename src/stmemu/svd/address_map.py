@@ -1,17 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
 
 from stmemu.svd.model import SvdDevice, SvdPeripheral, SvdRegister
-
-
-@dataclass(frozen=True)
-class PeripheralRange:
-    name: str
-    base: int
-    end: int  # exclusive
-    peripheral: SvdPeripheral
 
 
 @dataclass(frozen=True)
@@ -46,7 +38,8 @@ class AddressMap:
     def find_register(self, p: SvdPeripheral, addr: int) -> Optional[SvdRegister]:
         off = addr - p.base_address
         for reg in p.registers:
-            if reg.offset == off:
+            reg_size = max(1, (reg.size_bits + 7) // 8)
+            if reg.offset <= off < reg.offset + reg_size:
                 return reg
         return None
 
@@ -56,10 +49,10 @@ class AddressMap:
         return self._by_name.get(name.upper())
 
 def build_address_map(device: SvdDevice) -> AddressMap:
-    ranges = []
+    ranges: list[AddressRange] = []
     for p in device.peripherals:
         base = p.base_address
         end = base + max(p.size, 4)
-        ranges.append(PeripheralRange(name=p.name, base=base, end=end, peripheral=p))
+        ranges.append(AddressRange(base=base, end=end, peripheral=p))
     ranges.sort(key=lambda r: r.base)
     return AddressMap(device_name=device.name, peripherals=device.peripherals, ranges=tuple(ranges))

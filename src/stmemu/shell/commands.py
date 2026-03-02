@@ -28,6 +28,8 @@ class Commands:
     def cmd_step(self, argv: list[str]) -> str:
         n = _int(argv[0]) if argv else 1
         self.emu.step(n)
+        if getattr(self.emu, "last_pc_break", None) is not None:
+            return f"PC BP HIT: 0x{int(self.emu.last_pc_break):08X}"
         if getattr(self.emu, "last_mmio_break", None):
             b = self.emu.last_mmio_break
             val = b.get("value", None)
@@ -42,6 +44,8 @@ class Commands:
     def cmd_run(self, argv: list[str]) -> str:
         n = _int(argv[0]) if argv else 100000
         self.emu.run(n)
+        if getattr(self.emu, "last_pc_break", None) is not None:
+            return f"PC BP HIT: 0x{int(self.emu.last_pc_break):08X}"
         if getattr(self.emu, "last_mmio_break", None):
             b = self.emu.last_mmio_break
             val = b.get("value", None)
@@ -205,6 +209,55 @@ class Commands:
         if reg:
             return f"0x{addr:08X}: {p.name}.{reg.name} (offset=0x{reg.offset:X})"
         return f"0x{addr:08X}: {p.name}+0x{addr - p.base_address:X}"
+
+    def cmd_irq(self, argv: list[str]) -> str:
+        core = self.emu.core_peripheral
+        if core is None:
+            return "irq controller unavailable"
+
+        if not argv or argv[0] == "list":
+            pending = ", ".join(str(n) for n in core.pending_irqs()) or "-"
+            system = ", ".join(core.pending_system_exceptions()) or "-"
+            return f"pending external: {pending}\npending system: {system}"
+
+        sub = argv[0].lower()
+        if sub in ("set", "clear", "enable", "disable"):
+            if len(argv) != 2:
+                return f"usage: irq {sub} <num|SysTick|PendSV|NMI>"
+            target = argv[1]
+            if target.lower() in ("systick", "pendsv", "nmi"):
+                if sub not in ("set", "clear"):
+                    return "system exceptions support only set|clear"
+                core.set_system_pending(target, pending=sub == "set")
+                state = "pending" if sub == "set" else "cleared"
+                return f"{target} {state}"
+
+            irq = _int(target)
+            if sub == "set":
+                core.set_irq_pending(irq, True)
+                return f"irq {irq} pending"
+            if sub == "clear":
+                core.set_irq_pending(irq, False)
+                return f"irq {irq} cleared"
+            if sub == "enable":
+                core.set_irq_enabled(irq, True)
+                return f"irq {irq} enabled"
+            core.set_irq_enabled(irq, False)
+            return f"irq {irq} disabled"
+
+        if sub == "show":
+            if len(argv) != 2:
+                return "usage: irq show <num>"
+            irq = _int(argv[1])
+            state = core.irq_state(irq)
+            return (
+                f"irq {irq}: "
+                f"enabled={'1' if state['enabled'] else '0'} "
+                f"pending={'1' if state['pending'] else '0'} "
+                f"active={'1' if state['active'] else '0'}"
+            )
+
+        return "usage: irq [list|show <num>|set <num|SysTick>|clear <num|SysTick>|enable <num>|disable <num>]"
 
     # --- Breakpoints (PC + MMIO watchpoints) ---
     def _resolve_mmio_spec(self, spec: str) -> tuple[str, int, int]:

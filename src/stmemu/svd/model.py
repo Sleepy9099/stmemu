@@ -17,6 +17,7 @@ class SvdRegister:
     offset: int
     size_bits: int = 32
     reset_value: Optional[int] = None
+    access: str = "rw"
     fields: tuple[SvdField, ...] = ()
 
 
