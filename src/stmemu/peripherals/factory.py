@@ -7,6 +7,9 @@ from stmemu.peripherals.bus import PeripheralBus, PeripheralModel
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.peripherals.memory import RawMemoryPeripheral
+from stmemu.peripherals.timer import build_tim5
+from stmemu.peripherals.usart import build_usart
+from stmemu.peripherals.usb_otg import build_otg_global
 from stmemu.svd.address_map import AddressMap
 from stmemu.svd.model import SvdPeripheral
 
@@ -55,6 +58,18 @@ def create_default_registry() -> PeripheralFactoryRegistry:
 
     registry.register("RCC", build_rcc)
     registry.register("PWR", build_pwr)
+    registry.register("TIM5", build_tim5)
+    registry.register("LPUART1", build_usart)
+    registry.register("USART1", build_usart)
+    registry.register("USART2", build_usart)
+    registry.register("USART3", build_usart)
+    registry.register("UART4", build_usart)
+    registry.register("UART5", build_usart)
+    registry.register("USART6", build_usart)
+    registry.register("UART7", build_usart)
+    registry.register("UART8", build_usart)
+    registry.register("OTG1_HS_GLOBAL", build_otg_global)
+    registry.register("OTG2_HS_GLOBAL", build_otg_global)
     return registry
 
 

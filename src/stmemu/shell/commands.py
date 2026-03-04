@@ -5,6 +5,7 @@ from sys import argv
 
 from stmemu.core.emulator import Emulator, PcRegWrite
 from stmemu.peripherals.bus import PeripheralBus
+from stmemu.peripherals.usart import Stm32UsartPeripheral
 from stmemu.utils.hexdump import hexdump
 from stmemu.core.disasm import ThumbDisassembler
 
@@ -111,6 +112,74 @@ class Commands:
 
         return "usage: periph list | periph read <P.REG|addr> | periph write <P.REG|addr> <value>"
 
+    def cmd_uart(self, argv: list[str]) -> str:
+        if not argv:
+            return "usage: uart list | uart status <name> | uart rx <name> <hexbytes> | uart tx <name> [clear]"
+
+        sub = argv[0].lower()
+        if sub == "list":
+            lines: list[str] = []
+            for peripheral in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(peripheral.name)
+                if isinstance(model, Stm32UsartPeripheral):
+                    lines.append(f"{peripheral.name:8} {model.status_summary()}")
+            return "\n".join(lines) if lines else "(no uart peripherals)"
+
+        if sub == "status":
+            if len(argv) != 2:
+                return "usage: uart status <name>"
+            model = self._resolve_uart_model(argv[1])
+            return f"{argv[1].upper()} {model.status_summary()}"
+
+        if sub == "rx":
+            if len(argv) != 3:
+                return "usage: uart rx <name> <hexbytes>"
+            model = self._resolve_uart_model(argv[1])
+            payload = bytes.fromhex(argv[2].replace(" ", ""))
+            model.inject_rx_bytes(payload)
+            return f"injected {len(payload)} byte(s) into {argv[1].upper()}"
+
+        if sub == "tx":
+            if len(argv) not in {2, 3}:
+                return "usage: uart tx <name> [clear]"
+            model = self._resolve_uart_model(argv[1])
+            clear = len(argv) == 3 and argv[2].lower() == "clear"
+            payload = model.drain_tx_bytes() if clear else model.peek_tx_bytes()
+            text = "".join(chr(b) if 32 <= b < 127 else "." for b in payload)
+            return (
+                f"{argv[1].upper()} tx_len={len(payload)}\n"
+                f"hex  = {payload.hex() or '-'}\n"
+                f"ascii= {text or '-'}"
+            )
+
+        return "usage: uart list | uart status <name> | uart rx <name> <hexbytes> | uart tx <name> [clear]"
+
+    def cmd_vtbl(self, argv: list[str]) -> str:
+        if not argv:
+            return "usage: vtbl <addr> [count] | vtbl obj <addr> [count]"
+
+        obj_mode = argv[0].lower() == "obj"
+        if obj_mode:
+            if len(argv) not in {2, 3}:
+                return "usage: vtbl obj <addr> [count]"
+            obj_addr = _int(argv[1])
+            count = _int(argv[2]) if len(argv) == 3 else 8
+            vtbl_addr = int.from_bytes(self.emu.mem_read(obj_addr, 4), "little")
+            lines = [f"object = 0x{obj_addr:08X}", f"vtable = 0x{vtbl_addr:08X}"]
+        else:
+            if len(argv) not in {1, 2}:
+                return "usage: vtbl <addr> [count] | vtbl obj <addr> [count]"
+            vtbl_addr = _int(argv[0])
+            count = _int(argv[1]) if len(argv) == 2 else 8
+            lines = [f"vtable = 0x{vtbl_addr:08X}"]
+
+        count = max(1, min(int(count), 64))
+        for index in range(count):
+            slot_addr = vtbl_addr + (index * 4)
+            value = int.from_bytes(self.emu.mem_read(slot_addr, 4), "little")
+            lines.append(self._format_pointer_slot(index, slot_addr, value))
+        return "\n".join(lines)
+
     def cmd_peekpc(self, argv: list[str]) -> str:
         n = _int(argv[0]) if argv else 64
         pc = self.emu.pc
@@ -136,6 +205,42 @@ class Commands:
             raise KeyError(f"unknown register: {p_name}.{r_name}")
 
         return p.base_address + r.offset
+
+    def _resolve_uart_model(self, name: str) -> Stm32UsartPeripheral:
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, Stm32UsartPeripheral):
+            raise KeyError(f"unknown uart peripheral: {name}")
+        return model
+
+    def _format_pointer_slot(self, index: int, slot_addr: int, value: int) -> str:
+        target = value & ~1
+        suffix = self._describe_pointer_target(value)
+        return f"[{index:02d}] 0x{slot_addr:08X}: 0x{value:08X}{suffix}"
+
+    def _describe_pointer_target(self, value: int) -> str:
+        target = value & ~1
+        if value & 1 and self.emu.flash_base <= target < self.emu.flash_end:
+            summary = self._disasm_one(target)
+            return f" -> code 0x{target:08X} {summary}"
+        if self.emu.flash_base <= value < self.emu.flash_end:
+            return f" -> flash 0x{value:08X}"
+        if self.emu.sram_base <= value < (self.emu.sram_base + self.emu.sram_size):
+            return f" -> sram 0x{value:08X}"
+        peripheral = self.bus.amap.find_peripheral(value)
+        if peripheral is not None:
+            return f" -> mmio {peripheral.name}+0x{value - peripheral.base_address:X}"
+        return ""
+
+    def _disasm_one(self, addr: int) -> str:
+        try:
+            code = self.emu.mem_read(addr & ~1, 4)
+            insns = self._dasm.disasm(code, addr & ~1, count=1)
+        except Exception:
+            return "(unreadable)"
+        if not insns:
+            return "(undecoded)"
+        ins = insns[0]
+        return f"{ins.mnemonic} {ins.op_str}".rstrip()
 
     def cmd_disasm(self, argv: list[str]) -> str:
         """
@@ -197,6 +302,85 @@ class Commands:
         if name not in regs:
             return f"unknown reg: {name}"
         return f"{name} = 0x{regs[name]:08X}"
+
+    def cmd_image(self, argv: list[str]) -> str:
+        if argv:
+            return "usage: image"
+
+        ranges: list[tuple[int, int]] = []
+        for segment in self.emu.firmware_segments:
+            start = int(segment.address)
+            end = start + len(segment.data)
+            if not ranges or start > ranges[-1][1]:
+                ranges.append((start, end))
+                continue
+            prev_start, prev_end = ranges[-1]
+            ranges[-1] = (prev_start, max(prev_end, end))
+
+        lines = [
+            f"format      = {self.emu.firmware_format}",
+            f"vector_base = 0x{self.emu.flash_base:08X}",
+        ]
+        entry = getattr(self.emu, "firmware_entry_point", None)
+        lines.append(
+            "entry_point = " + ("-" if entry is None else f"0x{int(entry):08X}")
+        )
+        lines.append(f"segments    = {len(self.emu.firmware_segments)}")
+        lines.append(f"ranges      = {len(ranges)}")
+        for index, (start, end) in enumerate(ranges):
+            lines.append(f"(range {index}) 0x{start:08X}-0x{end:08X} size=0x{end - start:X}")
+        for index, segment in enumerate(self.emu.firmware_segments):
+            start = int(segment.address)
+            size = len(segment.data)
+            end = start + size
+            lines.append(f"[{index}] 0x{start:08X}-0x{end:08X} size=0x{size:X}")
+        return "\n".join(lines)
+
+    def cmd_stuck(self, argv: list[str]) -> str:
+        if not argv:
+            mode = "auto" if self.emu.stuck_loop_auto else "manual"
+            return (
+                f"mode        = {mode}\n"
+                f"base        = {self.emu.stuck_loop_threshold}\n"
+                f"interrupt   = {self.emu.interrupt_stuck_threshold}\n"
+                f"effective   = {self.emu._stuck_loop_threshold()}"
+            )
+
+        sub = argv[0].lower()
+        if sub == "off":
+            self.emu.stuck_loop_auto = False
+            self.emu.stuck_loop_threshold = 0
+            return "stuck loop guard = off"
+
+        if sub == "auto":
+            if len(argv) > 3:
+                return "usage: stuck | stuck off | stuck auto [base] [interrupt] | stuck <base> [interrupt]"
+            if len(argv) >= 2:
+                self.emu.stuck_loop_threshold = _int(argv[1])
+            if len(argv) == 3:
+                self.emu.interrupt_stuck_threshold = _int(argv[2])
+            self.emu.stuck_loop_auto = True
+            return self.cmd_stuck([])
+
+        if len(argv) > 2:
+            return "usage: stuck | stuck off | stuck auto [base] [interrupt] | stuck <base> [interrupt]"
+
+        self.emu.stuck_loop_threshold = _int(argv[0])
+        if len(argv) == 2:
+            self.emu.interrupt_stuck_threshold = _int(argv[1])
+        self.emu.stuck_loop_auto = False
+        return self.cmd_stuck([])
+
+    def cmd_tickscale(self, argv: list[str]) -> str:
+        if not argv:
+            return f"tick_scale = {self.emu.tick_scale}"
+        if len(argv) != 1:
+            return "usage: tickscale [value]"
+        value = _int(argv[0])
+        if value <= 0:
+            return "tickscale must be >= 1"
+        self.emu.tick_scale = value
+        return f"tick_scale = {self.emu.tick_scale}"
 
     def cmd_addr2reg(self, argv: list[str]) -> str:
         if len(argv) != 1:

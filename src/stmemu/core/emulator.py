@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.core.disasm import ThumbDisassembler
+from stmemu.core.loader import FirmwareSegment
 
 from unicorn import Uc, UcError, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
 from unicorn.arm_const import (
@@ -82,10 +83,16 @@ def _u32(b: bytes, off: int) -> int:
 class Emulator:
     bus: PeripheralBus
     flash_base: int
-    flash_image: bytes
+    firmware_segments: tuple[FirmwareSegment, ...]
     sram_base: int
     sram_size: int
+    firmware_format: str = "bin"
+    firmware_entry_point: Optional[int] = None
     core_peripheral: Optional[CortexMCorePeripheral] = None
+    tick_scale: int = 1
+    stuck_loop_threshold: int = 5000
+    interrupt_stuck_threshold: int = 50000000
+    stuck_loop_auto: bool = True
     pc_reg_writes: list[PcRegWrite] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -115,23 +122,52 @@ class Emulator:
         self._trace_stop_after_prev: bool = False
         self.pc_reg_writes: List[PcRegWrite] = []
         self._exception_stack: list[int] = []
+        self._exception_return_stack: list[int] = []
         self._special_step_consumed = False
         self._ignore_breakpoint_once: int | None = None
 
     def _map_memory(self) -> None:
-        # Flash: map enough pages for image (round up)
-        flash_size = (len(self.flash_image) + 0xFFF) & ~0xFFF
-        if flash_size == 0:
-            flash_size = 0x1000
-        self.uc.mem_map(self.flash_base, flash_size, UC_PROT_ALL)
-        self.uc.mem_write(self.flash_base, self.flash_image)
-        log.info("Mapped flash: 0x%08X-0x%08X (%d bytes)", self.flash_base, self.flash_base + flash_size, flash_size)
-        self.flash_size = flash_size
-        self.flash_end = self.flash_base + flash_size
+        image_end = self.flash_base
+        mapped_segments = 0
+        firmware_ranges: list[tuple[int, int]] = []
+        for segment in self.firmware_segments:
+            start = int(segment.address)
+            end = start + len(segment.data)
+            page_base = start & ~0xFFF
+            page_end = max(page_base + 0x1000, (end + 0xFFF) & ~0xFFF)
+            firmware_ranges.append((page_base, page_end))
+            image_end = max(image_end, end)
+            mapped_segments += 1
+
+        for base, end in self._merge_ranges(firmware_ranges):
+            self.uc.mem_map(base, end - base, UC_PROT_ALL)
+
+        for segment in self.firmware_segments:
+            start = int(segment.address)
+            end = start + len(segment.data)
+            if segment.data:
+                self.uc.mem_write(start, segment.data)
+            log.info(
+                "Mapped firmware segment: 0x%08X-0x%08X (%d bytes)",
+                start,
+                end,
+                len(segment.data),
+            )
+
+        if mapped_segments == 0:
+            self.uc.mem_map(self.flash_base, 0x1000, UC_PROT_ALL)
+            image_end = self.flash_base + 0x1000
+
+        self.flash_size = max(0x1000, ((image_end - self.flash_base) + 0xFFF) & ~0xFFF)
+        self.flash_end = max(self.flash_base + 0x1000, (image_end + 0xFFF) & ~0xFFF)
 
         # SRAM
         sram_size = (self.sram_size + 0xFFF) & ~0xFFF
-        self.uc.mem_map(self.sram_base, sram_size, UC_PROT_ALL)
+        try:
+            self.uc.mem_map(self.sram_base, sram_size, UC_PROT_ALL)
+        except Exception:
+            # ELF images may preload .data/.bss into SRAM pages we still want to use.
+            pass
         log.info("Mapped sram : 0x%08X-0x%08X (%d bytes)", self.sram_base, self.sram_base + sram_size, sram_size)
 
         for mounted in self.bus.mounted_ranges():
@@ -411,14 +447,14 @@ class Emulator:
             uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
             return True
 
-        # ---- 32-bit Thumb: MSR special register, rN (common early boot)
-        # Pattern seen: 80 F3 08 88  -> hw1=0xF380 hw2=0x8808  (MSR MSP, r0)
-        #              80 F3 09 88  -> hw1=0xF380 hw2=0x8809  (MSR PSP, r0)
-        #
-        # We'll match hw1==0xF380 and hw2 high bits 0x8800, low nibble selects special reg.
-        if hw1 == 0xF380 and (hw2 & 0xFFF0) == 0x8800:
-            sysm = hw2 & 0x000F  # 8=MSP, 9=PSP in what we observed
-            rn = hw1 & 0x000F    # low nibble is Rn (works for r0 in your case)
+        # ---- 32-bit Thumb: MSR special register, rN
+        # Examples seen:
+        #   80 F3 08 88 -> MSR MSP, r0
+        #   80 F3 09 88 -> MSR PSP, r0
+        #   83 F3 11 88 -> MSR BASEPRI, r3
+        if (hw1 & 0xFFF0) == 0xF380 and (hw2 & 0xFF00) == 0x8800:
+            sysm = hw2 & 0x00FF
+            rn = hw1 & 0x000F
 
             reg_map = {
                 0: UC_ARM_REG_R0, 1: UC_ARM_REG_R1, 2: UC_ARM_REG_R2, 3: UC_ARM_REG_R3,
@@ -433,14 +469,17 @@ class Emulator:
 
             val = int(uc.reg_read(src_reg)) & 0xFFFFFFFF
 
-            # sysm values we care about for now
+            current_sp = int(uc.reg_read(UC_ARM_REG_SP))
+
             if sysm == 8 and UC_ARM_REG_MSP is not None:
                 try:
                     uc.reg_write(UC_ARM_REG_MSP, val)
                 except Exception:
                     pass
-                # Also update SP to match (good enough for MVP)
-                uc.reg_write(UC_ARM_REG_SP, val)
+                uc.reg_write(
+                    UC_ARM_REG_SP,
+                    val if not self._active_stack_is_psp() else current_sp,
+                )
 
                 uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
                 return True
@@ -448,6 +487,42 @@ class Emulator:
             if sysm == 9 and UC_ARM_REG_PSP is not None:
                 try:
                     uc.reg_write(UC_ARM_REG_PSP, val)
+                except Exception:
+                    pass
+                uc.reg_write(
+                    UC_ARM_REG_SP,
+                    val if self._active_stack_is_psp() else current_sp,
+                )
+                uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
+                return True
+
+            if sysm == 16 and UC_ARM_REG_PRIMASK is not None:
+                try:
+                    uc.reg_write(UC_ARM_REG_PRIMASK, val & 0x1)
+                except Exception:
+                    pass
+                uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
+                return True
+
+            if sysm == 17 and UC_ARM_REG_BASEPRI is not None:
+                try:
+                    uc.reg_write(UC_ARM_REG_BASEPRI, val & 0xFF)
+                except Exception:
+                    pass
+                uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
+                return True
+
+            if sysm == 19 and UC_ARM_REG_FAULTMASK is not None:
+                try:
+                    uc.reg_write(UC_ARM_REG_FAULTMASK, val & 0x1)
+                except Exception:
+                    pass
+                uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
+                return True
+
+            if sysm == 20 and UC_ARM_REG_CONTROL is not None:
+                try:
+                    uc.reg_write(UC_ARM_REG_CONTROL, val & 0x3)
                 except Exception:
                     pass
                 uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
@@ -497,7 +572,7 @@ class Emulator:
                 if not self._special_step_consumed:
                     raise
             executed += 1
-            self.bus.tick(1)
+            self.bus.tick(self._effective_tick_scale())
 
             if self.last_mmio_break is not None:
                 break
@@ -519,27 +594,7 @@ class Emulator:
         if exc_num is None:
             return False
 
-        handler_addr = self._exception_vector_address(exc_num)
-        if handler_addr in (0, 0xFFFFFFFF):
-            log.warning(
-                "Dropping pending exception %s: handler vector is 0x%08X",
-                self.core_peripheral.exception_name(exc_num),
-                handler_addr,
-            )
-            self.core_peripheral.clear_pending_exception(exc_num)
-            return False
-
-        self._push_exception_frame()
-        self._exception_stack.append(exc_num)
-        self.core_peripheral.enter_exception(exc_num)
-        self.uc.reg_write(UC_ARM_REG_LR, EXC_RETURN_THREAD_MSP)
-        self.uc.reg_write(UC_ARM_REG_PC, handler_addr | 1)
-        log.info(
-            "EXC enter %s -> handler=0x%08X",
-            self.core_peripheral.exception_name(exc_num),
-            handler_addr | 1,
-        )
-        return True
+        return self._enter_exception(exc_num, clear_pending_on_drop=True)
 
     def _handle_exception_return(self) -> bool:
         pc = self.pc & 0xFFFFFFFF
@@ -549,14 +604,15 @@ class Emulator:
         return True
 
     def _perform_exception_return(self, exc_return: int) -> None:
-        del exc_return
         if not self._exception_stack:
             log.warning("EXC return requested with empty exception stack")
             self.uc.reg_write(UC_ARM_REG_PC, self.flash_base | 1)
             return
 
         exc_num = self._exception_stack.pop()
-        self._pop_exception_frame()
+        if self._exception_return_stack:
+            self._exception_return_stack.pop()
+        self._pop_exception_frame(exc_return)
         if self.core_peripheral is not None:
             self.core_peripheral.exit_exception(exc_num)
             log.info("EXC return %s", self.core_peripheral.exception_name(exc_num))
@@ -568,7 +624,60 @@ class Emulator:
         data = self.uc.mem_read(base + (int(exc_num) * 4), 4)
         return _u32(data, 0)
 
-    def _push_exception_frame(self) -> None:
+    @staticmethod
+    def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if not ranges:
+            return []
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+                continue
+            prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end))
+        return merged
+
+    def _enter_exception(self, exc_num: int, clear_pending_on_drop: bool = False) -> bool:
+        handler_addr = self._exception_vector_address(exc_num)
+        if handler_addr in (0, 0xFFFFFFFF):
+            name = f"exception {exc_num}"
+            if self.core_peripheral is not None:
+                name = self.core_peripheral.exception_name(exc_num)
+            log.warning(
+                "Dropping pending exception %s: handler vector is 0x%08X",
+                name,
+                handler_addr,
+            )
+            if clear_pending_on_drop and self.core_peripheral is not None:
+                self.core_peripheral.clear_pending_exception(exc_num)
+            return False
+
+        return_to_psp = self._active_stack_is_psp()
+        exc_return = EXC_RETURN_THREAD_PSP if return_to_psp else EXC_RETURN_THREAD_MSP
+        self._push_exception_frame(return_to_psp=return_to_psp)
+        self._exception_stack.append(exc_num)
+        self._exception_return_stack.append(exc_return)
+        if self.core_peripheral is not None:
+            self.core_peripheral.enter_exception(exc_num)
+        self._set_control_spsel(False)
+        if UC_ARM_REG_MSP is not None:
+            try:
+                self.uc.reg_write(UC_ARM_REG_SP, int(self.uc.reg_read(UC_ARM_REG_MSP)))
+            except Exception:
+                pass
+        self.uc.reg_write(UC_ARM_REG_LR, exc_return)
+        self.uc.reg_write(UC_ARM_REG_PC, handler_addr | 1)
+        if self.core_peripheral is not None:
+            log.info(
+                "EXC enter %s -> handler=0x%08X",
+                self.core_peripheral.exception_name(exc_num),
+                handler_addr | 1,
+            )
+        else:
+            log.info("EXC enter %d -> handler=0x%08X", exc_num, handler_addr | 1)
+        return True
+
+    def _push_exception_frame(self, return_to_psp: bool) -> None:
         regs = self.read_regs()
         xpsr = 0x01000000
         try:
@@ -586,13 +695,16 @@ class Emulator:
             regs["pc"],
             xpsr,
         ]
-        sp = self.sp - (len(frame) * 4)
+        sp = self._read_stack_pointer(use_psp=return_to_psp) - (len(frame) * 4)
         payload = b"".join(int(word & 0xFFFFFFFF).to_bytes(4, "little") for word in frame)
         self.uc.mem_write(sp, payload)
-        self.uc.reg_write(UC_ARM_REG_SP, sp)
+        self._write_stack_pointer(use_psp=return_to_psp, value=sp)
+        if not return_to_psp:
+            self.uc.reg_write(UC_ARM_REG_SP, sp)
 
-    def _pop_exception_frame(self) -> None:
-        sp = self.sp
+    def _pop_exception_frame(self, exc_return: int) -> None:
+        use_psp = exc_return == EXC_RETURN_THREAD_PSP
+        sp = self._read_stack_pointer(use_psp=use_psp)
         data = bytes(self.uc.mem_read(sp, 32))
         words = [_u32(data, off) for off in range(0, 32, 4)]
         self.uc.reg_write(UC_ARM_REG_R0, words[0])
@@ -606,10 +718,19 @@ class Emulator:
             self.uc.reg_write(UC_ARM_REG_CPSR, words[7])
         except Exception:
             pass
-        self.uc.reg_write(UC_ARM_REG_SP, sp + 32)
+        new_sp = sp + 32
+        self._write_stack_pointer(use_psp=use_psp, value=new_sp)
+        self._set_control_spsel(use_psp)
+        self.uc.reg_write(UC_ARM_REG_SP, new_sp)
 
     def _hook_code(self, uc, address, size, user_data):
         pc = int(address)
+        if self._intercept_pop_exc_return(uc, pc, size):
+            return
+        if self._intercept_special_register_write(uc, pc, size):
+            return
+        if self._intercept_svc(uc, pc, size):
+            return
         if self._intercept_exc_return(uc, pc, size):
             return
         if self._pc_break_if_needed(uc, pc):
@@ -642,12 +763,71 @@ class Emulator:
                     e,
                 )
 
-        # ---- stuck-loop detection (keep exactly as you had it)
+        # Treat tight loops as suspicious, but let interrupt-driven idle loops run longer.
         c = self._pc_hist.get(address, 0) + 1
         self._pc_hist[address] = c
-        if c == 5000:
+        threshold = self._stuck_loop_threshold()
+        if threshold > 0 and c == threshold:
             log.error("Likely stuck polling at PC=0x%08X (hit %d times)", address, c)
             uc.emu_stop()
+
+    def _stuck_loop_threshold(self) -> int:
+        base = max(0, int(self.stuck_loop_threshold))
+        irq = max(0, int(self.interrupt_stuck_threshold))
+        if not self.stuck_loop_auto or self.core_peripheral is None:
+            return base
+        if self.core_peripheral.pending_irqs():
+            return max(base, irq)
+        if self.core_peripheral.pending_system_exceptions():
+            return max(base, irq)
+        if self.core_peripheral.enabled_irqs():
+            return max(base, irq)
+        return base
+
+    def _effective_tick_scale(self) -> int:
+        return max(1, int(self.tick_scale))
+
+    def _active_stack_is_psp(self) -> bool:
+        if self._exception_stack:
+            return False
+        if UC_ARM_REG_CONTROL is None:
+            return False
+        try:
+            return bool(int(self.uc.reg_read(UC_ARM_REG_CONTROL)) & 0x2)
+        except Exception:
+            return False
+
+    def _read_stack_pointer(self, use_psp: bool) -> int:
+        reg = UC_ARM_REG_PSP if use_psp and UC_ARM_REG_PSP is not None else UC_ARM_REG_MSP
+        if reg is None:
+            return self.sp
+        try:
+            return int(self.uc.reg_read(reg))
+        except Exception:
+            return self.sp
+
+    def _write_stack_pointer(self, use_psp: bool, value: int) -> None:
+        reg = UC_ARM_REG_PSP if use_psp and UC_ARM_REG_PSP is not None else UC_ARM_REG_MSP
+        if reg is None:
+            self.uc.reg_write(UC_ARM_REG_SP, value)
+            return
+        try:
+            self.uc.reg_write(reg, value)
+        except Exception:
+            self.uc.reg_write(UC_ARM_REG_SP, value)
+
+    def _set_control_spsel(self, use_psp: bool) -> None:
+        if UC_ARM_REG_CONTROL is None:
+            return
+        try:
+            control = int(self.uc.reg_read(UC_ARM_REG_CONTROL)) & 0xFFFFFFFF
+        except Exception:
+            return
+        next_control = (control | 0x2) if use_psp else (control & ~0x2)
+        try:
+            self.uc.reg_write(UC_ARM_REG_CONTROL, next_control)
+        except Exception:
+            pass
 
     def _pc_break_if_needed(self, uc, pc: int) -> bool:
         addr = int(pc) & ~1
@@ -657,6 +837,168 @@ class Emulator:
         if not self._running or addr not in self._breakpoints:
             return False
         self.last_pc_break = addr
+        try:
+            uc.emu_stop()
+        except Exception:
+            pass
+        return True
+
+    def _intercept_special_register_write(self, uc, pc: int, size: int) -> bool:
+        addr = pc & ~1
+        if size != 4:
+            return False
+        try:
+            data = bytes(uc.mem_read(addr, 4))
+        except Exception:
+            return False
+
+        hw1 = int.from_bytes(data[0:2], "little")
+        hw2 = int.from_bytes(data[2:4], "little")
+        if (hw1 & 0xFFF0) != 0xF380 or (hw2 & 0xFF00) != 0x8800:
+            return False
+
+        sysm = hw2 & 0x00FF
+        rn = hw1 & 0x000F
+        reg_map = {
+            0: UC_ARM_REG_R0, 1: UC_ARM_REG_R1, 2: UC_ARM_REG_R2, 3: UC_ARM_REG_R3,
+            4: UC_ARM_REG_R4, 5: UC_ARM_REG_R5, 6: UC_ARM_REG_R6, 7: UC_ARM_REG_R7,
+            8: UC_ARM_REG_R8, 9: UC_ARM_REG_R9, 10: UC_ARM_REG_R10, 11: UC_ARM_REG_R11,
+            12: UC_ARM_REG_R12,
+        }
+        src_reg = reg_map.get(rn)
+        if src_reg is None:
+            return False
+
+        val = int(uc.reg_read(src_reg)) & 0xFFFFFFFF
+        current_sp = int(uc.reg_read(UC_ARM_REG_SP))
+
+        handled = False
+        if sysm == 8 and UC_ARM_REG_MSP is not None:
+            try:
+                uc.reg_write(UC_ARM_REG_MSP, val)
+            except Exception:
+                pass
+            uc.reg_write(
+                UC_ARM_REG_SP,
+                val if not self._active_stack_is_psp() else current_sp,
+            )
+            handled = True
+        elif sysm == 9 and UC_ARM_REG_PSP is not None:
+            try:
+                uc.reg_write(UC_ARM_REG_PSP, val)
+            except Exception:
+                pass
+            uc.reg_write(
+                UC_ARM_REG_SP,
+                val if self._active_stack_is_psp() else current_sp,
+            )
+            handled = True
+        elif sysm == 16 and UC_ARM_REG_PRIMASK is not None:
+            try:
+                uc.reg_write(UC_ARM_REG_PRIMASK, val & 0x1)
+            except Exception:
+                pass
+            handled = True
+        elif sysm == 17 and UC_ARM_REG_BASEPRI is not None:
+            try:
+                uc.reg_write(UC_ARM_REG_BASEPRI, val & 0xFF)
+            except Exception:
+                pass
+            handled = True
+        elif sysm == 19 and UC_ARM_REG_FAULTMASK is not None:
+            try:
+                uc.reg_write(UC_ARM_REG_FAULTMASK, val & 0x1)
+            except Exception:
+                pass
+            handled = True
+        elif sysm == 20 and UC_ARM_REG_CONTROL is not None:
+            try:
+                uc.reg_write(UC_ARM_REG_CONTROL, val & 0x3)
+            except Exception:
+                pass
+            uc.reg_write(
+                UC_ARM_REG_SP,
+                int(uc.reg_read(UC_ARM_REG_PSP if self._active_stack_is_psp() else UC_ARM_REG_MSP))
+                if (UC_ARM_REG_PSP is not None and UC_ARM_REG_MSP is not None)
+                else current_sp,
+            )
+            handled = True
+
+        if not handled:
+            return False
+
+        self._special_step_consumed = True
+        uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
+        try:
+            uc.emu_stop()
+        except Exception:
+            pass
+        return True
+
+    def _intercept_svc(self, uc, pc: int, size: int) -> bool:
+        if size != 2:
+            return False
+        try:
+            opcode = int.from_bytes(bytes(uc.mem_read(pc & ~1, 2)), "little")
+        except Exception:
+            return False
+        if (opcode & 0xFF00) != 0xDF00:
+            return False
+
+        if not self._enter_exception(11):
+            return False
+
+        self._special_step_consumed = True
+        try:
+            uc.emu_stop()
+        except Exception:
+            pass
+        return True
+
+    def _intercept_pop_exc_return(self, uc, pc: int, size: int) -> bool:
+        if size != 2:
+            return False
+        try:
+            opcode = int.from_bytes(bytes(uc.mem_read(pc & ~1, 2)), "little")
+        except Exception:
+            return False
+        if (opcode & 0xFE00) != 0xBC00 or not (opcode & 0x0100):
+            return False
+
+        reglist = opcode & 0x00FF
+        reg_count = reglist.bit_count()
+        sp = self.sp
+        frame_size = (reg_count + 1) * 4
+        try:
+            data = bytes(self.uc.mem_read(sp, frame_size))
+        except Exception:
+            return False
+
+        reg_map = {
+            0: UC_ARM_REG_R0,
+            1: UC_ARM_REG_R1,
+            2: UC_ARM_REG_R2,
+            3: UC_ARM_REG_R3,
+            4: UC_ARM_REG_R4,
+            5: UC_ARM_REG_R5,
+            6: UC_ARM_REG_R6,
+            7: UC_ARM_REG_R7,
+        }
+        offset = 0
+        for bit in range(8):
+            if not (reglist & (1 << bit)):
+                continue
+            reg_value = _u32(data, offset)
+            uc.reg_write(reg_map[bit], reg_value)
+            offset += 4
+
+        exc_return = _u32(data, offset) | 1
+        if exc_return not in EXC_RETURN_VALUES:
+            return False
+
+        uc.reg_write(UC_ARM_REG_SP, sp + frame_size)
+        self._special_step_consumed = True
+        self._perform_exception_return(exc_return)
         try:
             uc.emu_stop()
         except Exception:

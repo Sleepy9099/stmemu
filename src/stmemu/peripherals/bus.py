@@ -120,6 +120,9 @@ class PeripheralBus:
             return None
         return mounted.model
 
+    def model_for_name(self, name: str) -> Optional[PeripheralModel]:
+        return self._models.get(str(name).upper())
+
     def set_interrupt_controller(self, controller: InterruptController) -> None:
         self._interrupts = controller
         for mounted in self._mounted:

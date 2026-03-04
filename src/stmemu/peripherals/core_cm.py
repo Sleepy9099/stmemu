@@ -19,13 +19,14 @@ class CortexMCorePeripheral(RegisterPeripheral):
     _SYST_CSR = 0xE010
     _SYST_RVR = 0xE014
     _SYST_CVR = 0xE018
-    _NVIC_ISER_BASE = 0x0100
-    _NVIC_ICER_BASE = 0x0180
-    _NVIC_ISPR_BASE = 0x0200
-    _NVIC_ICPR_BASE = 0x0280
-    _NVIC_IABR_BASE = 0x0300
+    _NVIC_ISER_BASE = 0xE100
+    _NVIC_ICER_BASE = 0xE180
+    _NVIC_ISPR_BASE = 0xE200
+    _NVIC_ICPR_BASE = 0xE280
+    _NVIC_IABR_BASE = 0xE300
     _NVIC_WORDS = 8
     _EXC_NMI = 2
+    _EXC_SVC = 11
     _EXC_PENDSV = 14
     _EXC_SYSTICK = 15
     _SYST_CSR_ENABLE = 1 << 0
@@ -123,6 +124,17 @@ class CortexMCorePeripheral(RegisterPeripheral):
                 bits &= bits - 1
         return pending
 
+    def enabled_irqs(self) -> list[int]:
+        enabled: list[int] = []
+        for word, value in enumerate(self._irq_enabled):
+            bits = value
+            while bits:
+                lsb = bits & -bits
+                bit = lsb.bit_length() - 1
+                enabled.append(word * 32 + bit)
+                bits &= bits - 1
+        return enabled
+
     def pending_system_exceptions(self) -> list[str]:
         return [name for name, pending in self._system_pending.items() if pending]
 
@@ -177,6 +189,7 @@ class CortexMCorePeripheral(RegisterPeripheral):
         names = {
             0: "Thread",
             self._EXC_NMI: "NMI",
+            self._EXC_SVC: "SVC",
             self._EXC_PENDSV: "PendSV",
             self._EXC_SYSTICK: "SysTick",
         }

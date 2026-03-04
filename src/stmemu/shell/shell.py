@@ -75,3 +75,18 @@ class StmEmuShell(cmd.Cmd):
 
     def do_periph(self, arg: str) -> None:
         self.default("periph " + arg if arg else "periph")
+
+    def do_image(self, arg: str) -> None:
+        self.default("image " + arg if arg else "image")
+
+    def do_stuck(self, arg: str) -> None:
+        self.default("stuck " + arg if arg else "stuck")
+
+    def do_tickscale(self, arg: str) -> None:
+        self.default("tickscale " + arg if arg else "tickscale")
+
+    def do_uart(self, arg: str) -> None:
+        self.default("uart " + arg if arg else "uart")
+
+    def do_vtbl(self, arg: str) -> None:
+        self.default("vtbl " + arg if arg else "vtbl")

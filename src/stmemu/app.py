@@ -5,7 +5,7 @@ from pathlib import Path
 from stmemu.utils.logger import get_logger, setup_logging
 from stmemu.svd.svd_loader import load_svd
 from stmemu.svd.address_map import build_address_map
-from stmemu.core.loader import load_raw_bin
+from stmemu.core.loader import load_firmware
 from stmemu.core.emulator import Emulator
 from stmemu.shell.shell import StmEmuShell
 from stmemu.peripherals.factory import build_default_bus
@@ -19,6 +19,10 @@ def run_app(
     svd_path: Path,
     sram_base: int,
     sram_size: int,
+    tick_scale: int,
+    stuck_threshold: int,
+    interrupt_stuck_threshold: int,
+    stuck_auto: bool,
     shell: bool,
     cmd: str,
     log_level: str,
@@ -28,24 +32,36 @@ def run_app(
     setup_logging(level=log_level, quiet=quiet)
 
     log.info("stmemu starting")
-    log.info("Firmware: %s base=0x%08X", image_path, base_addr)
+    log.info("Firmware: %s", image_path)
     log.info("SVD: %s", svd_path)
 
-    fw = load_raw_bin(image_path)
+    firmware = load_firmware(image_path, base_addr=base_addr)
+    log.info(
+        "Firmware format=%s vector_base=0x%08X segments=%d",
+        firmware.format,
+        firmware.vector_base,
+        len(firmware.segments),
+    )
     device = load_svd(svd_path)
     amap = build_address_map(device)
 
-    bus, core = build_default_bus(amap, flash_base=base_addr)
+    bus, core = build_default_bus(amap, flash_base=firmware.vector_base)
     emu = Emulator(
         bus=bus,
-        flash_base=base_addr,
-        flash_image=fw,
+        flash_base=firmware.vector_base,
+        firmware_segments=firmware.segments,
         sram_base=sram_base,
         sram_size=sram_size,
+        firmware_format=firmware.format,
+        firmware_entry_point=firmware.entry_point,
         core_peripheral=core,
+        tick_scale=tick_scale,
+        stuck_loop_threshold=stuck_threshold,
+        interrupt_stuck_threshold=interrupt_stuck_threshold,
+        stuck_loop_auto=stuck_auto,
     )
 
-    emu.boot_from_vector_table(flash_base=base_addr)
+    emu.boot_from_vector_table(flash_base=firmware.vector_base)
 
     sh = StmEmuShell(emu=emu, bus=bus)
     # Run optional startup script from --cfg (supports ';' and newlines; '#' line comments)
