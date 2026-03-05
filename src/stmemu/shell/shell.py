@@ -73,6 +73,12 @@ class StmEmuShell(cmd.Cmd):
     def do_mmio(self, arg: str) -> None:
         self.default("mmio " + arg if arg else "mmio")
 
+    def do_mmioprof(self, arg: str) -> None:
+        self.default("mmioprof " + arg if arg else "mmioprof")
+
+    def do_pcprof(self, arg: str) -> None:
+        self.default("pcprof " + arg if arg else "pcprof")
+
     def do_periph(self, arg: str) -> None:
         self.default("periph " + arg if arg else "periph")
 

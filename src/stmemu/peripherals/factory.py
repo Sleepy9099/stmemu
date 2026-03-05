@@ -3,11 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
+from stmemu.peripherals.adc import build_adc
 from stmemu.peripherals.bus import PeripheralBus, PeripheralModel
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.peripherals.memory import RawMemoryPeripheral
-from stmemu.peripherals.timer import build_tim5
+from stmemu.peripherals.timer import (
+    build_tim2,
+    build_tim3,
+    build_tim4,
+    build_tim5,
+    build_tim6,
+    build_tim7,
+)
 from stmemu.peripherals.usart import build_usart
 from stmemu.peripherals.usb_otg import build_otg_global
 from stmemu.svd.address_map import AddressMap
@@ -58,7 +66,15 @@ def create_default_registry() -> PeripheralFactoryRegistry:
 
     registry.register("RCC", build_rcc)
     registry.register("PWR", build_pwr)
+    registry.register("ADC1", build_adc)
+    registry.register("ADC2", build_adc)
+    registry.register("ADC3", build_adc)
+    registry.register("TIM2", build_tim2)
+    registry.register("TIM3", build_tim3)
+    registry.register("TIM4", build_tim4)
     registry.register("TIM5", build_tim5)
+    registry.register("TIM6", build_tim6)
+    registry.register("TIM7", build_tim7)
     registry.register("LPUART1", build_usart)
     registry.register("USART1", build_usart)
     registry.register("USART2", build_usart)

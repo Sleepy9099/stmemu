@@ -141,13 +141,15 @@ class CortexMCorePeripheral(RegisterPeripheral):
     def current_active_exception(self) -> int:
         return self._active_exceptions[-1] if self._active_exceptions else 0
 
-    def next_pending_exception(self, primask: bool = False) -> int | None:
+    def next_pending_exception(self, primask: bool = False, basepri: bool = False) -> int | None:
         candidates: list[int] = []
 
         if self._system_pending["NMI"]:
             candidates.append(self._EXC_NMI)
 
-        if not primask:
+        # Without modeled priorities, treat BASEPRI as masking all configurable
+        # exceptions (PendSV, SysTick, external IRQs). NMI remains unmasked.
+        if not primask and not basepri:
             if self._system_pending["PendSV"]:
                 candidates.append(self._EXC_PENDSV)
             if self._system_pending["SysTick"]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from sys import argv
 
@@ -8,6 +9,7 @@ from stmemu.peripherals.bus import PeripheralBus
 from stmemu.peripherals.usart import Stm32UsartPeripheral
 from stmemu.utils.hexdump import hexdump
 from stmemu.core.disasm import ThumbDisassembler
+from unicorn.unicorn_const import UC_HOOK_CODE
 
 def _int(s: str) -> int:
     return int(s, 0)
@@ -83,6 +85,110 @@ class Commands:
             return "usage: mmio log on|off"
         self.bus.mmio_log_enabled = (argv[1].lower() == "on")
         return f"mmio log = {'on' if self.bus.mmio_log_enabled else 'off'}"
+
+    def cmd_mmioprof(self, argv: list[str]) -> str:
+        if not argv:
+            return "usage: mmioprof <instructions> [top]"
+        steps = _int(argv[0])
+        if steps <= 0:
+            return "instructions must be > 0"
+        top = _int(argv[1]) if len(argv) > 1 else 20
+        top = max(1, min(int(top), 100))
+
+        reads: Counter[tuple[int, int]] = Counter()
+        writes: Counter[tuple[int, int]] = Counter()
+        orig_read = self.bus.read
+        orig_write = self.bus.write
+
+        def wrapped_read(addr: int, size: int) -> int:
+            reads[(int(addr), int(size))] += 1
+            return orig_read(addr, size)
+
+        def wrapped_write(addr: int, size: int, value: int) -> None:
+            writes[(int(addr), int(size))] += 1
+            return orig_write(addr, size, value)
+
+        self.bus.read = wrapped_read
+        self.bus.write = wrapped_write
+        try:
+            self.emu.run(steps)
+        finally:
+            self.bus.read = orig_read
+            self.bus.write = orig_write
+
+        lines = [
+            f"pc = 0x{self.emu.pc:08X}",
+            f"instructions = {steps}",
+            f"read_events = {sum(reads.values())}",
+            f"write_events = {sum(writes.values())}",
+            "",
+            "top reads:",
+        ]
+        if reads:
+            for (addr, size), n in reads.most_common(top):
+                lines.append(
+                    f"{n:8d}  {self._describe_mmio_addr(addr):30} addr=0x{addr:08X} size={size}"
+                )
+        else:
+            lines.append("(none)")
+
+        lines.append("")
+        lines.append("top writes:")
+        if writes:
+            for (addr, size), n in writes.most_common(top):
+                lines.append(
+                    f"{n:8d}  {self._describe_mmio_addr(addr):30} addr=0x{addr:08X} size={size}"
+                )
+        else:
+            lines.append("(none)")
+        return "\n".join(lines)
+
+    def cmd_pcprof(self, argv: list[str]) -> str:
+        if not argv:
+            return "usage: pcprof <instructions> [top]"
+
+        steps = _int(argv[0])
+        if steps <= 0:
+            return "instructions must be > 0"
+
+        top = _int(argv[1]) if len(argv) > 1 else 20
+        top = max(1, min(int(top), 100))
+
+        pcs: Counter[int] = Counter()
+
+        def wrapped_code(uc, address, size, user_data):
+            pcs[int(address) & ~1] += 1
+
+        hook = None
+        try:
+            hook = self.emu.uc.hook_add(UC_HOOK_CODE, wrapped_code)
+            self.emu.run(steps)
+        finally:
+            if hook is not None:
+                try:
+                    self.emu.uc.hook_del(hook)
+                except Exception:
+                    pass
+
+        executed = sum(pcs.values())
+        lines = [
+            f"pc = 0x{self.emu.pc:08X}",
+            f"instructions_requested = {steps}",
+            f"instructions_executed = {executed}",
+            "",
+            "top pcs:",
+        ]
+
+        if pcs:
+            for addr, n in pcs.most_common(top):
+                pct = (float(n) * 100.0 / float(executed)) if executed else 0.0
+                lines.append(
+                    f"{n:8d}  {pct:6.2f}%  0x{addr:08X}  {self._disasm_one(addr)}"
+                )
+        else:
+            lines.append("(none)")
+
+        return "\n".join(lines)
 
     def cmd_periph(self, argv: list[str]) -> str:
         if not argv:
@@ -211,6 +317,15 @@ class Commands:
         if not isinstance(model, Stm32UsartPeripheral):
             raise KeyError(f"unknown uart peripheral: {name}")
         return model
+
+    def _describe_mmio_addr(self, addr: int) -> str:
+        peripheral = self.bus.amap.find_peripheral(addr)
+        if peripheral is None:
+            return f"0x{addr:08X}"
+        reg = self.bus.amap.find_register(peripheral, addr)
+        if reg is None:
+            return f"{peripheral.name}+0x{addr - peripheral.base_address:X}"
+        return f"{peripheral.name}.{reg.name}"
 
     def _format_pointer_slot(self, index: int, slot_addr: int, value: int) -> str:
         target = value & ~1

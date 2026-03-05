@@ -390,10 +390,14 @@ class Emulator:
     # ---- hooks
 
     def _hook_unmapped_read(self, uc, access, address, size, value, user_data):
+        if self._maybe_map_internal_ram(address, size):
+            return True
         log.error("UNMAPPED READ: addr=0x%08X size=%d PC=0x%08X", address, size, self.pc)
         return False
 
     def _hook_unmapped_write(self, uc, access, address, size, value, user_data):
+        if self._maybe_map_internal_ram(address, size):
+            return True
         log.error("UNMAPPED WRITE: addr=0x%08X size=%d value=0x%X PC=0x%08X", address, size, value, self.pc)
         return False
 
@@ -401,6 +405,43 @@ class Emulator:
     def _hook_unmapped_fetch(self, uc, access, address, size, value, user_data):
         log.error("UNMAPPED FETCH: addr=0x%08X size=%d PC=0x%08X", address, size, self.pc)
         return False
+
+    def _maybe_map_internal_ram(self, address: int, size: int) -> bool:
+        addr = int(address) & 0xFFFFFFFF
+        span = max(1, int(size))
+        start = addr & ~0xFFF
+        end = (addr + span + 0xFFF) & ~0xFFF
+
+        # Conservative STM32-oriented RAM windows. These are data-only fallbacks
+        # for cases where firmware uses internal SRAM/TCM regions not explicitly
+        # described by the loaded image.
+        windows = (
+            (0x00000000, 0x00020000),  # ITCM/low-memory SRAM aliases on M7 parts
+            (0x10000000, 0x10020000),  # DTCM aliases used by some STM32 families
+            (0x20000000, 0x20200000),  # SRAM / DTCM (common STM32 range)
+            (0x24000000, 0x24200000),  # AXI SRAM (H7)
+            (0x30000000, 0x30200000),  # SRAM D2 (H7)
+            (0x38000000, 0x38100000),  # SRAM D3 (H7)
+        )
+
+        def in_window(page: int) -> bool:
+            for lo, hi in windows:
+                if lo <= page < hi:
+                    return True
+            return False
+
+        if not all(in_window(page) for page in range(start, end, 0x1000)):
+            return False
+
+        mapped = False
+        for page in range(start, end, 0x1000):
+            try:
+                self.uc.mem_map(page, 0x1000, UC_PROT_ALL)
+                mapped = True
+            except Exception:
+                # Already mapped or overlaps an existing region.
+                continue
+        return mapped
 
     def _hook_insn_invalid(self, uc, user_data):
         """
@@ -444,6 +485,14 @@ class Emulator:
         # ISB: BF F3 6F 8F => hw1=0xF3BF hw2=0x8F6F
         if hw1 == 0xF3BF and hw2 in (0x8F4F, 0x8F6F):
             # treat as NOP barrier
+            uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
+            return True
+
+        # ---- 32-bit Thumb VFP/FP coprocessor instructions (EDxx/EExx prefix).
+        # Unicorn MCLASS builds often reject these even when firmware relies on
+        # them heavily. We currently treat unsupported FP ops as NOPs so control
+        # flow can progress to peripheral/runtime integration work.
+        if (hw1 & 0xFF00) in (0xED00, 0xEE00):
             uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
             return True
 
@@ -590,7 +639,17 @@ class Emulator:
             except Exception:
                 primask = False
 
-        exc_num = self.core_peripheral.next_pending_exception(primask=primask)
+        basepri_active = False
+        if UC_ARM_REG_BASEPRI is not None:
+            try:
+                basepri_active = bool(int(self.uc.reg_read(UC_ARM_REG_BASEPRI)) & 0xFF)
+            except Exception:
+                basepri_active = False
+
+        exc_num = self.core_peripheral.next_pending_exception(
+            primask=primask,
+            basepri=basepri_active,
+        )
         if exc_num is None:
             return False
 
@@ -652,8 +711,12 @@ class Emulator:
                 self.core_peripheral.clear_pending_exception(exc_num)
             return False
 
-        return_to_psp = self._active_stack_is_psp()
-        exc_return = EXC_RETURN_THREAD_PSP if return_to_psp else EXC_RETURN_THREAD_MSP
+        in_handler = bool(self._exception_stack)
+        return_to_psp = self._active_stack_is_psp() if not in_handler else False
+        if in_handler:
+            exc_return = EXC_RETURN_HANDLER_MSP
+        else:
+            exc_return = EXC_RETURN_THREAD_PSP if return_to_psp else EXC_RETURN_THREAD_MSP
         self._push_exception_frame(return_to_psp=return_to_psp)
         self._exception_stack.append(exc_num)
         self._exception_return_stack.append(exc_return)

@@ -113,3 +113,23 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
 
 def build_tim5(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
     return BasicTimerPeripheral(peripheral=peripheral, irq=50)
+
+
+def build_tim2(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
+    return BasicTimerPeripheral(peripheral=peripheral, irq=28)
+
+
+def build_tim3(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
+    return BasicTimerPeripheral(peripheral=peripheral, irq=29)
+
+
+def build_tim4(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
+    return BasicTimerPeripheral(peripheral=peripheral, irq=30)
+
+
+def build_tim6(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
+    return BasicTimerPeripheral(peripheral=peripheral, irq=54)
+
+
+def build_tim7(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
+    return BasicTimerPeripheral(peripheral=peripheral, irq=55)
