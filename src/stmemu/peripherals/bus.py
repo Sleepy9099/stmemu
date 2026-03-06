@@ -53,6 +53,12 @@ class PeripheralModel:
     def attach(self, context: "PeripheralContext") -> None:
         del context
 
+    def snapshot_state(self) -> object | None:
+        return None
+
+    def restore_state(self, state: object) -> None:
+        del state
+
 
 @dataclass(frozen=True)
 class MountedPeripheral:
@@ -147,6 +153,30 @@ class PeripheralBus:
                 continue
             seen.add(ident)
             mounted.model.tick(cycles)
+
+    def snapshot_models_state(self) -> dict[str, object]:
+        states: dict[str, object] = {}
+        seen: set[int] = set()
+        for mounted in self._mounted:
+            ident = id(mounted.model)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            state = mounted.model.snapshot_state()
+            if state is not None:
+                states[mounted.name] = state
+        return states
+
+    def restore_models_state(self, states: dict[str, object]) -> None:
+        seen: set[int] = set()
+        for mounted in self._mounted:
+            ident = id(mounted.model)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            if mounted.name not in states:
+                continue
+            mounted.model.restore_state(states[mounted.name])
 
     def read(self, addr: int, size: int) -> int:
         mounted = self._mount_for_addr(addr)

@@ -110,6 +110,22 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         if ((counter - compare) & 0xFFFFFFFF) < 0x80000000:
             self.write_register_value(self._SR, self.read_register_value(self._SR) | self._SR_CC1IF)
 
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base["prescaler_accum"] = int(self._prescaler_accum)
+        base["last_counter"] = int(self._last_counter) & 0xFFFFFFFF
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if not isinstance(state, dict):
+            return
+        self._prescaler_accum = int(state.get("prescaler_accum", 0))
+        self._last_counter = int(state.get("last_counter", 0)) & 0xFFFFFFFF
+        self._update_irq()
+
 
 def build_tim5(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
     return BasicTimerPeripheral(peripheral=peripheral, irq=50)

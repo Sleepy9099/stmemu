@@ -377,3 +377,53 @@ class CortexMCorePeripheral(RegisterPeripheral):
             return
 
         self._values[self._SCB_ICSR] = self._build_icsr_value()
+
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base.update(
+            {
+                "irq_enabled": [int(x) & 0xFFFFFFFF for x in self._irq_enabled],
+                "irq_pending": [int(x) & 0xFFFFFFFF for x in self._irq_pending],
+                "irq_active": [int(x) & 0xFFFFFFFF for x in self._irq_active],
+                "system_pending": {k: bool(v) for k, v in self._system_pending.items()},
+                "active_exceptions": [int(x) for x in self._active_exceptions],
+            }
+        )
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if not isinstance(state, dict):
+            return
+
+        irq_enabled = state.get("irq_enabled")
+        if isinstance(irq_enabled, list):
+            self._irq_enabled = [int(x) & 0xFFFFFFFF for x in irq_enabled[: self._NVIC_WORDS]]
+            self._irq_enabled += [0] * max(0, self._NVIC_WORDS - len(self._irq_enabled))
+
+        irq_pending = state.get("irq_pending")
+        if isinstance(irq_pending, list):
+            self._irq_pending = [int(x) & 0xFFFFFFFF for x in irq_pending[: self._NVIC_WORDS]]
+            self._irq_pending += [0] * max(0, self._NVIC_WORDS - len(self._irq_pending))
+
+        irq_active = state.get("irq_active")
+        if isinstance(irq_active, list):
+            self._irq_active = [int(x) & 0xFFFFFFFF for x in irq_active[: self._NVIC_WORDS]]
+            self._irq_active += [0] * max(0, self._NVIC_WORDS - len(self._irq_active))
+
+        system_pending = state.get("system_pending")
+        if isinstance(system_pending, dict):
+            merged = dict(self._system_pending)
+            for key, value in system_pending.items():
+                if key in merged:
+                    merged[key] = bool(value)
+            self._system_pending = merged
+
+        active_exceptions = state.get("active_exceptions")
+        if isinstance(active_exceptions, list):
+            self._active_exceptions = [int(x) for x in active_exceptions]
+
+        for word in range(self._NVIC_WORDS):
+            self._sync_irq_words(word)

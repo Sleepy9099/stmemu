@@ -133,3 +133,20 @@ class RegisterPeripheral(PeripheralModel):
         current = self._values.get(slot, 0) & 0xFFFFFFFF
         next_value = (current & ~write_mask) | ((int(value) & mask_for_size(size)) << shift)
         self._values[slot] = next_value & 0xFFFFFFFF
+
+    def snapshot_state(self) -> object | None:
+        return {"values": {int(k): int(v) for k, v in self._values.items()}}
+
+    def restore_state(self, state: object) -> None:
+        if not isinstance(state, dict):
+            return
+        values = state.get("values")
+        if not isinstance(values, dict):
+            return
+        restored: dict[int, int] = {}
+        for key, value in values.items():
+            try:
+                restored[int(key)] = int(value) & 0xFFFFFFFF
+            except Exception:
+                continue
+        self._values = restored

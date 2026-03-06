@@ -46,3 +46,35 @@ class GenericRegisterFilePeripheral(RegisterPeripheral):
     def force_bit_after_reads(self, reg_offset: int, bit_index: int, reads_before_set: int = 5) -> None:
         rules = self._force_bits_after_reads.setdefault(reg_offset, [])
         rules.append((bit_index, reads_before_set))
+
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base["read_counts"] = {int(k): int(v) for k, v in self._read_counts.items()}
+        base["force_bits_after_reads"] = {
+            int(k): [(int(bit), int(reads)) for bit, reads in v]
+            for k, v in self._force_bits_after_reads.items()
+        }
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if not isinstance(state, dict):
+            return
+        read_counts = state.get("read_counts")
+        if isinstance(read_counts, dict):
+            self._read_counts = {int(k): int(v) for k, v in read_counts.items()}
+        force_rules = state.get("force_bits_after_reads")
+        if isinstance(force_rules, dict):
+            rebuilt: dict[int, list[tuple[int, int]]] = {}
+            for key, value in force_rules.items():
+                if not isinstance(value, list):
+                    continue
+                rules: list[tuple[int, int]] = []
+                for item in value:
+                    if not isinstance(item, (list, tuple)) or len(item) != 2:
+                        continue
+                    rules.append((int(item[0]), int(item[1])))
+                rebuilt[int(key)] = rules
+            self._force_bits_after_reads = rebuilt

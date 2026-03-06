@@ -70,6 +70,9 @@ class StmEmuShell(cmd.Cmd):
     def do_mem(self, arg: str) -> None:
         self.default("mem " + arg if arg else "mem")
 
+    def do_reg(self, arg: str) -> None:
+        self.default("reg " + arg if arg else "reg")
+
     def do_mmio(self, arg: str) -> None:
         self.default("mmio " + arg if arg else "mmio")
 
@@ -96,3 +99,27 @@ class StmEmuShell(cmd.Cmd):
 
     def do_vtbl(self, arg: str) -> None:
         self.default("vtbl " + arg if arg else "vtbl")
+
+    def do_wp(self, arg: str) -> None:
+        self.default("wp " + arg if arg else "wp")
+
+    def do_snap(self, arg: str) -> None:
+        self.default("snap " + arg if arg else "snap")
+
+    def do_ret(self, arg: str) -> None:
+        self.default("ret " + arg if arg else "ret")
+
+    def do_stub(self, arg: str) -> None:
+        self.default("stub " + arg if arg else "stub")
+
+    def do_skip(self, arg: str) -> None:
+        self.default("skip " + arg if arg else "skip")
+
+    def do_fault(self, arg: str) -> None:
+        self.default("fault " + arg if arg else "fault")
+
+    def do_export(self, arg: str) -> None:
+        self.default("export " + arg if arg else "export")
+
+    def do_scenario(self, arg: str) -> None:
+        self.default("scenario " + arg if arg else "scenario")

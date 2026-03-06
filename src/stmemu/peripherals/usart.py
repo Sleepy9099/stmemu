@@ -149,6 +149,29 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
             pending = True
         self._context.interrupts.set_irq_pending(self.irq, pending)
 
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base["rx_fifo"] = [int(b) & 0xFF for b in self._rx_fifo]
+        base["tx_fifo"] = bytes(self._tx_fifo)
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if not isinstance(state, dict):
+            return
+        rx_fifo = state.get("rx_fifo")
+        if isinstance(rx_fifo, list):
+            self._rx_fifo.clear()
+            for byte in rx_fifo:
+                self._rx_fifo.append(int(byte) & 0xFF)
+        tx_fifo = state.get("tx_fifo")
+        if isinstance(tx_fifo, (bytes, bytearray)):
+            self._tx_fifo = bytearray(tx_fifo)
+        self._refresh_status()
+        self._update_irq()
+
 
 USART_IRQS: dict[str, int] = {
     "USART1": 37,

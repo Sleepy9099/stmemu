@@ -51,6 +51,19 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
                 self.write_register_value(self._cr_offset, control & ~self._CR_ADCAL)
         return super().read(offset, size)
 
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base["calibration_reads_remaining"] = int(self._calibration_reads_remaining)
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if not isinstance(state, dict):
+            return
+        self._calibration_reads_remaining = int(state.get("calibration_reads_remaining", 0))
+
 
 def build_adc(peripheral: SvdPeripheral) -> Stm32AdcPeripheral:
     return Stm32AdcPeripheral(peripheral=peripheral)

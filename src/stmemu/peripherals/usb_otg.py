@@ -43,6 +43,19 @@ class OtgGlobalPeripheral(GenericRegisterFilePeripheral):
             return
         super().write(offset, size, value)
 
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base["reset_reads_remaining"] = int(self._reset_reads_remaining)
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if not isinstance(state, dict):
+            return
+        self._reset_reads_remaining = int(state.get("reset_reads_remaining", 0))
+
 
 def build_otg_global(peripheral: SvdPeripheral) -> OtgGlobalPeripheral:
     return OtgGlobalPeripheral(peripheral=peripheral)
