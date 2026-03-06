@@ -88,6 +88,7 @@ class _FakeEmu:
         self.pc_reg_writes: list[object] = []
         self._pc_cpu_actions: list[dict[str, object]] = []
         self._pc_cpu_next_id = 1
+        self._memory: dict[int, int] = {}
 
         self.last_pc_break = None
         self.last_mmio_break = None
@@ -109,6 +110,8 @@ class _FakeEmu:
         self.last_fault_report = None
         self._fail_step = False
         self._fail_run = False
+        self.on_step = None
+        self.on_run = None
 
     def read_regs(self) -> dict[str, int]:
         return dict(self._regs)
@@ -157,11 +160,18 @@ class _FakeEmu:
         self.last_step = count
         if self._fail_step:
             raise RuntimeError("step failed")
+        cb = self.on_step
+        if cb is not None:
+            for _ in range(max(0, int(count))):
+                cb()
 
     def run(self, count: int = 1) -> None:
         self.last_run = count
         if self._fail_run:
             raise RuntimeError("run failed")
+        cb = self.on_run
+        if cb is not None:
+            cb(int(count))
 
     def capture_snapshot(self, name: str = "(current)"):
         return types.SimpleNamespace(
@@ -173,6 +183,18 @@ class _FakeEmu:
             exception_return_stack=(),
             pc_hist={},
         )
+
+    def mem_read(self, addr: int, ln: int) -> bytes:
+        base = int(addr)
+        size = int(ln)
+        if size < 0:
+            raise ValueError("len must be >= 0")
+        return bytes(self._memory.get(base + i, 0) for i in range(size))
+
+    def mem_write(self, addr: int, data: bytes) -> None:
+        base = int(addr)
+        for i, b in enumerate(bytes(data)):
+            self._memory[base + i] = int(b) & 0xFF
 
     def save_snapshot(self, name: str):
         snap = self.capture_snapshot(name)
@@ -295,6 +317,26 @@ class _FakeEmu:
 
 class _FakeBus:
     pass
+
+
+class _FakeUartModel:
+    def __init__(self) -> None:
+        self.rx = bytearray()
+        self.tx = bytearray()
+
+    def inject_rx_bytes(self, data: bytes) -> None:
+        self.rx.extend(data)
+
+    def peek_tx_bytes(self) -> bytes:
+        return bytes(self.tx)
+
+    def drain_tx_bytes(self) -> bytes:
+        data = bytes(self.tx)
+        self.tx.clear()
+        return data
+
+    def status_summary(self) -> str:
+        return f"rx={len(self.rx)} tx={len(self.tx)} isr=0x00000000 cr1=0x00000000"
 
 
 class ShellCommandTests(unittest.TestCase):
@@ -480,6 +522,156 @@ class ShellCommandTests(unittest.TestCase):
             out = self.cmds.cmd_scenario([str(scenario_path)])
             self.assertIn("scenario failed:", out)
             self.assertIn("bad.scn:2:", out)
+
+    def test_checkpoint_and_reload_default_name(self) -> None:
+        self.emu.write_reg("r0", 0x1111)
+        out_ckpt = self.cmds.cmd_checkpoint([])
+        self.assertIn("snapshot saved: baseline", out_ckpt)
+
+        self.emu.write_reg("r0", 0x2222)
+        out_reload = self.cmds.cmd_reload([])
+        self.assertIn("snapshot loaded: baseline", out_reload)
+        self.assertEqual(self.emu.read_regs()["r0"], 0x1111)
+
+    def test_repeat_and_test_commands(self) -> None:
+        out_repeat = self.cmds.cmd_repeat(["3", "reg", "set", "r0", "0x3"])
+        self.assertIn("[1] r0 <- 0x00000003", out_repeat)
+        self.assertIn("[3] r0 <- 0x00000003", out_repeat)
+
+        self.emu.write_reg("r1", 0x10)
+        self.cmds.cmd_snap(["save", "loop_base"])
+        self.emu.write_reg("r1", 0)
+        out_test = self.cmds.cmd_test(["from", "loop_base", "2", "reg", "r1"])
+        self.assertEqual(out_test, "test done: passed=2 failed=0 total=2")
+
+    def test_log_start_run_note_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "session.log"
+            out_start = self.cmds.cmd_log(["start", str(log_path)])
+            self.assertIn("log = on", out_start)
+
+            out_run = self.cmds.cmd_log(["run", "reg", "set", "r0", "0x44"])
+            self.assertEqual(out_run, "r0 <- 0x00000044")
+
+            out_note = self.cmds.cmd_log(["note", "bootloader", "probe"])
+            self.assertEqual(out_note, "log note written")
+
+            out_stop = self.cmds.cmd_log(["stop"])
+            self.assertEqual(out_stop, "log = off")
+
+            payload = log_path.read_text(encoding="utf-8")
+            self.assertIn("reg set r0 0x44", payload)
+            self.assertIn("r0 <- 0x00000044", payload)
+            self.assertIn("bootloader probe", payload)
+
+    def test_uart_xfer_and_waittx_helpers(self) -> None:
+        model = _FakeUartModel()
+        self.cmds._resolve_uart_model = lambda name: model  # type: ignore[method-assign]
+
+        def on_run(count: int) -> None:
+            if bytes(model.rx).endswith(bytes.fromhex("2120")):
+                model.tx.extend(bytes.fromhex("1210"))
+
+        self.emu.on_run = on_run
+
+        out_xfer = self.cmds.cmd_uart(
+            ["xfer", "UART7", "2120", "10", "expect-prefix", "12"]
+        )
+        self.assertIn("UART7 xfer", out_xfer)
+        self.assertIn("hex  = 1210", out_xfer)
+        self.assertIn("match = ok (prefix)", out_xfer)
+
+        model.tx.clear()
+
+        def on_step() -> None:
+            if len(model.tx) < 2:
+                model.tx.append(0x55)
+
+        self.emu.on_step = on_step
+        out_wait = self.cmds.cmd_uart(["waittx", "UART7", "2", "5"])
+        self.assertIn("waittx ready: UART7", out_wait)
+        self.assertIn("tx_len=2", out_wait)
+
+    def test_uart_xfer_expect_mismatch_errors(self) -> None:
+        model = _FakeUartModel()
+        model.tx.extend(bytes.fromhex("1210"))
+        self.cmds._resolve_uart_model = lambda name: model  # type: ignore[method-assign]
+        out = self.cmds.cmd_uart(["xfer", "UART7", "2120", "0", "expect", "1110"])
+        self.assertTrue(out.startswith("error: uart xfer expected=1110 got=1210"))
+
+    def test_uart_sweep_with_snapshot_reload(self) -> None:
+        model = _FakeUartModel()
+        self.cmds._resolve_uart_model = lambda name: model  # type: ignore[method-assign]
+
+        def on_run(count: int) -> None:
+            del count
+            rx = bytes(model.rx)
+            if rx.endswith(bytes.fromhex("2120")):
+                model.tx.extend(bytes.fromhex("1210"))
+            elif rx.endswith(bytes.fromhex("220120")):
+                model.tx.extend(bytes.fromhex("050000001210"))
+            model.rx.clear()
+
+        self.emu.on_run = on_run
+        self.cmds.cmd_snap(["save", "ready"])
+        out = self.cmds.cmd_uart(
+            ["sweep", "UART7", "ready", "1", "2120", "220120"]
+        )
+        self.assertIn("summary passed=2 failed=0", out)
+        self.assertIn("[1] cmd=2120 status=ok tx=1210", out)
+        self.assertIn("[2] cmd=220120 status=ok tx=050000001210", out)
+
+    def test_uart_sweepfile_and_txsave_and_mem_file_io(self) -> None:
+        model = _FakeUartModel()
+        self.cmds._resolve_uart_model = lambda name: model  # type: ignore[method-assign]
+
+        def on_run(count: int) -> None:
+            del count
+            rx = bytes(model.rx)
+            if rx.endswith(bytes.fromhex("2120")):
+                model.tx.extend(bytes.fromhex("1210"))
+            elif rx.endswith(bytes.fromhex("220120")):
+                model.tx.extend(bytes.fromhex("050000001210"))
+            model.rx.clear()
+
+        self.emu.on_run = on_run
+        self.cmds.cmd_snap(["save", "ready"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cmd_file = tmpdir / "cmds.txt"
+            cmd_file.write_text(
+                "# command vectors\n"
+                "2120 => 1210\n"
+                "220120 ~> 05000000\n",
+                encoding="utf-8",
+            )
+            out_sweep = self.cmds.cmd_uart(["sweepfile", "UART7", "ready", "1", str(cmd_file)])
+            self.assertIn("summary passed=2 failed=0", out_sweep)
+
+            # txsave
+            model.tx.extend(b"\xAA\xBB")
+            out_txsave = self.cmds.cmd_uart(["txsave", "UART7", str(tmpdir / "tx.bin"), "clear"])
+            self.assertIn("saved 2 byte(s)", out_txsave)
+            self.assertEqual((tmpdir / "tx.bin").read_bytes(), b"\xAA\xBB")
+            self.assertEqual(model.peek_tx_bytes(), b"")
+
+            # mem load/save + mem w from @file + hex@file
+            payload = b"\x01\x02\x03\x04"
+            (tmpdir / "in.bin").write_bytes(payload)
+            out_load = self.cmds.cmd_mem(["load", "0x20000000", str(tmpdir / "in.bin")])
+            self.assertIn("loaded 4 bytes", out_load)
+            out_save = self.cmds.cmd_mem(["save", "0x20000000", "4", str(tmpdir / "out.bin")])
+            self.assertIn("saved 4 bytes", out_save)
+            self.assertEqual((tmpdir / "out.bin").read_bytes(), payload)
+
+            (tmpdir / "raw.bin").write_bytes(b"\x10\x11")
+            out_w_file = self.cmds.cmd_mem(["w", "0x20000010", f"@{tmpdir / 'raw.bin'}"])
+            self.assertIn("wrote 2 bytes", out_w_file)
+
+            (tmpdir / "hex.txt").write_text("AA BB CC", encoding="utf-8")
+            out_w_hexfile = self.cmds.cmd_mem(["w", "0x20000020", f"hex@{tmpdir / 'hex.txt'}"])
+            self.assertIn("wrote 3 bytes", out_w_hexfile)
 
 
 if __name__ == "__main__":

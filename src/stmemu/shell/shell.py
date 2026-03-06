@@ -123,3 +123,18 @@ class StmEmuShell(cmd.Cmd):
 
     def do_scenario(self, arg: str) -> None:
         self.default("scenario " + arg if arg else "scenario")
+
+    def do_checkpoint(self, arg: str) -> None:
+        self.default("checkpoint " + arg if arg else "checkpoint")
+
+    def do_reload(self, arg: str) -> None:
+        self.default("reload " + arg if arg else "reload")
+
+    def do_repeat(self, arg: str) -> None:
+        self.default("repeat " + arg if arg else "repeat")
+
+    def do_test(self, arg: str) -> None:
+        self.default("test " + arg if arg else "test")
+
+    def do_log(self, arg: str) -> None:
+        self.default("log " + arg if arg else "log")

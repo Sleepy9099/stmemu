@@ -5,6 +5,7 @@ import json
 import shlex
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from stmemu.core.emulator import Emulator, PcRegWrite
@@ -25,6 +26,8 @@ class Commands:
 
     def __post_init__(self) -> None:
         self._dasm = ThumbDisassembler()
+        self._checkpoint_default_name = "baseline"
+        self._command_log_path: Path | None = None
 
     def cmd_regs(self, argv: list[str]) -> str:
         regs = self.emu.read_regs()
@@ -91,7 +94,10 @@ class Commands:
 
     def cmd_mem(self, argv: list[str]) -> str:
         if len(argv) < 1:
-            return "usage: mem r <addr> <len> | mem w <addr> <hexbytes>"
+            return (
+                "usage: mem r <addr> <len> | mem w <addr> <hexbytes|@file|hex@file> | "
+                "mem load <addr> <file> | mem save <addr> <len> <file>"
+            )
         op = argv[0]
         if op == "r":
             if len(argv) != 3:
@@ -101,13 +107,42 @@ class Commands:
             return hexdump(data, base=addr)
         if op == "w":
             if len(argv) != 3:
-                return "usage: mem w <addr> <hexbytes>"
+                return "usage: mem w <addr> <hexbytes|@file|hex@file>"
             addr = _int(argv[1])
-            hx = argv[2].replace(" ", "")
-            data = bytes.fromhex(hx)
+            try:
+                data = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
             self.emu.mem_write(addr, data)
             return f"wrote {len(data)} bytes to 0x{addr:08X}"
-        return "usage: mem r <addr> <len> | mem w <addr> <hexbytes>"
+        if op == "load":
+            if len(argv) != 3:
+                return "usage: mem load <addr> <file>"
+            addr = _int(argv[1])
+            try:
+                data = Path(argv[2]).expanduser().read_bytes()
+            except OSError as e:
+                return f"error: {e}"
+            self.emu.mem_write(addr, data)
+            return f"loaded {len(data)} bytes from {argv[2]} into 0x{addr:08X}"
+        if op == "save":
+            if len(argv) != 4:
+                return "usage: mem save <addr> <len> <file>"
+            addr = _int(argv[1])
+            ln = _int(argv[2])
+            if ln < 0:
+                return "len must be >= 0"
+            try:
+                data = bytes(self.emu.mem_read(addr, ln))
+                path = self._prepare_export_path(argv[3])
+                path.write_bytes(data)
+            except Exception as e:
+                return f"error: {e}"
+            return f"saved {len(data)} bytes from 0x{addr:08X} to {path}"
+        return (
+            "usage: mem r <addr> <len> | mem w <addr> <hexbytes|@file|hex@file> | "
+            "mem load <addr> <file> | mem save <addr> <len> <file>"
+        )
 
     def cmd_mmio(self, argv: list[str]) -> str:
         if len(argv) != 2 or argv[0] != "log":
@@ -306,8 +341,17 @@ class Commands:
         return "usage: periph list | periph read <P.REG|addr> | periph write <P.REG|addr> <value>"
 
     def cmd_uart(self, argv: list[str]) -> str:
+        usage = (
+            "usage: uart list | uart status <name> | uart rx <name> <hexbytes|@file|hex@file> | "
+            "uart tx <name> [clear] | uart txsave <name> <file> [clear] | "
+            "uart waittx <name> <min_len> [max_steps] | "
+            "uart xfer <name> <hexbytes|@file|hex@file> [steps] "
+            "[expect <hexbytes|@file|hex@file>] [expect-prefix <hexbytes|@file|hex@file>] [clear] | "
+            "uart sweep <name> <snapshot> <steps> <cmd1> [cmd2 ...] | "
+            "uart sweepfile <name> <snapshot> <steps> <file>"
+        )
         if not argv:
-            return "usage: uart list | uart status <name> | uart rx <name> <hexbytes> | uart tx <name> [clear]"
+            return usage
 
         sub = argv[0].lower()
         if sub == "list":
@@ -326,9 +370,12 @@ class Commands:
 
         if sub == "rx":
             if len(argv) != 3:
-                return "usage: uart rx <name> <hexbytes>"
+                return "usage: uart rx <name> <hexbytes|@file|hex@file>"
             model = self._resolve_uart_model(argv[1])
-            payload = bytes.fromhex(argv[2].replace(" ", ""))
+            try:
+                payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
             model.inject_rx_bytes(payload)
             return f"injected {len(payload)} byte(s) into {argv[1].upper()}"
 
@@ -338,14 +385,241 @@ class Commands:
             model = self._resolve_uart_model(argv[1])
             clear = len(argv) == 3 and argv[2].lower() == "clear"
             payload = model.drain_tx_bytes() if clear else model.peek_tx_bytes()
-            text = "".join(chr(b) if 32 <= b < 127 else "." for b in payload)
-            return (
-                f"{argv[1].upper()} tx_len={len(payload)}\n"
-                f"hex  = {payload.hex() or '-'}\n"
-                f"ascii= {text or '-'}"
-            )
+            return self._format_uart_tx(argv[1], payload)
 
-        return "usage: uart list | uart status <name> | uart rx <name> <hexbytes> | uart tx <name> [clear]"
+        if sub == "txsave":
+            if len(argv) not in {3, 4}:
+                return "usage: uart txsave <name> <file> [clear]"
+            model = self._resolve_uart_model(argv[1])
+            clear = len(argv) == 4 and argv[3].lower() == "clear"
+            payload = model.drain_tx_bytes() if clear else model.peek_tx_bytes()
+            try:
+                path = self._prepare_export_path(argv[2])
+                path.write_bytes(payload)
+            except OSError as e:
+                return f"error: {e}"
+            return f"saved {len(payload)} byte(s) from {argv[1].upper()} tx to {path}"
+
+        if sub == "waittx":
+            if len(argv) not in {3, 4}:
+                return "usage: uart waittx <name> <min_len> [max_steps]"
+            model = self._resolve_uart_model(argv[1])
+            min_len = _int(argv[2])
+            if min_len < 0:
+                return "min_len must be >= 0"
+            max_steps = _int(argv[3]) if len(argv) == 4 else 100000
+            if max_steps < 0:
+                return "max_steps must be >= 0"
+
+            steps = 0
+            while len(model.peek_tx_bytes()) < int(min_len) and steps < int(max_steps):
+                self.emu.step(1)
+                steps += 1
+
+            payload = model.peek_tx_bytes()
+            if len(payload) < int(min_len):
+                return (
+                    f"error: waittx timeout name={argv[1].upper()} got={len(payload)} "
+                    f"need={int(min_len)} steps={steps}"
+                )
+            return f"waittx ready: {argv[1].upper()} steps={steps}\n" + self._format_uart_tx(argv[1], payload)
+
+        if sub == "xfer":
+            if len(argv) < 3:
+                return (
+                    "usage: uart xfer <name> <hexbytes> [steps] "
+                    "[expect <hexbytes>] [expect-prefix <hexbytes>] [clear]"
+                )
+            model = self._resolve_uart_model(argv[1])
+            try:
+                rx_payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
+
+            steps = 100000
+            expect_exact: bytes | None = None
+            expect_prefix: bytes | None = None
+            clear = False
+            i = 3
+            if i < len(argv):
+                try:
+                    steps = _int(argv[i])
+                    i += 1
+                except Exception:
+                    pass
+            while i < len(argv):
+                tok = argv[i].lower()
+                if tok == "clear":
+                    clear = True
+                    i += 1
+                    continue
+                if tok in {"expect", "expect-prefix"}:
+                    if i + 1 >= len(argv):
+                        return (
+                            "usage: uart xfer <name> <hexbytes> [steps] "
+                            "[expect <hexbytes>] [expect-prefix <hexbytes>] [clear]"
+                        )
+                    try:
+                        val = self._read_bytes_spec(argv[i + 1])
+                    except Exception as e:
+                        return f"error: {e}"
+                    if tok == "expect":
+                        expect_exact = val
+                    else:
+                        expect_prefix = val
+                    i += 2
+                    continue
+                return (
+                    "usage: uart xfer <name> <hexbytes> [steps] "
+                    "[expect <hexbytes>] [expect-prefix <hexbytes>] [clear]"
+                )
+
+            if steps < 0:
+                return "steps must be >= 0"
+            model.inject_rx_bytes(rx_payload)
+            if steps > 0:
+                try:
+                    self.emu.run(steps)
+                except Exception as e:
+                    return f"error: {e}"
+            tx_payload = model.drain_tx_bytes() if clear else model.peek_tx_bytes()
+            if expect_exact is not None and tx_payload != expect_exact:
+                return (
+                    f"error: uart xfer expected={expect_exact.hex() or '-'} "
+                    f"got={tx_payload.hex() or '-'}"
+                )
+            if expect_prefix is not None and not tx_payload.startswith(expect_prefix):
+                return (
+                    f"error: uart xfer expected-prefix={expect_prefix.hex() or '-'} "
+                    f"got={tx_payload.hex() or '-'}"
+                )
+
+            lines = [
+                f"{argv[1].upper()} xfer steps={steps} clear={'1' if clear else '0'}",
+                f"rx_len={len(rx_payload)} rx_hex={rx_payload.hex() or '-'}",
+                self._format_uart_tx(argv[1], tx_payload),
+            ]
+            if expect_exact is not None:
+                lines.append("match = ok (exact)")
+            if expect_prefix is not None:
+                lines.append("match = ok (prefix)")
+            return "\n".join(lines)
+
+        if sub == "sweep":
+            if len(argv) < 5:
+                return "usage: uart sweep <name> <snapshot> <steps> <hexcmd1> [hexcmd2 ...]"
+            name = argv[1]
+            snapshot_name = argv[2]
+            steps = _int(argv[3])
+            if steps < 0:
+                return "steps must be >= 0"
+
+            commands = argv[4:]
+            failed = 0
+            lines = [
+                (
+                    f"uart sweep name={name.upper()} snapshot={snapshot_name} "
+                    f"steps={steps} count={len(commands)}"
+                )
+            ]
+            for idx, hex_cmd in enumerate(commands, start=1):
+                load_out = self.cmd_snap(["load", snapshot_name])
+                if load_out.startswith("unknown snapshot:"):
+                    return load_out
+                out = self.cmd_uart(["xfer", name, hex_cmd, str(steps), "clear"])
+                is_error = out.lower().startswith("error:")
+                if is_error:
+                    failed += 1
+                tx_hex = "-"
+                for row in out.splitlines():
+                    if row.startswith("hex  = "):
+                        tx_hex = row.split("=", 1)[1].strip()
+                        break
+                lines.append(
+                    f"[{idx}] cmd={hex_cmd} status={'error' if is_error else 'ok'} tx={tx_hex}"
+                )
+                if is_error:
+                    lines.append("    " + out)
+            lines.insert(1, f"summary passed={len(commands) - failed} failed={failed}")
+            return "\n".join(lines)
+
+        if sub == "sweepfile":
+            if len(argv) != 5:
+                return "usage: uart sweepfile <name> <snapshot> <steps> <file>"
+            name = argv[1]
+            snapshot_name = argv[2]
+            steps = _int(argv[3])
+            if steps < 0:
+                return "steps must be >= 0"
+            path = Path(argv[4]).expanduser()
+            try:
+                raw_lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                return f"error: {e}"
+
+            entries: list[tuple[str, str, str | None, int]] = []
+            for lineno, raw in enumerate(raw_lines, start=1):
+                stripped = raw.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                try:
+                    toks = shlex.split(stripped)
+                except ValueError as e:
+                    return f"error: sweepfile parse {path}:{lineno}: {e}"
+                if len(toks) == 1:
+                    entries.append((toks[0], "", None, lineno))
+                    continue
+                if len(toks) == 3 and toks[1] in {"=>", "~>"}:
+                    entries.append((toks[0], toks[1], toks[2], lineno))
+                    continue
+                return (
+                    f"error: sweepfile parse {path}:{lineno}: "
+                    "expected '<cmd>', '<cmd> => <expect>', or '<cmd> ~> <prefix>'"
+                )
+
+            failed = 0
+            lines = [
+                (
+                    f"uart sweepfile name={name.upper()} snapshot={snapshot_name} "
+                    f"steps={steps} file={path} count={len(entries)}"
+                )
+            ]
+            for idx, (cmd_spec, op, expect_spec, lineno) in enumerate(entries, start=1):
+                load_out = self.cmd_snap(["load", snapshot_name])
+                if load_out.startswith("unknown snapshot:"):
+                    return load_out
+                xfer_argv = ["xfer", name, cmd_spec, str(steps), "clear"]
+                if op == "=>":
+                    xfer_argv.extend(["expect", str(expect_spec)])
+                elif op == "~>":
+                    xfer_argv.extend(["expect-prefix", str(expect_spec)])
+                out = self.cmd_uart(xfer_argv)
+                is_error = out.lower().startswith("error:")
+                if is_error:
+                    failed += 1
+                tx_hex = "-"
+                for row in out.splitlines():
+                    if row.startswith("hex  = "):
+                        tx_hex = row.split("=", 1)[1].strip()
+                        break
+                lines.append(
+                    f"[{idx}] line={lineno} cmd={cmd_spec} status={'error' if is_error else 'ok'} tx={tx_hex}"
+                )
+                if is_error:
+                    lines.append("    " + out)
+            lines.insert(1, f"summary passed={len(entries) - failed} failed={failed}")
+            return "\n".join(lines)
+
+        return usage
+
+    @staticmethod
+    def _format_uart_tx(name: str, payload: bytes) -> str:
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in payload)
+        return (
+            f"{name.upper()} tx_len={len(payload)}\n"
+            f"hex  = {payload.hex() or '-'}\n"
+            f"ascii= {text or '-'}"
+        )
 
     def cmd_vtbl(self, argv: list[str]) -> str:
         if not argv:
@@ -833,6 +1107,22 @@ class Commands:
         return path
 
     @staticmethod
+    def _read_bytes_spec(spec: str) -> bytes:
+        s = str(spec).strip()
+        if not s:
+            return b""
+        if s.lower().startswith("hex@"):
+            path = Path(s[4:]).expanduser()
+            text = path.read_text(encoding="utf-8")
+            # bytes.fromhex tolerates whitespace; also support separators.
+            cleaned = text.replace(",", " ").replace(":", " ")
+            return bytes.fromhex(cleaned)
+        if s.startswith("@"):
+            path = Path(s[1:]).expanduser()
+            return path.read_bytes()
+        return bytes.fromhex(s.replace(",", " ").replace(":", " "))
+
+    @staticmethod
     def _detect_export_format(path: Path, default: str) -> str:
         ext = path.suffix.lower().lstrip(".")
         if ext in {"json", "csv", "txt"}:
@@ -868,9 +1158,36 @@ class Commands:
         cmd_name = tokens[0].replace("-", "_")
         handler = getattr(self, f"cmd_{cmd_name}", None)
         if handler is None:
-            raise ValueError(f"unknown command: {tokens[0]}")
-        out = handler(tokens[1:])
-        return "" if out is None else str(out)
+            err = f"unknown command: {tokens[0]}"
+            self._append_command_log(command_line=shlex.join(tokens), output="", error=err)
+            raise ValueError(err)
+        cmd_line = shlex.join(tokens)
+        try:
+            out = handler(tokens[1:])
+        except Exception as e:
+            self._append_command_log(command_line=cmd_line, output="", error=str(e))
+            raise
+        out_s = "" if out is None else str(out)
+        self._append_command_log(command_line=cmd_line, output=out_s, error=None)
+        return out_s
+
+    def _append_command_log(self, *, command_line: str, output: str, error: str | None) -> None:
+        path = self._command_log_path
+        if path is None:
+            return
+        ts = datetime.now(timezone.utc).isoformat()
+        lines = [f"[{ts}] $ {command_line}"]
+        if error is not None and str(error):
+            lines.append(f"error: {error}")
+        elif output:
+            lines.extend(str(output).splitlines())
+        try:
+            with path.open("a", encoding="utf-8", newline="\n") as f:
+                for line in lines:
+                    f.write(line)
+                    f.write("\n")
+        except Exception:
+            pass
 
     @staticmethod
     def _scenario_compare(actual: int, op: str, expected: int) -> bool:
@@ -1314,6 +1631,140 @@ class Commands:
             "export trace <path.{txt|json|csv}> [clear] | "
             "export snapdiff <path.{json|csv|txt}> <left> [right|current]"
         )
+
+    def cmd_checkpoint(self, argv: list[str]) -> str:
+        """
+        checkpoint [name]
+        Save a snapshot and make it the default for `reload`.
+        """
+        if len(argv) > 1:
+            return "usage: checkpoint [name]"
+        name = argv[0] if argv else self._checkpoint_default_name
+        out = self.cmd_snap(["save", name])
+        self._checkpoint_default_name = name
+        return out
+
+    def cmd_reload(self, argv: list[str]) -> str:
+        """
+        reload [name]
+        Load a snapshot (defaults to most recent checkpoint name).
+        """
+        if len(argv) > 1:
+            return "usage: reload [name]"
+        name = argv[0] if argv else self._checkpoint_default_name
+        return self.cmd_snap(["load", name])
+
+    def cmd_repeat(self, argv: list[str]) -> str:
+        """
+        repeat <count> <command ...>
+        """
+        if len(argv) < 2:
+            return "usage: repeat <count> <command ...>"
+        count = _int(argv[0])
+        if count <= 0:
+            return "count must be > 0"
+        command_tokens = argv[1:]
+        lines: list[str] = []
+        for i in range(1, int(count) + 1):
+            out = self._dispatch_command_tokens(command_tokens)
+            if out:
+                lines.append(f"[{i}] {out}")
+            else:
+                lines.append(f"[{i}] (ok)")
+        return "\n".join(lines)
+
+    def cmd_test(self, argv: list[str]) -> str:
+        """
+        test [from <snapshot>] <count> <command ...>
+        Runs a command repeatedly and reports failures (outputs starting with "error:").
+        """
+        if not argv:
+            return "usage: test [from <snapshot>] <count> <command ...>"
+
+        snap_name: str | None = None
+        idx = 0
+        if len(argv) >= 3 and argv[0].lower() == "from":
+            snap_name = argv[1]
+            idx = 2
+
+        if len(argv) <= idx + 0:
+            return "usage: test [from <snapshot>] <count> <command ...>"
+        if len(argv) <= idx + 1:
+            return "usage: test [from <snapshot>] <count> <command ...>"
+
+        count = _int(argv[idx])
+        if count <= 0:
+            return "count must be > 0"
+        command_tokens = argv[idx + 1 :]
+        if not command_tokens:
+            return "usage: test [from <snapshot>] <count> <command ...>"
+
+        failures: list[str] = []
+        for i in range(1, int(count) + 1):
+            if snap_name is not None:
+                loaded = self.cmd_snap(["load", snap_name])
+                if loaded.startswith("unknown snapshot:"):
+                    return loaded
+            out = self._dispatch_command_tokens(command_tokens)
+            if out.lower().startswith("error:"):
+                failures.append(f"[{i}] {out}")
+
+        passed = int(count) - len(failures)
+        lines = [f"test done: passed={passed} failed={len(failures)} total={int(count)}"]
+        for row in failures[:10]:
+            lines.append(row)
+        if len(failures) > 10:
+            lines.append(f"... ({len(failures) - 10} more failures)")
+        return "\n".join(lines)
+
+    def cmd_log(self, argv: list[str]) -> str:
+        """
+        log status
+        log start <path>
+        log stop
+        log note <text ...>
+        log run <command ...>
+        """
+        if not argv or argv[0].lower() == "status":
+            if self._command_log_path is None:
+                return "log = off"
+            return f"log = on ({self._command_log_path})"
+
+        sub = argv[0].lower()
+        if sub == "start":
+            if len(argv) != 2:
+                return "usage: log start <path>"
+            path = self._prepare_export_path(argv[1])
+            self._command_log_path = path
+            with path.open("w", encoding="utf-8", newline="\n") as f:
+                f.write(f"# stmemu command log started {datetime.now(timezone.utc).isoformat()}\n")
+            return f"log = on ({path})"
+
+        if sub == "stop":
+            if len(argv) != 1:
+                return "usage: log stop"
+            self._command_log_path = None
+            return "log = off"
+
+        if sub == "note":
+            if len(argv) < 2:
+                return "usage: log note <text ...>"
+            if self._command_log_path is None:
+                return "log is off; use: log start <path>"
+            self._append_command_log(
+                command_line="note",
+                output=" ".join(argv[1:]),
+                error=None,
+            )
+            return "log note written"
+
+        if sub == "run":
+            if len(argv) < 2:
+                return "usage: log run <command ...>"
+            out = self._dispatch_command_tokens(argv[1:])
+            return out or "(ok)"
+
+        return "usage: log [status|start <path>|stop|note <text ...>|run <command ...>]"
 
     def cmd_image(self, argv: list[str]) -> str:
         if argv:
