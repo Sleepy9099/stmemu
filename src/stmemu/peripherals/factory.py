@@ -7,8 +7,13 @@ from typing import Callable, Optional
 from stmemu.peripherals.adc import build_adc
 from stmemu.peripherals.bus import PeripheralBus, PeripheralModel
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
+from stmemu.peripherals.dma import build_dma
+from stmemu.peripherals.flash import build_flash
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
+from stmemu.peripherals.gpio import build_gpio
+from stmemu.peripherals.i2c import build_i2c
 from stmemu.peripherals.memory import RawMemoryPeripheral
+from stmemu.peripherals.spi import build_spi
 from stmemu.peripherals.timer import build_timer
 from stmemu.peripherals.usart import build_usart
 from stmemu.peripherals.usb_otg import build_otg_global
@@ -27,6 +32,12 @@ _PERIPHERAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^L?P?USART\d*$", re.IGNORECASE), "usart"),
     (re.compile(r"^UART\d*$", re.IGNORECASE), "usart"),
     (re.compile(r"^TIM\d+$", re.IGNORECASE), "timer"),
+    (re.compile(r"^GPIO[A-Z]$", re.IGNORECASE), "gpio"),
+    (re.compile(r"^FLASH$", re.IGNORECASE), "flash"),
+    (re.compile(r"^SPI\d*$", re.IGNORECASE), "spi"),
+    (re.compile(r"^I2C\d*$", re.IGNORECASE), "i2c"),
+    (re.compile(r"^DMA\d*$", re.IGNORECASE), "dma"),
+    (re.compile(r"^BDMA\d*$", re.IGNORECASE), "dma"),
     (re.compile(r"^OTG\d?_[A-Z]+_GLOBAL$", re.IGNORECASE), "otg_global"),
     (re.compile(r"^USB_OTG_[A-Z]+$", re.IGNORECASE), "otg_global"),
 ]
@@ -113,6 +124,11 @@ def create_default_registry() -> PeripheralFactoryRegistry:
     registry.register("__pattern__adc", build_adc)
     registry.register("__pattern__usart", build_usart)
     registry.register("__pattern__timer", build_timer)
+    registry.register("__pattern__gpio", build_gpio)
+    registry.register("__pattern__flash", build_flash)
+    registry.register("__pattern__spi", build_spi)
+    registry.register("__pattern__i2c", build_i2c)
+    registry.register("__pattern__dma", build_dma)
     registry.register("__pattern__otg_global", build_otg_global)
 
     return registry
