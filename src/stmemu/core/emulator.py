@@ -5,6 +5,8 @@ from typing import Optional, Tuple, List
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.core.disasm import ThumbDisassembler
 from stmemu.core.loader import FirmwareSegment
+from stmemu.core.semihosting import SemihostingHandler, BKPT_SEMIHOST
+from stmemu.core.symbols import SymbolTable
 
 from unicorn import Uc, UcError, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
 from unicorn.arm_const import (
@@ -123,6 +125,8 @@ class Emulator:
     interrupt_stuck_threshold: int = 50000000
     stuck_loop_auto: bool = True
     pc_reg_writes: list[PcRegWrite] = field(default_factory=list)
+    symbols: SymbolTable = field(default_factory=SymbolTable)
+    semihosting: SemihostingHandler = field(default_factory=SemihostingHandler)
 
     def __post_init__(self) -> None:
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
@@ -171,6 +175,9 @@ class Emulator:
         self._trace_stop_after_prev: bool = False
         self.pc_reg_writes: List[PcRegWrite] = []
         self._exception_stack: list[int] = []
+        # Code coverage tracking
+        self.coverage_enabled: bool = False
+        self._coverage: set[int] = set()
         self._exception_return_stack: list[int] = []
         self._special_step_consumed = False
         self._ignore_breakpoint_once: int | None = None
@@ -1382,10 +1389,25 @@ class Emulator:
 
     def _hook_code(self, uc, address, size, user_data):
         pc = int(address)
+        if self.coverage_enabled:
+            self._coverage.add(pc & ~1)
         if self.trace_enabled:
             self._trace_finalize_pending(next_pc=pc & ~1)
         else:
             self._trace_reset_pending()
+
+        # Semihosting: intercept BKPT 0xAB (opcode 0xBEAB)
+        if size == 2 and self.semihosting.enabled:
+            try:
+                opcode = int.from_bytes(bytes(uc.mem_read(pc, 2)), "little")
+                if opcode == BKPT_SEMIHOST:
+                    r0 = uc.reg_read(UC_ARM_REG_R0)
+                    r1 = uc.reg_read(UC_ARM_REG_R1)
+                    result = self.semihosting.handle(r0, r1, uc.mem_read, uc.mem_write, uc)
+                    uc.reg_write(UC_ARM_REG_R0, result & 0xFFFFFFFF)
+                    return
+            except Exception:
+                pass
 
         if self._intercept_pop_exc_return(uc, pc, size):
             return
@@ -1400,7 +1422,7 @@ class Emulator:
         if self._watch_break_if_needed("x", pc & ~1, size, pc=pc):
             return
 
-        self._apply_pc_reg_writes( int(address))
+        self._apply_pc_reg_writes(int(address))
         if self._apply_pc_cpu_actions(uc, int(address), int(size)):
             return
 

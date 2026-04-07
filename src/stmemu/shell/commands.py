@@ -334,7 +334,18 @@ class Commands:
                 return "usage: periph read <P.REG|addr>"
             addr = self._resolve_periph_addr(argv[1])
             val = self.bus.read(addr, 4)
-            return f"[0x{addr:08X}] = 0x{val:08X}"
+            lines = [f"[0x{addr:08X}] = 0x{val:08X}"]
+            # Field decode: find the peripheral and register for this address
+            p = self.bus.amap.find_peripheral(addr)
+            if p is not None:
+                reg = self.bus.amap.find_register(p, addr)
+                if reg is not None and reg.fields:
+                    for f in sorted(reg.fields, key=lambda f: f.bit_offset, reverse=True):
+                        mask = (1 << f.bit_width) - 1
+                        fval = (val >> f.bit_offset) & mask
+                        bits = f"[{f.bit_offset + f.bit_width - 1}:{f.bit_offset}]" if f.bit_width > 1 else f"[{f.bit_offset}]"
+                        lines.append(f"  {f.name:20} {bits:>8} = 0x{fval:X} ({fval})")
+            return "\n".join(lines)
 
         if sub == "write":
             if len(argv) != 3:
@@ -2577,5 +2588,148 @@ class Commands:
             else:
                 model.write(model._BSRR, 4, 1 << pin)
             return f"{argv[1].upper()} pin {pin} toggled (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        return usage
+
+    # ── Symbol table commands ──────────────────────────────────────
+
+    def cmd_sym(self, argv: list[str]) -> str:
+        usage = "usage: sym search <pattern> | sym addr <address> | sym name <name> | sym stats"
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "stats":
+            t = self.emu.symbols
+            return f"symbols loaded: {t.count}"
+
+        if sub == "search":
+            if len(argv) != 2:
+                return "usage: sym search <pattern>"
+            results = self.emu.symbols.search(argv[1])
+            if not results:
+                return "(no matches)"
+            lines = []
+            for s in results[:50]:
+                lines.append(f"0x{s.address:08X}  {s.sym_type:6}  size={s.size:<6}  {s.name}")
+            if len(results) > 50:
+                lines.append(f"... and {len(results) - 50} more")
+            return "\n".join(lines)
+
+        if sub == "addr":
+            if len(argv) != 2:
+                return "usage: sym addr <address>"
+            addr = _int(argv[1])
+            return self.emu.symbols.format_addr(addr)
+
+        if sub == "name":
+            if len(argv) != 2:
+                return "usage: sym name <name>"
+            s = self.emu.symbols.lookup_name(argv[1])
+            if s is None:
+                return f"symbol not found: {argv[1]}"
+            return f"0x{s.address:08X}  {s.sym_type:6}  size={s.size}  {s.name}"
+
+        return usage
+
+    # ── Semihosting commands ───────────────────────────────────────
+
+    def cmd_semihost(self, argv: list[str]) -> str:
+        usage = "usage: semihost on|off|status|drain|echo on|off"
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "on":
+            self.emu.semihosting.enabled = True
+            return "semihosting enabled"
+
+        if sub == "off":
+            self.emu.semihosting.enabled = False
+            return "semihosting disabled"
+
+        if sub == "status":
+            sh = self.emu.semihosting
+            buf_len = len(sh.output)
+            return (
+                f"enabled={sh.enabled}  echo={sh._console_echo}  "
+                f"buffer={buf_len} bytes"
+            )
+
+        if sub == "drain":
+            data = self.emu.semihosting.drain_output()
+            if not data:
+                return "(empty)"
+            try:
+                text = data.decode("utf-8", errors="replace")
+            except Exception:
+                text = repr(data)
+            return f"--- semihosting output ({len(data)} bytes) ---\n{text}"
+
+        if sub == "echo":
+            if len(argv) != 2:
+                return "usage: semihost echo on|off"
+            self.emu.semihosting._console_echo = argv[1].lower() == "on"
+            return f"semihost echo = {'on' if self.emu.semihosting._console_echo else 'off'}"
+
+        return usage
+
+    # ── Coverage commands ──────────────────────────────────────────
+
+    def cmd_coverage(self, argv: list[str]) -> str:
+        usage = "usage: coverage on|off|status|report [top]|clear|export <file>"
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "on":
+            self.emu.coverage_enabled = True
+            return "coverage tracking enabled"
+
+        if sub == "off":
+            self.emu.coverage_enabled = False
+            return "coverage tracking disabled"
+
+        if sub == "status":
+            return (
+                f"enabled={self.emu.coverage_enabled}  "
+                f"unique_pcs={len(self.emu._coverage)}"
+            )
+
+        if sub == "clear":
+            self.emu._coverage.clear()
+            return "coverage data cleared"
+
+        if sub == "report":
+            top = _int(argv[1]) if len(argv) > 1 else 30
+            top = max(1, min(top, 200))
+            pcs = sorted(self.emu._coverage)
+            if not pcs:
+                return "no coverage data"
+            lines = [f"unique PCs covered: {len(pcs)}"]
+            if len(pcs) <= top:
+                for pc in pcs:
+                    label = self.emu.symbols.format_addr(pc)
+                    lines.append(f"  {label}")
+            else:
+                lines.append(f"(showing first {top} of {len(pcs)})")
+                for pc in pcs[:top]:
+                    label = self.emu.symbols.format_addr(pc)
+                    lines.append(f"  {label}")
+            return "\n".join(lines)
+
+        if sub == "export":
+            if len(argv) != 2:
+                return "usage: coverage export <file>"
+            pcs = sorted(self.emu._coverage)
+            if not pcs:
+                return "no coverage data to export"
+            try:
+                path = self._prepare_export_path(argv[1])
+                lines = [f"0x{pc:08X}" for pc in pcs]
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError as e:
+                return f"error: {e}"
+            return f"exported {len(pcs)} addresses to {path}"
 
         return usage

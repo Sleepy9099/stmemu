@@ -147,3 +147,12 @@ class StmEmuShell(cmd.Cmd):
 
     def do_gpio(self, arg: str) -> None:
         self.default("gpio " + arg if arg else "gpio")
+
+    def do_sym(self, arg: str) -> None:
+        self.default("sym " + arg if arg else "sym")
+
+    def do_semihost(self, arg: str) -> None:
+        self.default("semihost " + arg if arg else "semihost")
+
+    def do_coverage(self, arg: str) -> None:
+        self.default("coverage " + arg if arg else "coverage")
