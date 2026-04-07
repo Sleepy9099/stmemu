@@ -19,6 +19,13 @@ class SvdRegister:
     reset_value: Optional[int] = None
     access: str = "rw"
     fields: tuple[SvdField, ...] = ()
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class SvdInterrupt:
+    name: str
+    value: int  # IRQ number
 
 
 @dataclass(frozen=True)
@@ -27,6 +34,8 @@ class SvdPeripheral:
     base_address: int
     size: int  # bytes (from addressBlock.size if present; else heuristic)
     registers: tuple[SvdRegister, ...] = ()
+    description: str = ""
+    interrupts: tuple[SvdInterrupt, ...] = ()
 
 
 @dataclass(frozen=True)

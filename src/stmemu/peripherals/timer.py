@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from stmemu.peripherals.bus import PeripheralContext
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
@@ -133,25 +134,13 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         self._update_irq()
 
 
-def build_tim5(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
-    return BasicTimerPeripheral(peripheral=peripheral, irq=50)
+def _first_irq(peripheral: SvdPeripheral) -> Optional[int]:
+    """Extract the first IRQ number from SVD interrupt data."""
+    if peripheral.interrupts:
+        return peripheral.interrupts[0].value
+    return None
 
 
-def build_tim2(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
-    return BasicTimerPeripheral(peripheral=peripheral, irq=28)
-
-
-def build_tim3(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
-    return BasicTimerPeripheral(peripheral=peripheral, irq=29)
-
-
-def build_tim4(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
-    return BasicTimerPeripheral(peripheral=peripheral, irq=30)
-
-
-def build_tim6(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
-    return BasicTimerPeripheral(peripheral=peripheral, irq=54)
-
-
-def build_tim7(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
-    return BasicTimerPeripheral(peripheral=peripheral, irq=55)
+def build_timer(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
+    """Build a timer peripheral, extracting IRQ from SVD data."""
+    return BasicTimerPeripheral(peripheral=peripheral, irq=_first_irq(peripheral))

@@ -28,6 +28,7 @@ def run_app(
     log_level: str,
     quiet: bool,
     args=None,
+    sysmem_base: int | None = None,
 ) -> None:
     setup_logging(level=log_level, quiet=quiet)
 
@@ -45,7 +46,7 @@ def run_app(
     device = load_svd(svd_path)
     amap = build_address_map(device)
 
-    bus, core = build_default_bus(amap, flash_base=firmware.vector_base)
+    bus, core = build_default_bus(amap, flash_base=firmware.vector_base, sysmem_base=sysmem_base)
     emu = Emulator(
         bus=bus,
         flash_base=firmware.vector_base,

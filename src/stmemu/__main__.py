@@ -21,6 +21,13 @@ def main() -> None:
     p.add_argument("--sram-base", type=lambda s: int(s, 0), default=0x20000000)
     p.add_argument("--sram-size", type=lambda s: int(s, 0), default=0x00020000)  # 128 KiB
 
+    p.add_argument(
+        "--sysmem-base",
+        type=lambda s: int(s, 0),
+        default=None,
+        help="System memory base address (auto-detected from SVD device name if omitted)",
+    )
+
     # Execution controls
     p.add_argument("--shell", action="store_true", help="Start interactive shell after loading")
     p.add_argument("--cmd", type=str, default="", help='Semicolon-separated shell commands to run, e.g. "regs; step 10; run 1000"')
@@ -61,6 +68,7 @@ def main() -> None:
         svd_path=args.svd,
         sram_base=args.sram_base,
         sram_size=args.sram_size,
+        sysmem_base=args.sysmem_base,
         tick_scale=args.tick_scale,
         stuck_threshold=args.stuck_threshold,
         interrupt_stuck_threshold=args.interrupt_stuck_threshold,

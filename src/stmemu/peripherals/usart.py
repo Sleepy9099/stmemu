@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Optional
 
 from stmemu.peripherals.bus import PeripheralContext
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
@@ -179,21 +180,16 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
         self._update_irq()
 
 
-USART_IRQS: dict[str, int] = {
-    "USART1": 37,
-    "USART2": 38,
-    "USART3": 39,
-    "UART4": 52,
-    "UART5": 53,
-    "USART6": 71,
-    "UART7": 82,
-    "UART8": 83,
-    "LPUART1": 98,
-}
+def _first_irq(peripheral: SvdPeripheral) -> Optional[int]:
+    """Extract the first IRQ number from SVD interrupt data."""
+    if peripheral.interrupts:
+        return peripheral.interrupts[0].value
+    return None
 
 
 def build_usart(peripheral: SvdPeripheral) -> Stm32UsartPeripheral:
+    """Build a USART peripheral, extracting IRQ from SVD data."""
     return Stm32UsartPeripheral(
         peripheral=peripheral,
-        irq=USART_IRQS.get(peripheral.name.upper()),
+        irq=_first_irq(peripheral),
     )
