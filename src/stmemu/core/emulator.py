@@ -247,7 +247,7 @@ class Emulator:
         self._snapshot_base_ranges = self._merge_ranges(snapshot_ranges)
 
     def add_pc_reg_write(self, w: PcRegWrite) -> None:
-         self.pc_reg_writes.append(w)
+        self.pc_reg_writes.append(w)
 
     def add_pc_cpu_action(
         self,
@@ -1352,7 +1352,7 @@ class Emulator:
             regs["pc"],
             xpsr,
         ]
-        sp = self._read_stack_pointer(use_psp=return_to_psp) - (len(frame) * 4)
+        sp = (self._read_stack_pointer(use_psp=return_to_psp) - (len(frame) * 4)) & 0xFFFFFFFF
         payload = b"".join(int(word & 0xFFFFFFFF).to_bytes(4, "little") for word in frame)
         self.uc.mem_write(sp, payload)
         self._write_stack_pointer(use_psp=return_to_psp, value=sp)
@@ -1375,7 +1375,7 @@ class Emulator:
             self.uc.reg_write(UC_ARM_REG_CPSR, words[7])
         except Exception:
             pass
-        new_sp = sp + 32
+        new_sp = (sp + 32) & 0xFFFFFFFF
         self._write_stack_pointer(use_psp=use_psp, value=new_sp)
         self._set_control_spsel(use_psp)
         self.uc.reg_write(UC_ARM_REG_SP, new_sp)
@@ -1640,7 +1640,7 @@ class Emulator:
         if exc_return not in EXC_RETURN_VALUES:
             return False
 
-        uc.reg_write(UC_ARM_REG_SP, sp + frame_size)
+        uc.reg_write(UC_ARM_REG_SP, (sp + frame_size) & 0xFFFFFFFF)
         self._special_step_consumed = True
         self._perform_exception_return(exc_return)
         try:

@@ -16,7 +16,10 @@ from stmemu.core.disasm import ThumbDisassembler
 from unicorn.unicorn_const import UC_HOOK_CODE
 
 def _int(s: str) -> int:
-    return int(s, 0)
+    try:
+        return int(s, 0)
+    except ValueError:
+        raise ValueError(f"invalid integer: {s!r}")
 
 
 @dataclass
@@ -663,11 +666,12 @@ class Commands:
             raise ValueError("expected P.REG or address")
         p_name, r_name = s.split(".", 1)
 
-        p = next((x for x in self.bus.amap.peripherals if x.name == p_name), None)
+        p = self.bus.amap.find_peripheral_by_name(p_name)
         if not p:
             raise KeyError(f"unknown peripheral: {p_name}")
 
-        r = next((x for x in p.registers if x.name == r_name), None)
+        r_upper = r_name.upper()
+        r = next((x for x in p.registers if x.name.upper() == r_upper), None)
         if not r:
             raise KeyError(f"unknown register: {p_name}.{r_name}")
 
@@ -1209,14 +1213,14 @@ class Commands:
             max_steps = _int(argv[2]) if len(argv) == 3 else 100000
             if max_steps < 0:
                 raise ValueError("max_steps must be >= 0")
-            for i in range(max_steps + 1):
+            for _ in range(max_steps):
                 current = int(getattr(self.emu, "pc", 0)) & ~1
                 if current == target:
                     return
-                if i == max_steps:
-                    break
                 self.emu.step(1)
             current = int(getattr(self.emu, "pc", 0)) & ~1
+            if current == target:
+                return
             raise AssertionError(
                 f"wait pc timeout: target=0x{target:08X} current=0x{current:08X} steps={max_steps}"
             )
@@ -1227,12 +1231,12 @@ class Commands:
             max_steps = _int(argv[1]) if len(argv) == 2 else 100000
             if max_steps < 0:
                 raise ValueError("max_steps must be >= 0")
-            for i in range(max_steps + 1):
+            for _ in range(max_steps):
                 if getattr(self.emu, "last_fault_report", None) is not None:
                     return
-                if i == max_steps:
-                    break
                 self.emu.step(1)
+            if getattr(self.emu, "last_fault_report", None) is not None:
+                return
             raise AssertionError(f"wait fault timeout: steps={max_steps}")
 
         raise ValueError("usage: wait pc <addr> [max_steps] | wait fault [max_steps]")
@@ -1922,11 +1926,12 @@ class Commands:
         if "." in s:
             periph_name, reg_name = s.split(".", 1)
 
-            p = next((x for x in self.bus.amap.peripherals if x.name == periph_name), None)
+            p = self.bus.amap.find_peripheral_by_name(periph_name)
             if not p:
                 raise ValueError(f"unknown peripheral: {periph_name}")
 
-            r = next((x for x in p.registers if x.name == reg_name), None)
+            reg_upper = reg_name.upper()
+            r = next((x for x in p.registers if x.name.upper() == reg_upper), None)
             if not r:
                 raise ValueError(f"unknown register: {periph_name}.{reg_name}")
 
@@ -1939,7 +1944,7 @@ class Commands:
             return (f"{p.name}.{r.name}", start, end)
 
         # --- PERIPH ---
-        p = next((x for x in self.bus.amap.peripherals if x.name == s), None)
+        p = self.bus.amap.find_peripheral_by_name(s)
         if not p:
             raise ValueError(f"unknown peripheral: {s}")
 

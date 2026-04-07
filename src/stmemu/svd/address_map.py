@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -18,6 +19,7 @@ class AddressMap:
     peripherals: tuple[SvdPeripheral, ...]
     ranges: tuple[AddressRange, ...] = ()
     _by_name: Dict[str, SvdPeripheral] = field(default_factory=dict, init=False, repr=False)
+    _bases: tuple[int, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Build a stable uppercase name -> peripheral map
@@ -27,12 +29,16 @@ class AddressMap:
             if p and p.name:
                 m[p.name.upper()] = p
         object.__setattr__(self, "_by_name", m)
+        # Pre-compute sorted base addresses for bisect lookup
+        object.__setattr__(self, "_bases", tuple(r.base for r in self.ranges))
 
     def find_peripheral(self, addr: int) -> Optional[SvdPeripheral]:
-        # simple linear scan is fine for MVP; upgrade to bisect later
-        for r in self.ranges:
-            if r.base <= addr < r.end:
-                return r.peripheral
+        idx = bisect.bisect_right(self._bases, addr) - 1
+        if idx < 0:
+            return None
+        r = self.ranges[idx]
+        if r.base <= addr < r.end:
+            return r.peripheral
         return None
 
     def find_register(self, p: SvdPeripheral, addr: int) -> Optional[SvdRegister]:

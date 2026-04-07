@@ -28,6 +28,12 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     _SR_CC1IF = 1 << 1
     _EGR_UG = 1 << 0
 
+    def reset(self) -> None:
+        super().reset()
+        self._prescaler_accum = 0
+        self._last_counter = 0
+        self._update_irq()
+
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
 

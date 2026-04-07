@@ -44,6 +44,12 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
         super().__post_init__()
         self._refresh_status()
 
+    def reset(self) -> None:
+        super().reset()
+        self._rx_fifo.clear()
+        self._tx_fifo.clear()
+        self._refresh_status()
+
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
         self._update_irq()
