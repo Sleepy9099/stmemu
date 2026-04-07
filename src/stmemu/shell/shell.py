@@ -138,3 +138,12 @@ class StmEmuShell(cmd.Cmd):
 
     def do_log(self, arg: str) -> None:
         self.default("log " + arg if arg else "log")
+
+    def do_spi(self, arg: str) -> None:
+        self.default("spi " + arg if arg else "spi")
+
+    def do_i2c(self, arg: str) -> None:
+        self.default("i2c " + arg if arg else "i2c")
+
+    def do_gpio(self, arg: str) -> None:
+        self.default("gpio " + arg if arg else "gpio")

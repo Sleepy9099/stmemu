@@ -10,6 +10,9 @@ from pathlib import Path
 
 from stmemu.core.emulator import Emulator, PcRegWrite
 from stmemu.peripherals.bus import PeripheralBus
+from stmemu.peripherals.gpio import GpioPeripheral
+from stmemu.peripherals.i2c import I2cPeripheral
+from stmemu.peripherals.spi import SpiPeripheral
 from stmemu.peripherals.usart import Stm32UsartPeripheral
 from stmemu.utils.hexdump import hexdump
 from stmemu.core.disasm import ThumbDisassembler
@@ -2370,3 +2373,209 @@ class Commands:
     def _parse_int(self, s: str) -> int:
         s = s.strip()
         return int(s, 0)  # supports 0x..., decimal
+
+    # --- SPI commands ---
+    def _resolve_spi_model(self, name: str) -> SpiPeripheral:
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, SpiPeripheral):
+            raise KeyError(f"unknown spi peripheral: {name}")
+        return model
+
+    def cmd_spi(self, argv: list[str]) -> str:
+        usage = (
+            "usage: spi list | spi status <name> | spi rx <name> <hexbytes|@file|hex@file> | "
+            "spi tx <name> [clear] | spi xfer <name> <hexbytes> [steps]"
+        )
+        if not argv:
+            return usage
+
+        sub = argv[0].lower()
+        if sub == "list":
+            lines: list[str] = []
+            for peripheral in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(peripheral.name)
+                if isinstance(model, SpiPeripheral):
+                    tx_len = len(model.drain_tx() if False else model._tx_fifo)
+                    rx_len = len(model._rx_fifo)
+                    lines.append(f"{peripheral.name:8} tx={tx_len} rx={rx_len}")
+            return "\n".join(lines) if lines else "(no spi peripherals)"
+
+        if sub == "status":
+            if len(argv) != 2:
+                return "usage: spi status <name>"
+            model = self._resolve_spi_model(argv[1])
+            return f"{argv[1].upper()} tx={len(model._tx_fifo)} rx={len(model._rx_fifo)}"
+
+        if sub == "rx":
+            if len(argv) != 3:
+                return "usage: spi rx <name> <hexbytes|@file|hex@file>"
+            model = self._resolve_spi_model(argv[1])
+            try:
+                payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
+            model.inject_rx(payload)
+            return f"injected {len(payload)} byte(s) into {argv[1].upper()} rx"
+
+        if sub == "tx":
+            if len(argv) not in {2, 3}:
+                return "usage: spi tx <name> [clear]"
+            model = self._resolve_spi_model(argv[1])
+            clear = len(argv) == 3 and argv[2].lower() == "clear"
+            payload = model.drain_tx() if clear else bytes(model._tx_fifo)
+            if not payload:
+                return f"{argv[1].upper()} tx: (empty)"
+            return f"{argv[1].upper()} tx ({len(payload)} bytes): {payload.hex()}"
+
+        if sub == "xfer":
+            if len(argv) < 3:
+                return "usage: spi xfer <name> <hexbytes> [steps]"
+            model = self._resolve_spi_model(argv[1])
+            try:
+                rx_payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
+            steps = _int(argv[3]) if len(argv) > 3 else 10000
+            model.inject_rx(rx_payload)
+            model._tx_fifo.clear()
+            self.emu.step(steps)
+            tx_data = model.drain_tx()
+            return f"spi xfer: injected {len(rx_payload)} rx bytes, ran {steps} steps, got {len(tx_data)} tx bytes: {tx_data.hex()}"
+
+        return usage
+
+    # --- I2C commands ---
+    def _resolve_i2c_model(self, name: str) -> I2cPeripheral:
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, I2cPeripheral):
+            raise KeyError(f"unknown i2c peripheral: {name}")
+        return model
+
+    def cmd_i2c(self, argv: list[str]) -> str:
+        usage = (
+            "usage: i2c list | i2c status <name> | i2c rx <name> <hexbytes|@file|hex@file> | "
+            "i2c tx <name> [clear]"
+        )
+        if not argv:
+            return usage
+
+        sub = argv[0].lower()
+        if sub == "list":
+            lines: list[str] = []
+            for peripheral in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(peripheral.name)
+                if isinstance(model, I2cPeripheral):
+                    tx_len = len(model._tx_fifo)
+                    rx_len = len(model._rx_fifo)
+                    lines.append(f"{peripheral.name:8} tx={tx_len} rx={rx_len}")
+            return "\n".join(lines) if lines else "(no i2c peripherals)"
+
+        if sub == "status":
+            if len(argv) != 2:
+                return "usage: i2c status <name>"
+            model = self._resolve_i2c_model(argv[1])
+            return f"{argv[1].upper()} tx={len(model._tx_fifo)} rx={len(model._rx_fifo)}"
+
+        if sub == "rx":
+            if len(argv) != 3:
+                return "usage: i2c rx <name> <hexbytes|@file|hex@file>"
+            model = self._resolve_i2c_model(argv[1])
+            try:
+                payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
+            model.inject_rx(payload)
+            return f"injected {len(payload)} byte(s) into {argv[1].upper()} rx"
+
+        if sub == "tx":
+            if len(argv) not in {2, 3}:
+                return "usage: i2c tx <name> [clear]"
+            model = self._resolve_i2c_model(argv[1])
+            clear = len(argv) == 3 and argv[2].lower() == "clear"
+            payload = model.drain_tx() if clear else bytes(model._tx_fifo)
+            if not payload:
+                return f"{argv[1].upper()} tx: (empty)"
+            return f"{argv[1].upper()} tx ({len(payload)} bytes): {payload.hex()}"
+
+        return usage
+
+    # --- GPIO commands ---
+    def _resolve_gpio_model(self, name: str) -> GpioPeripheral:
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, GpioPeripheral):
+            raise KeyError(f"unknown gpio peripheral: {name}")
+        return model
+
+    def cmd_gpio(self, argv: list[str]) -> str:
+        usage = (
+            "usage: gpio list | gpio read <name> | "
+            "gpio set <name> <pin> | gpio clear <name> <pin> | "
+            "gpio toggle <name> <pin>"
+        )
+        if not argv:
+            return usage
+
+        sub = argv[0].lower()
+        if sub == "list":
+            lines: list[str] = []
+            for peripheral in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(peripheral.name)
+                if isinstance(model, GpioPeripheral):
+                    odr = model.read_register_value(model._ODR)
+                    lines.append(f"{peripheral.name:8} ODR=0x{odr:04X}")
+            return "\n".join(lines) if lines else "(no gpio peripherals)"
+
+        if sub == "read":
+            if len(argv) != 2:
+                return "usage: gpio read <name>"
+            model = self._resolve_gpio_model(argv[1])
+            odr = model.read_register_value(model._ODR)
+            idr = model.read(model._IDR, 4)
+            moder = model.read_register_value(model._MODER)
+            lines = [f"{argv[1].upper()} ODR=0x{odr:04X}  IDR=0x{idr:04X}  MODER=0x{moder:08X}"]
+            # Show per-pin status
+            pin_info = []
+            for pin in range(16):
+                mode = (moder >> (pin * 2)) & 0x3
+                mode_str = ["IN", "OUT", "AF", "AN"][mode]
+                state = "H" if (odr >> pin) & 1 else "L"
+                pin_info.append(f"P{pin}:{mode_str}/{state}")
+            lines.append("  ".join(pin_info[:8]))
+            lines.append("  ".join(pin_info[8:]))
+            return "\n".join(lines)
+
+        if sub == "set":
+            if len(argv) != 3:
+                return "usage: gpio set <name> <pin>"
+            model = self._resolve_gpio_model(argv[1])
+            pin = _int(argv[2])
+            if not (0 <= pin <= 15):
+                return "pin must be 0-15"
+            model.write(model._BSRR, 4, 1 << pin)
+            return f"{argv[1].upper()} pin {pin} set (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        if sub == "clear":
+            if len(argv) != 3:
+                return "usage: gpio clear <name> <pin>"
+            model = self._resolve_gpio_model(argv[1])
+            pin = _int(argv[2])
+            if not (0 <= pin <= 15):
+                return "pin must be 0-15"
+            model.write(model._BSRR, 4, 1 << (pin + 16))
+            return f"{argv[1].upper()} pin {pin} cleared (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        if sub == "toggle":
+            if len(argv) != 3:
+                return "usage: gpio toggle <name> <pin>"
+            model = self._resolve_gpio_model(argv[1])
+            pin = _int(argv[2])
+            if not (0 <= pin <= 15):
+                return "pin must be 0-15"
+            odr = model.read_register_value(model._ODR)
+            if odr & (1 << pin):
+                model.write(model._BSRR, 4, 1 << (pin + 16))
+            else:
+                model.write(model._BSRR, 4, 1 << pin)
+            return f"{argv[1].upper()} pin {pin} toggled (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        return usage
