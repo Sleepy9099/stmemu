@@ -178,6 +178,8 @@ class Emulator:
         # Code coverage tracking
         self.coverage_enabled: bool = False
         self._coverage: set[int] = set()
+        self._coverage_hits: dict[int, int] = {}
+        self._coverage_snapshots: dict[str, set[int]] = {}
         self._exception_return_stack: list[int] = []
         self._special_step_consumed = False
         self._ignore_breakpoint_once: int | None = None
@@ -1390,7 +1392,9 @@ class Emulator:
     def _hook_code(self, uc, address, size, user_data):
         pc = int(address)
         if self.coverage_enabled:
-            self._coverage.add(pc & ~1)
+            clean_pc = pc & ~1
+            self._coverage.add(clean_pc)
+            self._coverage_hits[clean_pc] = self._coverage_hits.get(clean_pc, 0) + 1
         if self.trace_enabled:
             self._trace_finalize_pending(next_pc=pc & ~1)
         else:

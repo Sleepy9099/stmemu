@@ -2677,7 +2677,12 @@ class Commands:
     # ── Coverage commands ──────────────────────────────────────────
 
     def cmd_coverage(self, argv: list[str]) -> str:
-        usage = "usage: coverage on|off|status|report [top]|clear|export <file>"
+        usage = (
+            "usage: coverage on|off|status|clear|report [top]|hotspots [top]|"
+            "functions [top]|ranges|diff <snapshot>|"
+            "snapshot <name>|snapshots|"
+            "export <file>|lcov <file>|pct"
+        )
         if not argv:
             return usage
         sub = argv[0].lower()
@@ -2691,13 +2696,17 @@ class Commands:
             return "coverage tracking disabled"
 
         if sub == "status":
+            total_hits = sum(self.emu._coverage_hits.values())
             return (
                 f"enabled={self.emu.coverage_enabled}  "
-                f"unique_pcs={len(self.emu._coverage)}"
+                f"unique_pcs={len(self.emu._coverage)}  "
+                f"total_hits={total_hits}  "
+                f"snapshots={len(self.emu._coverage_snapshots)}"
             )
 
         if sub == "clear":
             self.emu._coverage.clear()
+            self.emu._coverage_hits.clear()
             return "coverage data cleared"
 
         if sub == "report":
@@ -2718,6 +2727,58 @@ class Commands:
                     lines.append(f"  {label}")
             return "\n".join(lines)
 
+        if sub == "hotspots":
+            top = _int(argv[1]) if len(argv) > 1 else 20
+            top = max(1, min(top, 200))
+            if not self.emu._coverage_hits:
+                return "no coverage data"
+            ranked = sorted(
+                self.emu._coverage_hits.items(), key=lambda kv: kv[1], reverse=True
+            )[:top]
+            total = sum(self.emu._coverage_hits.values())
+            lines = [f"top {min(top, len(ranked))} hotspots ({total} total instructions):"]
+            for pc, hits in ranked:
+                pct = (hits * 100.0 / total) if total else 0.0
+                label = self.emu.symbols.format_addr(pc)
+                lines.append(f"  {hits:8d}  {pct:5.1f}%  {label}")
+            return "\n".join(lines)
+
+        if sub == "functions":
+            top = _int(argv[1]) if len(argv) > 1 else 20
+            top = max(1, min(top, 200))
+            if not self.emu._coverage_hits:
+                return "no coverage data"
+            return self._coverage_functions(top)
+
+        if sub == "ranges":
+            pcs = sorted(self.emu._coverage)
+            if not pcs:
+                return "no coverage data"
+            return self._coverage_ranges(pcs)
+
+        if sub == "pct":
+            return self._coverage_pct()
+
+        if sub == "diff":
+            if len(argv) != 2:
+                return "usage: coverage diff <snapshot>"
+            return self._coverage_diff(argv[1])
+
+        if sub == "snapshot":
+            if len(argv) != 2:
+                return "usage: coverage snapshot <name>"
+            name = argv[1]
+            self.emu._coverage_snapshots[name] = set(self.emu._coverage)
+            return f"saved coverage snapshot '{name}' ({len(self.emu._coverage)} PCs)"
+
+        if sub == "snapshots":
+            if not self.emu._coverage_snapshots:
+                return "(no coverage snapshots)"
+            lines = []
+            for name, pcs in sorted(self.emu._coverage_snapshots.items()):
+                lines.append(f"  {name:20} {len(pcs)} PCs")
+            return "\n".join(lines)
+
         if sub == "export":
             if len(argv) != 2:
                 return "usage: coverage export <file>"
@@ -2726,10 +2787,188 @@ class Commands:
                 return "no coverage data to export"
             try:
                 path = self._prepare_export_path(argv[1])
-                lines = [f"0x{pc:08X}" for pc in pcs]
+                lines = []
+                for pc in pcs:
+                    hits = self.emu._coverage_hits.get(pc, 0)
+                    label = self.emu.symbols.format_addr(pc)
+                    lines.append(f"0x{pc:08X}\t{hits}\t{label}")
                 path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             except OSError as e:
                 return f"error: {e}"
             return f"exported {len(pcs)} addresses to {path}"
 
+        if sub == "lcov":
+            if len(argv) != 2:
+                return "usage: coverage lcov <file>"
+            return self._coverage_lcov_export(argv[1])
+
         return usage
+
+    def _coverage_functions(self, top: int) -> str:
+        """Aggregate coverage by function using symbol table."""
+        func_hits: dict[str, int] = {}
+        func_pcs: dict[str, int] = {}
+        unknown_hits = 0
+        unknown_pcs = 0
+
+        for pc, hits in self.emu._coverage_hits.items():
+            sym = self.emu.symbols.find_containing(pc)
+            if sym is not None:
+                func_hits[sym.name] = func_hits.get(sym.name, 0) + hits
+                func_pcs[sym.name] = func_pcs.get(sym.name, 0) + 1
+            else:
+                unknown_hits += hits
+                unknown_pcs += 1
+
+        if not func_hits and unknown_pcs == 0:
+            return "no coverage data (or no symbols loaded)"
+
+        ranked = sorted(func_hits.items(), key=lambda kv: kv[1], reverse=True)[:top]
+        total_hits = sum(self.emu._coverage_hits.values())
+        lines = [f"function coverage ({len(func_hits)} functions hit, {total_hits} total instructions):"]
+        for name, hits in ranked:
+            pct = (hits * 100.0 / total_hits) if total_hits else 0.0
+            pcs = func_pcs.get(name, 0)
+            sym = self.emu.symbols.lookup_name(name)
+            size_str = ""
+            if sym and sym.size > 0:
+                # Estimate instruction coverage within this function
+                # Thumb instructions are 2 or 4 bytes; use 2 as estimate
+                est_insns = sym.size // 2
+                func_cov = min(100.0, pcs * 100.0 / est_insns) if est_insns > 0 else 0.0
+                size_str = f"  cov~{func_cov:.0f}%"
+            lines.append(f"  {hits:8d}  {pct:5.1f}%  {pcs:4d} PCs  {name}{size_str}")
+        if unknown_pcs > 0:
+            pct = (unknown_hits * 100.0 / total_hits) if total_hits else 0.0
+            lines.append(f"  {unknown_hits:8d}  {pct:5.1f}%  {unknown_pcs:4d} PCs  (unknown/no symbol)")
+        return "\n".join(lines)
+
+    def _coverage_ranges(self, pcs: list[int]) -> str:
+        """Show contiguous covered address ranges."""
+        if not pcs:
+            return "no coverage data"
+        ranges: list[tuple[int, int, int]] = []
+        start = pcs[0]
+        prev = pcs[0]
+        count = 1
+        for pc in pcs[1:]:
+            # Consider PCs within 4 bytes as contiguous (Thumb instructions are 2 or 4 bytes)
+            if pc <= prev + 4:
+                prev = pc
+                count += 1
+            else:
+                ranges.append((start, prev, count))
+                start = pc
+                prev = pc
+                count = 1
+        ranges.append((start, prev, count))
+
+        lines = [f"{len(ranges)} contiguous range(s) from {len(pcs)} PCs:"]
+        for rstart, rend, rcount in ranges:
+            span = rend - rstart + 2  # +2 for last instruction
+            label_start = self.emu.symbols.format_addr(rstart)
+            label_end = self.emu.symbols.format_addr(rend)
+            lines.append(
+                f"  0x{rstart:08X}-0x{rend + 1:08X}  "
+                f"{span:5d} bytes  {rcount:4d} PCs  "
+                f"{label_start} .. {label_end}"
+            )
+        return "\n".join(lines)
+
+    def _coverage_pct(self) -> str:
+        """Calculate coverage percentage of firmware flash area."""
+        if not self.emu._coverage:
+            return "no coverage data"
+        flash_base = self.emu.flash_base
+        flash_end = self.emu.flash_end
+        flash_size = flash_end - flash_base
+        if flash_size <= 0:
+            return "flash size unknown"
+
+        in_flash = sum(1 for pc in self.emu._coverage if flash_base <= pc < flash_end)
+        # Estimate total instructions: Thumb = 2 bytes average
+        est_total_insns = flash_size // 2
+        pct = (in_flash * 100.0 / est_total_insns) if est_total_insns > 0 else 0.0
+        return (
+            f"flash: 0x{flash_base:08X}-0x{flash_end:08X} ({flash_size} bytes)\n"
+            f"covered: {in_flash} unique PCs of ~{est_total_insns} estimated instructions\n"
+            f"coverage: {pct:.2f}%"
+        )
+
+    def _coverage_diff(self, snapshot_name: str) -> str:
+        """Show coverage difference vs a saved snapshot."""
+        snap = self.emu._coverage_snapshots.get(snapshot_name)
+        if snap is None:
+            return f"unknown coverage snapshot: {snapshot_name}"
+        current = self.emu._coverage
+        added = sorted(current - snap)
+        removed = sorted(snap - current)
+        lines = [
+            f"diff vs '{snapshot_name}': "
+            f"+{len(added)} new PCs, -{len(removed)} lost PCs"
+        ]
+        if added:
+            show = added[:20]
+            lines.append("  new:")
+            for pc in show:
+                lines.append(f"    + {self.emu.symbols.format_addr(pc)}")
+            if len(added) > 20:
+                lines.append(f"    ... and {len(added) - 20} more")
+        if removed:
+            show = removed[:20]
+            lines.append("  lost:")
+            for pc in show:
+                lines.append(f"    - {self.emu.symbols.format_addr(pc)}")
+            if len(removed) > 20:
+                lines.append(f"    ... and {len(removed) - 20} more")
+        return "\n".join(lines)
+
+    def _coverage_lcov_export(self, raw_path: str) -> str:
+        """Export coverage in LCOV tracefile format for use with genhtml/etc."""
+        if not self.emu._coverage_hits:
+            return "no coverage data to export"
+
+        # Group by function
+        func_data: dict[str, list[tuple[int, int]]] = {}
+        unknown_data: list[tuple[int, int]] = []
+        for pc, hits in sorted(self.emu._coverage_hits.items()):
+            sym = self.emu.symbols.find_containing(pc)
+            if sym is not None:
+                func_data.setdefault(sym.name, []).append((pc, hits))
+            else:
+                unknown_data.append((pc, hits))
+
+        try:
+            path = self._prepare_export_path(raw_path)
+            lines: list[str] = []
+            source = "firmware.elf"
+
+            lines.append("TN:")
+            lines.append(f"SF:{source}")
+
+            # Function entries
+            for fname, pcs in sorted(func_data.items()):
+                sym = self.emu.symbols.lookup_name(fname)
+                addr = sym.address if sym else pcs[0][0]
+                total_hits = sum(h for _, h in pcs)
+                lines.append(f"FN:{addr},{fname}")
+                lines.append(f"FNDA:{total_hits},{fname}")
+
+            lines.append(f"FNF:{len(func_data)}")
+            lines.append(f"FNH:{len(func_data)}")
+
+            # Line/address entries (we use PC addresses as "line numbers")
+            for pc, hits in sorted(self.emu._coverage_hits.items()):
+                lines.append(f"DA:{pc},{hits}")
+            lines.append(f"LF:{len(self.emu._coverage_hits)}")
+            lines.append(f"LH:{len(self.emu._coverage_hits)}")
+
+            lines.append("end_of_record")
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as e:
+            return f"error: {e}"
+
+        return (
+            f"exported LCOV data to {path} "
+            f"({len(func_data)} functions, {len(self.emu._coverage_hits)} addresses)"
+        )

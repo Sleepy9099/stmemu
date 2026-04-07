@@ -76,6 +76,10 @@ class _FakeEmu:
         self.semihosting = SemihostingHandler()
         self.coverage_enabled = False
         self._coverage: set[int] = set()
+        self._coverage_hits: dict[int, int] = {}
+        self._coverage_snapshots: dict[str, set[int]] = {}
+        self.flash_base = 0x08000000
+        self.flash_end = 0x08010000
         self.pc = 0
 
 
@@ -339,6 +343,18 @@ class CoverageCommandTests(unittest.TestCase):
         self.emu = _FakeEmu()
         self.cmds = Commands(emu=self.emu, bus=_FakeBus())
 
+    def _populate_coverage(self):
+        """Load sample coverage data with hit counts."""
+        hits = {
+            0x08000100: 500,
+            0x08000102: 300,
+            0x08000104: 200,
+            0x08000200: 1000,
+            0x08000202: 50,
+        }
+        self.emu._coverage = set(hits.keys())
+        self.emu._coverage_hits = dict(hits)
+
     def test_coverage_on_off(self):
         out = self.cmds.cmd_coverage(["on"])
         self.assertIn("enabled", out)
@@ -347,16 +363,19 @@ class CoverageCommandTests(unittest.TestCase):
         self.assertIn("disabled", out)
         self.assertFalse(self.emu.coverage_enabled)
 
-    def test_coverage_status(self):
-        self.emu._coverage = {0x08000100, 0x08000102, 0x08000104}
+    def test_coverage_status_shows_hits(self):
+        self._populate_coverage()
         out = self.cmds.cmd_coverage(["status"])
-        self.assertIn("unique_pcs=3", out)
+        self.assertIn("unique_pcs=5", out)
+        self.assertIn("total_hits=2050", out)
+        self.assertIn("snapshots=0", out)
 
-    def test_coverage_clear(self):
-        self.emu._coverage = {0x08000100}
+    def test_coverage_clear_resets_hits(self):
+        self._populate_coverage()
         out = self.cmds.cmd_coverage(["clear"])
         self.assertIn("cleared", out)
         self.assertEqual(len(self.emu._coverage), 0)
+        self.assertEqual(len(self.emu._coverage_hits), 0)
 
     def test_coverage_report_empty(self):
         out = self.cmds.cmd_coverage(["report"])
@@ -368,19 +387,142 @@ class CoverageCommandTests(unittest.TestCase):
         self.assertIn("unique PCs covered: 2", out)
         self.assertIn("0x08000100", out)
 
-    def test_coverage_export(self):
+    def test_coverage_hotspots(self):
+        self._populate_coverage()
+        out = self.cmds.cmd_coverage(["hotspots", "3"])
+        self.assertIn("hotspots", out)
+        # Top hit should be 0x08000200 with 1000 hits
+        lines = out.strip().split("\n")
+        # First data line after header should be the highest count
+        self.assertIn("1000", lines[1])
+
+    def test_coverage_hotspots_empty(self):
+        out = self.cmds.cmd_coverage(["hotspots"])
+        self.assertIn("no coverage data", out)
+
+    def test_coverage_functions_with_symbols(self):
+        self._populate_coverage()
+        # Add symbols mapping to our coverage data
+        syms = [
+            Symbol("main", 0x08000100, 64, "func"),
+            Symbol("HAL_Init", 0x08000200, 128, "func"),
+        ]
+        for s in syms:
+            self.emu.symbols._by_name[s.name] = s
+            self.emu.symbols._by_addr[s.address] = s
+        self.emu.symbols._func_addrs = sorted(s.address for s in syms)
+
+        out = self.cmds.cmd_coverage(["functions"])
+        self.assertIn("main", out)
+        self.assertIn("HAL_Init", out)
+        self.assertIn("function coverage", out)
+
+    def test_coverage_functions_no_symbols(self):
+        self._populate_coverage()
+        out = self.cmds.cmd_coverage(["functions"])
+        self.assertIn("unknown/no symbol", out)
+
+    def test_coverage_ranges(self):
+        self.emu._coverage = {0x08000100, 0x08000102, 0x08000104, 0x08000200, 0x08000202}
+        out = self.cmds.cmd_coverage(["ranges"])
+        self.assertIn("2 contiguous range(s)", out)
+        self.assertIn("5 PCs", out)
+
+    def test_coverage_ranges_empty(self):
+        out = self.cmds.cmd_coverage(["ranges"])
+        self.assertIn("no coverage data", out)
+
+    def test_coverage_pct(self):
+        self._populate_coverage()
+        out = self.cmds.cmd_coverage(["pct"])
+        self.assertIn("flash:", out)
+        self.assertIn("coverage:", out)
+        self.assertIn("%", out)
+
+    def test_coverage_pct_empty(self):
+        out = self.cmds.cmd_coverage(["pct"])
+        self.assertIn("no coverage data", out)
+
+    def test_coverage_snapshot_and_diff(self):
+        self._populate_coverage()
+        out = self.cmds.cmd_coverage(["snapshot", "baseline"])
+        self.assertIn("saved coverage snapshot 'baseline'", out)
+        self.assertIn("5 PCs", out)
+
+        # Add more coverage
+        self.emu._coverage.add(0x08000300)
+        self.emu._coverage_hits[0x08000300] = 10
+
+        out = self.cmds.cmd_coverage(["diff", "baseline"])
+        self.assertIn("+1 new PCs", out)
+        self.assertIn("-0 lost PCs", out)
+        self.assertIn("0x08000300", out)
+
+    def test_coverage_diff_removes(self):
+        self._populate_coverage()
+        self.cmds.cmd_coverage(["snapshot", "full"])
+        # Remove some coverage
+        self.emu._coverage.discard(0x08000200)
+        self.emu._coverage.discard(0x08000202)
+        out = self.cmds.cmd_coverage(["diff", "full"])
+        self.assertIn("-2 lost PCs", out)
+
+    def test_coverage_diff_unknown_snapshot(self):
+        out = self.cmds.cmd_coverage(["diff", "nonexistent"])
+        self.assertIn("unknown coverage snapshot", out)
+
+    def test_coverage_snapshots_list(self):
+        self._populate_coverage()
+        self.cmds.cmd_coverage(["snapshot", "alpha"])
+        self.cmds.cmd_coverage(["snapshot", "beta"])
+        out = self.cmds.cmd_coverage(["snapshots"])
+        self.assertIn("alpha", out)
+        self.assertIn("beta", out)
+
+    def test_coverage_snapshots_empty(self):
+        out = self.cmds.cmd_coverage(["snapshots"])
+        self.assertIn("no coverage snapshots", out)
+
+    def test_coverage_export_with_hits(self):
         import tempfile
         import os
-        self.emu._coverage = {0x08000100, 0x08000104, 0x08000102}
+        self._populate_coverage()
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "cov.txt")
             out = self.cmds.cmd_coverage(["export", path])
-            self.assertIn("exported 3", out)
+            self.assertIn("exported 5", out)
             with open(path) as f:
                 contents = f.read()
             self.assertIn("0x08000100", contents)
-            self.assertIn("0x08000102", contents)
-            self.assertIn("0x08000104", contents)
+            # Export should include hit counts
+            self.assertIn("500", contents)
+
+    def test_coverage_lcov_export(self):
+        import tempfile
+        import os
+        self._populate_coverage()
+        # Add a symbol so function grouping works
+        sym = Symbol("main", 0x08000100, 64, "func")
+        self.emu.symbols._by_name["main"] = sym
+        self.emu.symbols._by_addr[0x08000100] = sym
+        self.emu.symbols._func_addrs = [0x08000100]
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "cov.lcov")
+            out = self.cmds.cmd_coverage(["lcov", path])
+            self.assertIn("exported LCOV data", out)
+            with open(path) as f:
+                contents = f.read()
+            self.assertIn("TN:", contents)
+            self.assertIn("SF:", contents)
+            self.assertIn("FN:", contents)
+            self.assertIn("main", contents)
+            self.assertIn("DA:", contents)
+            self.assertIn("end_of_record", contents)
+
+    def test_coverage_lcov_empty(self):
+        out = self.cmds.cmd_coverage(["lcov", "/tmp/test.lcov"])
+        self.assertIn("no coverage data", out)
 
 
 # ── Field Decode Tests ─────────────────────────────────────────────
