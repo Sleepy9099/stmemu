@@ -156,3 +156,6 @@ class StmEmuShell(cmd.Cmd):
 
     def do_coverage(self, arg: str) -> None:
         self.default("coverage " + arg if arg else "coverage")
+
+    def do_fuzz(self, arg: str) -> None:
+        self.default("fuzz " + arg if arg else "fuzz")

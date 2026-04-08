@@ -2972,3 +2972,215 @@ class Commands:
             f"exported LCOV data to {path} "
             f"({len(func_data)} functions, {len(self.emu._coverage_hits)} addresses)"
         )
+
+    # ── Fuzzer commands ────────────────────────────────────────────
+
+    def cmd_fuzz(self, argv: list[str]) -> str:
+        usage = (
+            "usage: fuzz setup [snapshot_name] | fuzz run <iterations> [steps] | "
+            "fuzz targets | fuzz stats | fuzz findings [max] | "
+            "fuzz corpus | fuzz seed <hexbytes|@file> | "
+            "fuzz dict <token_hex> | fuzz config <key> <value> | "
+            "fuzz export findings <file> | fuzz export corpus <dir> | "
+            "fuzz import <dir> | fuzz reset"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "setup":
+            snap_name = argv[1] if len(argv) > 1 else "__fuzz_baseline"
+            return self._fuzz_setup(snap_name)
+
+        if sub == "run":
+            if len(argv) < 2:
+                return "usage: fuzz run <iterations> [steps_per_iter]"
+            iters = _int(argv[1])
+            if iters <= 0:
+                return "iterations must be > 0"
+            steps = _int(argv[2]) if len(argv) > 2 else 5000
+            if steps <= 0:
+                return "steps must be > 0"
+            return self._fuzz_run(iters, steps)
+
+        if sub == "targets":
+            return self._fuzz_targets()
+
+        if sub == "stats":
+            return self._fuzz_stats()
+
+        if sub == "findings":
+            max_show = _int(argv[1]) if len(argv) > 1 else 20
+            return self._fuzz_findings(max_show)
+
+        if sub == "corpus":
+            return self._fuzz_corpus()
+
+        if sub == "seed":
+            if len(argv) != 2:
+                return "usage: fuzz seed <hexbytes|@file>"
+            try:
+                data = self._read_bytes_spec(argv[1])
+            except Exception as e:
+                return f"error: {e}"
+            self._ensure_fuzz_engine()
+            self._fuzz_engine.add_seed_input(data)
+            return f"added seed input ({len(data)} bytes)"
+
+        if sub == "dict":
+            if len(argv) != 2:
+                return "usage: fuzz dict <token_hex>"
+            try:
+                token = bytes.fromhex(argv[1])
+            except ValueError:
+                return "invalid hex for dictionary token"
+            self._ensure_fuzz_engine()
+            self._fuzz_engine.mutator.add_dict_entry(token)
+            return f"added dictionary token ({len(token)} bytes)"
+
+        if sub == "config":
+            if len(argv) != 3:
+                return "usage: fuzz config <key> <value>"
+            return self._fuzz_config(argv[1], argv[2])
+
+        if sub == "export":
+            if len(argv) < 3:
+                return "usage: fuzz export findings <file> | fuzz export corpus <dir>"
+            return self._fuzz_export(argv[1], argv[2])
+
+        if sub == "import":
+            if len(argv) != 2:
+                return "usage: fuzz import <dir>"
+            return self._fuzz_import(argv[1])
+
+        if sub == "reset":
+            return self._fuzz_reset()
+
+        return usage
+
+    def _ensure_fuzz_engine(self):
+        if not hasattr(self, "_fuzz_engine") or self._fuzz_engine is None:
+            from stmemu.fuzz.engine import FuzzEngine
+            self._fuzz_engine = FuzzEngine(emu=self.emu, bus=self.bus)
+
+    def _fuzz_setup(self, snap_name: str) -> str:
+        self._ensure_fuzz_engine()
+        result = self._fuzz_engine.setup(snapshot_name=snap_name)
+        return f"fuzz setup: {result}"
+
+    def _fuzz_run(self, iterations: int, steps: int) -> str:
+        self._ensure_fuzz_engine()
+        if not self._fuzz_engine._snapshot_name:
+            return "error: run 'fuzz setup' first"
+        findings = self._fuzz_engine.run(iterations=iterations, steps_per_iter=steps)
+        lines = [self._fuzz_engine.format_stats()]
+        if findings:
+            lines.append("")
+            crash_count = sum(1 for f in findings if "crash" in f.kind)
+            hang_count = sum(1 for f in findings if f.kind == "hang")
+            cov_count = sum(1 for f in findings if f.kind == "new_coverage")
+            lines.append(
+                f"session: {len(findings)} findings "
+                f"({crash_count} crashes, {hang_count} hangs, {cov_count} new coverage)"
+            )
+        return "\n".join(lines)
+
+    def _fuzz_targets(self) -> str:
+        self._ensure_fuzz_engine()
+        if not self._fuzz_engine.injector:
+            return "(not set up — run 'fuzz setup' first)"
+        targets = self._fuzz_engine.injector.list_targets()
+        if not targets:
+            return "(no injectable targets found)"
+        lines = [f"{len(targets)} target(s):"]
+        for t in targets:
+            lines.append(f"  {t['kind']:6}  {t['name']}")
+        return "\n".join(lines)
+
+    def _fuzz_stats(self) -> str:
+        self._ensure_fuzz_engine()
+        return self._fuzz_engine.format_stats()
+
+    def _fuzz_findings(self, max_show: int) -> str:
+        self._ensure_fuzz_engine()
+        return self._fuzz_engine.format_findings(max_show)
+
+    def _fuzz_corpus(self) -> str:
+        self._ensure_fuzz_engine()
+        corpus = self._fuzz_engine.corpus
+        if not corpus:
+            return "(empty corpus)"
+        lines = [f"{len(corpus)} corpus entry/entries:"]
+        for i, entry in enumerate(corpus[:30]):
+            preview = entry.data[:16].hex()
+            if len(entry.data) > 16:
+                preview += "..."
+            lines.append(
+                f"  [{i:4d}] iter={entry.iteration_found:5d} "
+                f"+{entry.new_pcs}PCs "
+                f"{entry.target_kind}:{entry.target_name:8s} "
+                f"{len(entry.data):3d}B  {preview}"
+            )
+        if len(corpus) > 30:
+            lines.append(f"  ... and {len(corpus) - 30} more")
+        return "\n".join(lines)
+
+    def _fuzz_config(self, key: str, value: str) -> str:
+        self._ensure_fuzz_engine()
+        eng = self._fuzz_engine
+        key_lower = key.lower()
+        if key_lower == "min_len":
+            eng.min_input_len = max(1, _int(value))
+            return f"min_input_len = {eng.min_input_len}"
+        if key_lower == "max_len":
+            eng.max_input_len = max(1, _int(value))
+            return f"max_input_len = {eng.max_input_len}"
+        if key_lower == "max_mutations":
+            eng.max_mutations = max(1, _int(value))
+            return f"max_mutations = {eng.max_mutations}"
+        if key_lower == "mode":
+            if value.lower() not in ("random", "round_robin", "all"):
+                return "mode must be: random, round_robin, or all"
+            eng.mode = value.lower()
+            return f"mode = {eng.mode}"
+        if key_lower == "seed":
+            eng.seed(_int(value))
+            return f"rng seed = {value}"
+        if key_lower == "target":
+            if eng.target_filter is None:
+                eng.target_filter = []
+            eng.target_filter.append(value)
+            return f"target filter: {eng.target_filter}"
+        return f"unknown config key: {key} (valid: min_len, max_len, max_mutations, mode, seed, target)"
+
+    def _fuzz_export(self, what: str, path_str: str) -> str:
+        self._ensure_fuzz_engine()
+        eng = self._fuzz_engine
+        if what == "findings":
+            try:
+                path = self._prepare_export_path(path_str)
+                count = eng.export_findings(path)
+            except OSError as e:
+                return f"error: {e}"
+            return f"exported {count} findings to {path}"
+        if what == "corpus":
+            try:
+                path = Path(path_str).expanduser()
+                count = eng.export_corpus(path)
+            except OSError as e:
+                return f"error: {e}"
+            return f"exported {count} corpus entries to {path}"
+        return "usage: fuzz export findings <file> | fuzz export corpus <dir>"
+
+    def _fuzz_import(self, dir_str: str) -> str:
+        self._ensure_fuzz_engine()
+        directory = Path(dir_str).expanduser()
+        if not directory.is_dir():
+            return f"not a directory: {dir_str}"
+        count = self._fuzz_engine.import_corpus(directory)
+        return f"imported {count} seed inputs from {directory}"
+
+    def _fuzz_reset(self) -> str:
+        self._ensure_fuzz_engine()
+        self._fuzz_engine.reset()
+        return "fuzzer state reset"
