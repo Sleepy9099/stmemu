@@ -2978,6 +2978,7 @@ class Commands:
     def cmd_fuzz(self, argv: list[str]) -> str:
         usage = (
             "usage: fuzz setup [snapshot_name] | fuzz run <iterations> [steps] | "
+            "fuzz profile <file.yaml|file.json> | "
             "fuzz targets | fuzz stats | fuzz findings [max] | "
             "fuzz corpus | fuzz seed <hexbytes|@file> | "
             "fuzz dict <token_hex> | fuzz config <key> <value> | "
@@ -2994,6 +2995,11 @@ class Commands:
         if sub == "setup":
             snap_name = argv[1] if len(argv) > 1 else "__fuzz_baseline"
             return self._fuzz_setup(snap_name)
+
+        if sub == "profile":
+            if len(argv) != 2:
+                return "usage: fuzz profile <file.yaml|file.json>"
+            return self._fuzz_load_profile(argv[1])
 
         if sub == "run":
             if len(argv) < 2:
@@ -3078,6 +3084,26 @@ class Commands:
         self._ensure_fuzz_engine()
         result = self._fuzz_engine.setup(snapshot_name=snap_name)
         return f"fuzz setup: {result}"
+
+    def _fuzz_load_profile(self, path_str: str) -> str:
+        from stmemu.fuzz.profile import load_profile, apply_profile
+        path = Path(path_str).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            profile = load_profile(path)
+        except Exception as e:
+            return f"error loading profile: {e}"
+        self._ensure_fuzz_engine()
+        try:
+            result = apply_profile(
+                profile, self._fuzz_engine, base_dir=path.parent,
+            )
+        except Exception as e:
+            return f"error applying profile: {e}"
+        snap = profile.snapshot
+        setup_result = self._fuzz_engine.setup(snapshot_name=snap)
+        return f"{result}\n\nfuzz setup: {setup_result}"
 
     def _fuzz_add_target(self, argv: list[str]) -> str:
         target_usage = (

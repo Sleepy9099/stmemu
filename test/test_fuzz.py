@@ -65,6 +65,7 @@ if "stmemu.core.emulator" not in sys.modules:
 from stmemu.fuzz.mutator import Mutator
 from stmemu.fuzz.injector import Injector, InjectionTarget, FunctionTargetConfig
 from stmemu.fuzz.engine import FuzzEngine, FuzzStats, CorpusEntry, FuzzFinding, IterationTrace
+from stmemu.fuzz.profile import load_profile, apply_profile, FuzzProfile, TargetProfile
 from stmemu.core.symbols import SymbolTable
 from stmemu.core.semihosting import SemihostingHandler
 
@@ -1170,6 +1171,194 @@ class FuzzStatsTests(unittest.TestCase):
         self.assertEqual(s.execs_per_sec(), 0.0)
 
 
+# ── Profile Tests ─────────────────────────────────────────────────
+
+
+class ProfileTests(unittest.TestCase):
+    def test_load_json_profile(self):
+        profile_data = {
+            "name": "test_profile",
+            "targets": [
+                {
+                    "name": "parse_pkt",
+                    "type": "function",
+                    "entry": "0x08001000",
+                    "buffer": "0x20000400",
+                    "stop": "return",
+                    "return_addr": "0x0800FFFE",
+                }
+            ],
+            "iterations": 500,
+            "steps_per_iter": 3000,
+            "max_input_len": 128,
+            "coverage_mode": "edge",
+            "mode": "round_robin",
+            "seed_inputs": ["AABBCC", "DDEEFF"],
+            "dictionary": ["DEADBEEF"],
+            "coverage": {"start": "0x08004000", "end": "0x08005000"},
+            "faults": {"hardfault": True, "busfault": True},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "profile.json"
+            path.write_text(json.dumps(profile_data))
+            prof = load_profile(path)
+
+        self.assertEqual(prof.name, "test_profile")
+        self.assertEqual(len(prof.targets), 1)
+        self.assertEqual(prof.targets[0].name, "parse_pkt")
+        self.assertEqual(prof.targets[0].entry, 0x08001000)
+        self.assertEqual(prof.targets[0].stop, "return")
+        self.assertEqual(prof.targets[0].return_addr, 0x0800FFFE)
+        self.assertEqual(prof.iterations, 500)
+        self.assertEqual(prof.steps_per_iter, 3000)
+        self.assertEqual(prof.max_input_len, 128)
+        self.assertEqual(prof.coverage_mode, "edge")
+        self.assertEqual(prof.mode, "round_robin")
+        self.assertEqual(len(prof.seed_inputs), 2)
+        self.assertEqual(len(prof.dictionary), 1)
+        self.assertIsNotNone(prof.coverage)
+        self.assertEqual(prof.coverage.start, 0x08004000)
+        self.assertTrue(prof.faults.get("hardfault"))
+
+    def test_load_yaml_profile(self):
+        yaml_text = """\
+name: uart_fuzzer
+target:
+  name: uart_handler
+  type: function
+  entry: 0x08002000
+  buffer: 0x20001000
+  args:
+    r0: buffer
+    r1: length
+  stop: return
+  return_addr: 0x0800FFFE
+max_input_len: 64
+seed: 42
+"""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "profile.yaml"
+            path.write_text(yaml_text)
+            prof = load_profile(path)
+
+        self.assertEqual(prof.name, "uart_fuzzer")
+        self.assertEqual(len(prof.targets), 1)
+        t = prof.targets[0]
+        self.assertEqual(t.name, "uart_handler")
+        self.assertEqual(t.entry, 0x08002000)
+        self.assertEqual(t.abi, "ptr_len")
+        self.assertEqual(t.buf_reg, "r0")
+        self.assertEqual(t.len_reg, "r1")
+        self.assertEqual(prof.seed, 42)
+
+    def test_load_profile_single_target_key(self):
+        data = {
+            "target": {
+                "name": "fn",
+                "type": "function",
+                "entry": "0x08001000",
+                "buffer": "0x20000400",
+            }
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "p.json"
+            path.write_text(json.dumps(data))
+            prof = load_profile(path)
+        self.assertEqual(len(prof.targets), 1)
+        self.assertEqual(prof.targets[0].name, "fn")
+
+    def test_load_profile_memory_target(self):
+        data = {
+            "targets": [
+                {"name": "buf", "type": "memory", "buffer": "0x20000100", "size_reg": "r1"}
+            ]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "p.json"
+            path.write_text(json.dumps(data))
+            prof = load_profile(path)
+        self.assertEqual(prof.targets[0].kind, "memory")
+        self.assertEqual(prof.targets[0].size_reg, "r1")
+
+    def test_apply_profile_to_engine(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        prof = FuzzProfile(
+            name="test",
+            targets=[
+                TargetProfile(
+                    name="fn", kind="function",
+                    entry=0x08001000, buffer=0x20000400,
+                    stop="return", return_addr=0x0800FFFE,
+                ),
+            ],
+            max_input_len=64,
+            coverage_mode="block",
+            mode="round_robin",
+            seed_inputs=["AABB"],
+            dictionary=["DEAD"],
+        )
+        result = apply_profile(prof, eng)
+        self.assertIn("profile 'test' applied", result)
+        self.assertEqual(eng.max_input_len, 64)
+        self.assertEqual(eng.coverage_mode, "block")
+        self.assertEqual(eng.mode, "round_robin")
+        self.assertEqual(len(eng.seed_corpus), 1)
+        self.assertEqual(len(eng.mutator._dictionary), 1)
+        self.assertIsNotNone(eng.injector)
+        fn_targets = [t for t in eng.injector.targets if t.kind == "function"]
+        self.assertEqual(len(fn_targets), 1)
+        self.assertEqual(fn_targets[0].fn_config.stop, "return")
+
+    def test_apply_profile_with_seed_dir(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "seed_001.bin").write_bytes(b"\x01\x02")
+            (Path(td) / "seed_002.bin").write_bytes(b"\x03\x04")
+            prof = FuzzProfile(
+                name="test",
+                targets=[TargetProfile(name="fn", kind="function", entry=0x08001000, buffer=0x20000400)],
+                seed_dir=td,
+            )
+            result = apply_profile(prof, eng, base_dir=Path(td))
+        self.assertEqual(len(eng.seed_corpus), 2)
+
+    def test_target_profile_to_fn_config(self):
+        tp = TargetProfile(
+            name="fn", kind="function",
+            entry=0x08001000, buffer=0x20000400,
+            abi="regs", stop="pc", stop_pc=0x08005000,
+        )
+        cfg = tp.to_fn_config()
+        self.assertEqual(cfg.abi, "regs")
+        self.assertEqual(cfg.stop, "pc")
+        self.assertEqual(cfg.stop_pc, 0x08005000)
+
+    def test_load_profile_invalid_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad.json"
+            path.write_text("not json")
+            with self.assertRaises(Exception):
+                load_profile(path)
+
+    def test_args_infer_abi_ptr_only(self):
+        data = {
+            "targets": [{
+                "name": "fn", "type": "function",
+                "entry": "0x08001000", "buffer": "0x20000400",
+                "args": {"r0": "buffer"},
+            }]
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "p.json"
+            path.write_text(json.dumps(data))
+            prof = load_profile(path)
+        self.assertEqual(prof.targets[0].abi, "ptr")
+
+
 # ── Shell fuzz command tests ───────────────────────────────────────
 
 
@@ -1382,6 +1571,30 @@ class FuzzShellCommandTests(unittest.TestCase):
 
     def test_fuzz_replay_usage(self):
         out = self.cmds.cmd_fuzz(["replay"])
+        self.assertIn("usage:", out)
+
+    def test_fuzz_profile_json(self):
+        profile_data = {
+            "name": "shell_test",
+            "targets": [{
+                "name": "fn", "type": "function",
+                "entry": "0x08001000", "buffer": "0x20000400",
+            }],
+            "max_input_len": 32,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "profile.json"
+            path.write_text(json.dumps(profile_data))
+            out = self.cmds.cmd_fuzz(["profile", str(path)])
+        self.assertIn("profile 'shell_test' applied", out)
+        self.assertIn("fuzz setup:", out)
+
+    def test_fuzz_profile_missing_file(self):
+        out = self.cmds.cmd_fuzz(["profile", "/nonexistent/profile.json"])
+        self.assertIn("error", out)
+
+    def test_fuzz_profile_usage(self):
+        out = self.cmds.cmd_fuzz(["profile"])
         self.assertIn("usage:", out)
 
 
