@@ -208,6 +208,12 @@ def apply_profile(
     eng.coverage_mode = profile.coverage_mode
     eng.capture_mmio = profile.capture_mmio
 
+    if profile.coverage and profile.coverage.end > profile.coverage.start:
+        eng.coverage_filter = (profile.coverage.start, profile.coverage.end)
+
+    if profile.faults:
+        eng.fault_policy = dict(profile.faults)
+
     if profile.seed is not None:
         eng.seed(profile.seed)
 

@@ -25,6 +25,12 @@ def _int(s: str) -> int:
         raise ValueError(f"invalid integer: {s!r}")
 
 
+def _fmt_cov_filter(f: tuple[int, int] | None) -> str:
+    if f is None:
+        return "disabled"
+    return f"0x{f[0]:08X}-0x{f[1]:08X}"
+
+
 @dataclass
 class Commands:
     emu: Emulator
@@ -3266,9 +3272,26 @@ class Commands:
                 return "coverage_mode must be: edge or block"
             eng.coverage_mode = value.lower()
             return f"coverage_mode = {eng.coverage_mode}"
+        if key_lower == "coverage_start":
+            start = _int(value)
+            end = eng.coverage_filter[1] if eng.coverage_filter else 0
+            eng.coverage_filter = (start, end) if end > start else (start, end)
+            return f"coverage_filter = {_fmt_cov_filter(eng.coverage_filter)}"
+        if key_lower == "coverage_end":
+            start = eng.coverage_filter[0] if eng.coverage_filter else 0
+            end = _int(value)
+            eng.coverage_filter = (start, end) if end > start else (start, end)
+            return f"coverage_filter = {_fmt_cov_filter(eng.coverage_filter)}"
+        if key_lower == "faults":
+            if not value or value.lower() in ("all", "none", ""):
+                eng.fault_policy = {}
+                return "fault_policy = all (no filter)"
+            eng.fault_policy = {f.strip(): True for f in value.split(",") if f.strip()}
+            return f"fault_policy = {', '.join(sorted(eng.fault_policy))}"
         return (
             f"unknown config key: {key} "
-            "(valid: min_len, max_len, max_mutations, mode, seed, target, capture_mmio, coverage_mode)"
+            "(valid: min_len, max_len, max_mutations, mode, seed, target, "
+            "capture_mmio, coverage_mode, coverage_start, coverage_end, faults)"
         )
 
     def _fuzz_replay(self, argv: list[str]) -> str:

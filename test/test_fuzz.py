@@ -65,7 +65,7 @@ if "stmemu.core.emulator" not in sys.modules:
 from stmemu.fuzz.mutator import Mutator
 from stmemu.fuzz.injector import Injector, InjectionTarget, FunctionTargetConfig
 from stmemu.fuzz.engine import FuzzEngine, FuzzStats, CorpusEntry, FuzzFinding, IterationTrace
-from stmemu.fuzz.profile import load_profile, apply_profile, FuzzProfile, TargetProfile
+from stmemu.fuzz.profile import load_profile, apply_profile, FuzzProfile, TargetProfile, CoverageFilter
 from stmemu.core.symbols import SymbolTable
 from stmemu.core.semihosting import SemihostingHandler
 
@@ -182,6 +182,8 @@ class _FakeEmu:
         self._prev_coverage_pc: int = 0
         self._edge_coverage: set[int] = set()
         self._edge_coverage_hits: dict[int, int] = {}
+        self._coverage_filter_start: int = 0
+        self._coverage_filter_end: int = 0
         self.flash_base = 0x08000000
         self.flash_end = 0x08010000
         self.pc = 0x08000100
@@ -219,11 +221,15 @@ class _FakeEmu:
 
     def _add_coverage_pc(self, pc: int) -> None:
         clean = pc & ~1
-        self._coverage.add(clean)
-        self._coverage_hits[clean] = self._coverage_hits.get(clean, 0) + 1
-        edge = (self._prev_coverage_pc >> 4) ^ clean
-        self._edge_coverage.add(edge)
-        self._edge_coverage_hits[edge] = self._edge_coverage_hits.get(edge, 0) + 1
+        if (
+            self._coverage_filter_end == 0
+            or self._coverage_filter_start <= clean < self._coverage_filter_end
+        ):
+            self._coverage.add(clean)
+            self._coverage_hits[clean] = self._coverage_hits.get(clean, 0) + 1
+            edge = (self._prev_coverage_pc >> 4) ^ clean
+            self._edge_coverage.add(edge)
+            self._edge_coverage_hits[edge] = self._edge_coverage_hits.get(edge, 0) + 1
         self._prev_coverage_pc = clean
 
     def run(self, count):
@@ -1180,6 +1186,112 @@ class FuzzEngineTests(unittest.TestCase):
         eng.reset()
         self.assertEqual(len(eng._global_edge_coverage), 0)
 
+    def test_coverage_filter_restricts_blocks(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "block"
+        eng.coverage_filter = (0x08001000, 0x08002000)
+        emu._coverage_filter_start = 0x08001000
+        emu._coverage_filter_end = 0x08002000
+
+        call_count = [0]
+        def mixed_pcs(emu_ref, count):
+            call_count[0] += 1
+            emu_ref._add_coverage_pc(0x08001000 + call_count[0] * 2)
+            emu_ref._add_coverage_pc(0x08003000 + call_count[0] * 2)
+
+        emu._run_callback = mixed_pcs
+        eng.seed(42)
+        eng.run(iterations=3, steps_per_iter=100)
+        for pc in eng._global_coverage:
+            self.assertGreaterEqual(pc, 0x08001000)
+            self.assertLess(pc, 0x08002000)
+
+    def test_coverage_filter_restricts_edges(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "edge"
+        eng.coverage_filter = (0x08001000, 0x08002000)
+        emu._coverage_filter_start = 0x08001000
+        emu._coverage_filter_end = 0x08002000
+
+        call_count = [0]
+        def filtered_pcs(emu_ref, count):
+            call_count[0] += 1
+            emu_ref._add_coverage_pc(0x08001000)
+            emu_ref._add_coverage_pc(0x08001010)
+
+        emu._run_callback = filtered_pcs
+        eng.seed(42)
+        eng.run(iterations=2, steps_per_iter=100)
+        self.assertGreater(len(eng._global_edge_coverage), 0)
+
+    def test_fault_policy_filters_crashes(self):
+        eng, emu, uart = self._make_engine()
+        eng.fault_policy = {"hardfault": True}
+
+        call_count = [0]
+        def crash_run(emu_ref, count):
+            call_count[0] += 1
+            emu_ref._add_coverage_pc(0x08000200)
+            raise RuntimeError("UsageFault at 0x08000200")
+
+        emu._run_callback = crash_run
+        eng.seed(42)
+        eng.run(iterations=3, steps_per_iter=100)
+        self.assertEqual(eng.stats.crashes, 3)
+        self.assertEqual(len(eng.findings), 0)
+
+    def test_fault_policy_accepts_matching(self):
+        eng, emu, uart = self._make_engine()
+        eng.fault_policy = {"hardfault": True}
+
+        def crash_run(emu_ref, count):
+            emu_ref._add_coverage_pc(0x08000200)
+            raise RuntimeError("HardFault at 0x08000200")
+
+        emu._run_callback = crash_run
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+        self.assertEqual(eng.stats.crashes, 1)
+        crash_findings = [f for f in eng.findings if "crash" in f.kind]
+        self.assertEqual(len(crash_findings), 1)
+
+    def test_fault_policy_empty_accepts_all(self):
+        eng, emu, uart = self._make_engine()
+        eng.fault_policy = {}
+
+        def crash_run(emu_ref, count):
+            raise RuntimeError("anything")
+
+        emu._run_callback = crash_run
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+        self.assertGreater(len(eng.findings), 0)
+
+    def test_fault_policy_cfsr_match(self):
+        eng, emu, uart = self._make_engine()
+        eng.fault_policy = {"busfault": True}
+
+        def crash_run(emu_ref, count):
+            raise RuntimeError("generic error")
+
+        emu._run_callback = crash_run
+        emu.capture_fault_report = lambda reason, detail=None: {
+            "reason": reason, "detail": detail or "", "pc": emu.pc,
+            "cfsr": 0x00000200, "hfsr": 0,
+        }
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+        crash_findings = [f for f in eng.findings if "crash" in f.kind]
+        self.assertEqual(len(crash_findings), 1)
+
+    def test_reset_clears_coverage_filter_on_emu(self):
+        eng, emu, uart = self._make_engine()
+        emu._coverage_filter_start = 0x08001000
+        emu._coverage_filter_end = 0x08002000
+        eng.reset()
+        self.assertEqual(emu._coverage_filter_start, 0)
+        self.assertEqual(emu._coverage_filter_end, 0)
+
 
 # ── FuzzStats Tests ────────────────────────────────────────────────
 
@@ -1380,6 +1492,21 @@ seed: 42
             path.write_text(json.dumps(data))
             prof = load_profile(path)
         self.assertEqual(prof.targets[0].abi, "ptr")
+
+    def test_apply_profile_sets_coverage_filter(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        prof = FuzzProfile(
+            name="test",
+            targets=[TargetProfile(name="fn", kind="function", entry=0x08001000, buffer=0x20000400)],
+            coverage=CoverageFilter(start=0x08004000, end=0x08005000),
+            faults={"hardfault": True, "busfault": True},
+        )
+        apply_profile(prof, eng)
+        self.assertEqual(eng.coverage_filter, (0x08004000, 0x08005000))
+        self.assertTrue(eng.fault_policy.get("hardfault"))
+        self.assertTrue(eng.fault_policy.get("busfault"))
 
 
 # ── Shell fuzz command tests ───────────────────────────────────────
@@ -1591,6 +1718,25 @@ class FuzzShellCommandTests(unittest.TestCase):
         self.cmds.cmd_fuzz(["setup"])
         out = self.cmds.cmd_fuzz(["config", "coverage_mode", "invalid"])
         self.assertIn("must be", out)
+
+    def test_fuzz_config_coverage_filter(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["config", "coverage_start", "0x08001000"])
+        self.assertIn("coverage_filter", out)
+        out = self.cmds.cmd_fuzz(["config", "coverage_end", "0x08002000"])
+        self.assertIn("0x08001000", out)
+        self.assertIn("0x08002000", out)
+
+    def test_fuzz_config_faults(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["config", "faults", "hardfault,busfault"])
+        self.assertIn("busfault", out)
+        self.assertIn("hardfault", out)
+
+    def test_fuzz_config_faults_all(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["config", "faults", "all"])
+        self.assertIn("no filter", out)
 
     def test_fuzz_replay_usage(self):
         out = self.cmds.cmd_fuzz(["replay"])

@@ -187,6 +187,9 @@ class Emulator:
         self._prev_coverage_pc: int = 0
         self._edge_coverage: set[int] = set()
         self._edge_coverage_hits: dict[int, int] = {}
+        # Optional address-range filter (0 = disabled)
+        self._coverage_filter_start: int = 0
+        self._coverage_filter_end: int = 0
         self._exception_return_stack: list[int] = []
         self._special_step_consumed = False
         self._ignore_breakpoint_once: int | None = None
@@ -1421,11 +1424,15 @@ class Emulator:
         pc = int(address)
         if self.coverage_enabled:
             clean_pc = pc & ~1
-            self._coverage.add(clean_pc)
-            self._coverage_hits[clean_pc] = self._coverage_hits.get(clean_pc, 0) + 1
-            edge = (self._prev_coverage_pc >> 4) ^ clean_pc
-            self._edge_coverage.add(edge)
-            self._edge_coverage_hits[edge] = self._edge_coverage_hits.get(edge, 0) + 1
+            if (
+                self._coverage_filter_end == 0
+                or self._coverage_filter_start <= clean_pc < self._coverage_filter_end
+            ):
+                self._coverage.add(clean_pc)
+                self._coverage_hits[clean_pc] = self._coverage_hits.get(clean_pc, 0) + 1
+                edge = (self._prev_coverage_pc >> 4) ^ clean_pc
+                self._edge_coverage.add(edge)
+                self._edge_coverage_hits[edge] = self._edge_coverage_hits.get(edge, 0) + 1
             self._prev_coverage_pc = clean_pc
         if self.trace_enabled:
             self._trace_finalize_pending(next_pc=pc & ~1)

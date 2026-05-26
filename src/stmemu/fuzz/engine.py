@@ -113,6 +113,8 @@ class FuzzEngine:
     target_filter: list[str] | None = None
     mode: str = "random"  # "random", "round_robin", "all"
     coverage_mode: str = "edge"  # "edge" or "block"
+    coverage_filter: tuple[int, int] | None = None  # (start, end) or None
+    fault_policy: dict[str, bool] = field(default_factory=dict)
     capture_mmio: bool = False
     _mmio_ring_size: int = 256
     _snapshot_name: str = ""
@@ -143,6 +145,9 @@ class FuzzEngine:
             return "no injectable targets found"
 
         self.emu.coverage_enabled = True
+        if self.coverage_filter and hasattr(self.emu, "_coverage_filter_start"):
+            self.emu._coverage_filter_start = self.coverage_filter[0]
+            self.emu._coverage_filter_end = self.coverage_filter[1]
         self._global_coverage = set(self.emu._coverage)
         self._global_edge_coverage = set(
             getattr(self.emu, "_edge_coverage", set())
@@ -276,12 +281,6 @@ class FuzzEngine:
 
                 if crashed:
                     self.stats.crashes += 1
-                    crash_hash = self._crash_hash(detail)
-                    kind = "crash"
-                    if crash_hash not in self._crash_hashes:
-                        self._crash_hashes.add(crash_hash)
-                        self.stats.unique_crashes += 1
-                        kind = "unique_crash"
 
                     fault_report = None
                     if hasattr(self.emu, 'capture_fault_report'):
@@ -292,19 +291,27 @@ class FuzzEngine:
                         except Exception:
                             pass
 
-                    finding = FuzzFinding(
-                        iteration=self.stats.iterations,
-                        kind=kind,
-                        input_data=bytes(input_data),
-                        target_name=target_name,
-                        target_kind=target_kind,
-                        new_pcs=new_pcs_count,
-                        detail=detail,
-                        fault_report=fault_report,
-                        trace=trace,
-                    )
-                    self.findings.append(finding)
-                    session_findings.append(finding)
+                    if self._fault_matches_policy(detail, fault_report):
+                        crash_hash = self._crash_hash(detail)
+                        kind = "crash"
+                        if crash_hash not in self._crash_hashes:
+                            self._crash_hashes.add(crash_hash)
+                            self.stats.unique_crashes += 1
+                            kind = "unique_crash"
+
+                        finding = FuzzFinding(
+                            iteration=self.stats.iterations,
+                            kind=kind,
+                            input_data=bytes(input_data),
+                            target_name=target_name,
+                            target_kind=target_kind,
+                            new_pcs=new_pcs_count,
+                            detail=detail,
+                            fault_report=fault_report,
+                            trace=trace,
+                        )
+                        self.findings.append(finding)
+                        session_findings.append(finding)
 
                 elif hung:
                     self.stats.hangs += 1
@@ -608,6 +615,37 @@ class FuzzEngine:
         pc = getattr(self.emu, 'pc', 0)
         return f"{pc:08x}:{detail[:64]}"
 
+    def _fault_matches_policy(
+        self, detail: str, fault_report: dict | None,
+    ) -> bool:
+        """Return True if the crash matches the fault policy.
+
+        An empty policy (the default) accepts all crashes.
+        """
+        if not self.fault_policy:
+            return True
+        dl = detail.lower()
+        if self.fault_policy.get("hardfault") and "hardfault" in dl:
+            return True
+        if self.fault_policy.get("busfault") and "busfault" in dl:
+            return True
+        if self.fault_policy.get("memfault") and ("memfault" in dl or "memmana" in dl):
+            return True
+        if self.fault_policy.get("usagefault") and "usagefault" in dl:
+            return True
+        if fault_report:
+            cfsr = int(fault_report.get("cfsr", 0))
+            hfsr = int(fault_report.get("hfsr", 0))
+            if self.fault_policy.get("busfault") and (cfsr & 0x0000FF00):
+                return True
+            if self.fault_policy.get("memfault") and (cfsr & 0x000000FF):
+                return True
+            if self.fault_policy.get("usagefault") and (cfsr & 0xFFFF0000):
+                return True
+            if self.fault_policy.get("hardfault") and hfsr:
+                return True
+        return False
+
     def format_stats(self) -> str:
         s = self.stats
         cov_unit = "edges" if self.coverage_mode == "edge" else "PCs"
@@ -704,3 +742,6 @@ class FuzzEngine:
         self._crash_hashes.clear()
         self._global_coverage.clear()
         self._global_edge_coverage.clear()
+        if hasattr(self.emu, "_coverage_filter_start"):
+            self.emu._coverage_filter_start = 0
+            self.emu._coverage_filter_end = 0
