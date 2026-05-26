@@ -183,6 +183,10 @@ class Emulator:
         self._coverage: set[int] = set()
         self._coverage_hits: dict[int, int] = {}
         self._coverage_snapshots: dict[str, set[int]] = {}
+        # Edge coverage: (prev_pc >> 4) ^ cur_pc
+        self._prev_coverage_pc: int = 0
+        self._edge_coverage: set[int] = set()
+        self._edge_coverage_hits: dict[int, int] = {}
         self._exception_return_stack: list[int] = []
         self._special_step_consumed = False
         self._ignore_breakpoint_once: int | None = None
@@ -739,9 +743,12 @@ class Emulator:
         self.last_mmio_break = None
         self.last_watch_break = None
 
+        self._prev_coverage_pc = 0
         if snap.coverage is not None:
             self._coverage = set(snap.coverage)
             self._coverage_hits.clear()
+            self._edge_coverage.clear()
+            self._edge_coverage_hits.clear()
         if snap.fault_report is not None:
             self.last_fault_report = dict(snap.fault_report)
         else:
@@ -1416,6 +1423,10 @@ class Emulator:
             clean_pc = pc & ~1
             self._coverage.add(clean_pc)
             self._coverage_hits[clean_pc] = self._coverage_hits.get(clean_pc, 0) + 1
+            edge = (self._prev_coverage_pc >> 4) ^ clean_pc
+            self._edge_coverage.add(edge)
+            self._edge_coverage_hits[edge] = self._edge_coverage_hits.get(edge, 0) + 1
+            self._prev_coverage_pc = clean_pc
         if self.trace_enabled:
             self._trace_finalize_pending(next_pc=pc & ~1)
         else:

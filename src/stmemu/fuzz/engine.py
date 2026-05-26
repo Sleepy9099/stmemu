@@ -112,11 +112,13 @@ class FuzzEngine:
     max_mutations: int = 4
     target_filter: list[str] | None = None
     mode: str = "random"  # "random", "round_robin", "all"
+    coverage_mode: str = "edge"  # "edge" or "block"
     capture_mmio: bool = False
     _mmio_ring_size: int = 256
     _snapshot_name: str = ""
     _crash_hashes: set[str] = field(default_factory=set)
     _global_coverage: set[int] = field(default_factory=set)
+    _global_edge_coverage: set[int] = field(default_factory=set)
     _rng_seed: int | None = None
 
     def setup(self, snapshot_name: str = "__fuzz_baseline") -> str:
@@ -142,7 +144,13 @@ class FuzzEngine:
 
         self.emu.coverage_enabled = True
         self._global_coverage = set(self.emu._coverage)
-        self.stats.coverage_at_start = len(self._global_coverage)
+        self._global_edge_coverage = set(
+            getattr(self.emu, "_edge_coverage", set())
+        )
+        if self.coverage_mode == "edge":
+            self.stats.coverage_at_start = len(self._global_edge_coverage)
+        else:
+            self.stats.coverage_at_start = len(self._global_coverage)
 
         if self._rng_seed is not None:
             self.mutator.set_seed(self._rng_seed)
@@ -200,6 +208,10 @@ class FuzzEngine:
                 self.emu.load_snapshot(self._snapshot_name)
                 self.emu._coverage.clear()
                 self.emu._coverage_hits.clear()
+                if hasattr(self.emu, "_edge_coverage"):
+                    self.emu._edge_coverage.clear()
+                    self.emu._edge_coverage_hits.clear()
+                    self.emu._prev_coverage_pc = 0
                 if mmio_log is not None:
                     mmio_log.clear()
 
@@ -242,14 +254,24 @@ class FuzzEngine:
                                 detail = "stuck loop detected"
                                 break
 
-                iter_coverage = set(self.emu._coverage)
-                new_pcs = iter_coverage - self._global_coverage
-                new_pcs_count = len(new_pcs)
-                self._global_coverage |= iter_coverage
+                iter_block_cov = set(self.emu._coverage)
+                new_blocks = iter_block_cov - self._global_coverage
+                self._global_coverage |= iter_block_cov
+
+                if self.coverage_mode == "edge" and hasattr(self.emu, "_edge_coverage"):
+                    iter_edge_cov = set(self.emu._edge_coverage)
+                    new_edges = iter_edge_cov - self._global_edge_coverage
+                    self._global_edge_coverage |= iter_edge_cov
+                    new_pcs_count = len(new_edges)
+                    novelty_pcs = new_edges
+                else:
+                    new_pcs_count = len(new_blocks)
+                    novelty_pcs = new_blocks
 
                 has_finding = crashed or hung or new_pcs_count > 0
                 trace = (
-                    self._capture_trace(new_pcs, mmio_log) if has_finding else None
+                    self._capture_trace(new_blocks, mmio_log)
+                    if has_finding else None
                 )
 
                 if crashed:
@@ -324,7 +346,10 @@ class FuzzEngine:
                         self.findings.append(finding)
                         session_findings.append(finding)
 
-                self.stats.coverage_current = len(self._global_coverage)
+                if self.coverage_mode == "edge":
+                    self.stats.coverage_current = len(self._global_edge_coverage)
+                else:
+                    self.stats.coverage_current = len(self._global_coverage)
         finally:
             if orig_read is not None:
                 self.bus.read = orig_read
@@ -354,6 +379,10 @@ class FuzzEngine:
         self.emu.load_snapshot(self._snapshot_name)
         self.emu._coverage.clear()
         self.emu._coverage_hits.clear()
+        if hasattr(self.emu, "_edge_coverage"):
+            self.emu._edge_coverage.clear()
+            self.emu._edge_coverage_hits.clear()
+            self.emu._prev_coverage_pc = 0
 
         target = self._find_target(finding.target_name, finding.target_kind)
 
@@ -580,6 +609,7 @@ class FuzzEngine:
 
     def format_stats(self) -> str:
         s = self.stats
+        cov_unit = "edges" if self.coverage_mode == "edge" else "PCs"
         lines = [
             f"iterations:      {s.iterations}",
             f"exec/sec:        {s.execs_per_sec():.1f}",
@@ -587,10 +617,15 @@ class FuzzEngine:
             f"crashes:         {s.crashes} ({s.unique_crashes} unique)",
             f"hangs:           {s.hangs}",
             f"new cov inputs:  {s.new_coverage_inputs}",
-            f"coverage start:  {s.coverage_at_start} PCs",
-            f"coverage now:    {s.coverage_current} PCs",
-            f"coverage gained: +{s.coverage_current - s.coverage_at_start} PCs",
+            f"coverage mode:   {self.coverage_mode}",
+            f"coverage start:  {s.coverage_at_start} {cov_unit}",
+            f"coverage now:    {s.coverage_current} {cov_unit}",
+            f"coverage gained: +{s.coverage_current - s.coverage_at_start} {cov_unit}",
         ]
+        if self.coverage_mode == "edge":
+            lines.append(
+                f"block coverage:  {len(self._global_coverage)} PCs"
+            )
         return "\n".join(lines)
 
     def format_findings(self, max_show: int = 20) -> str:
@@ -666,3 +701,4 @@ class FuzzEngine:
         self.findings.clear()
         self._crash_hashes.clear()
         self._global_coverage.clear()
+        self._global_edge_coverage.clear()

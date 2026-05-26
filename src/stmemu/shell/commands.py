@@ -3235,7 +3235,15 @@ class Commands:
         if key_lower == "capture_mmio":
             eng.capture_mmio = value.lower() in ("on", "true", "1", "yes")
             return f"capture_mmio = {'on' if eng.capture_mmio else 'off'}"
-        return f"unknown config key: {key} (valid: min_len, max_len, max_mutations, mode, seed, target, capture_mmio)"
+        if key_lower == "coverage_mode":
+            if value.lower() not in ("edge", "block"):
+                return "coverage_mode must be: edge or block"
+            eng.coverage_mode = value.lower()
+            return f"coverage_mode = {eng.coverage_mode}"
+        return (
+            f"unknown config key: {key} "
+            "(valid: min_len, max_len, max_mutations, mode, seed, target, capture_mmio, coverage_mode)"
+        )
 
     def _fuzz_replay(self, argv: list[str]) -> str:
         self._ensure_fuzz_engine()

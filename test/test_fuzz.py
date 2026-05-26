@@ -178,6 +178,9 @@ class _FakeEmu:
         self._coverage: set[int] = set()
         self._coverage_hits: dict[int, int] = {}
         self._coverage_snapshots: dict[str, set[int]] = {}
+        self._prev_coverage_pc: int = 0
+        self._edge_coverage: set[int] = set()
+        self._edge_coverage_hits: dict[int, int] = {}
         self.flash_base = 0x08000000
         self.flash_end = 0x08010000
         self.pc = 0x08000100
@@ -213,6 +216,15 @@ class _FakeEmu:
     def remove_breakpoint(self, addr):
         self._breakpoints.discard(addr & ~1)
 
+    def _add_coverage_pc(self, pc: int) -> None:
+        clean = pc & ~1
+        self._coverage.add(clean)
+        self._coverage_hits[clean] = self._coverage_hits.get(clean, 0) + 1
+        edge = (self._prev_coverage_pc >> 4) ^ clean
+        self._edge_coverage.add(edge)
+        self._edge_coverage_hits[edge] = self._edge_coverage_hits.get(edge, 0) + 1
+        self._prev_coverage_pc = clean
+
     def run(self, count):
         self.last_pc_break = None
         if self._run_callback:
@@ -221,8 +233,7 @@ class _FakeEmu:
             import random
             for _ in range(random.randint(0, 3)):
                 pc = random.randint(0x08000100, 0x08000FFF) & ~1
-                self._coverage.add(pc)
-                self._coverage_hits[pc] = self._coverage_hits.get(pc, 0) + 1
+                self._add_coverage_pc(pc)
         if (self.pc & ~1) in self._breakpoints:
             self.last_pc_break = self.pc & ~1
 
@@ -591,7 +602,7 @@ class FuzzEngineTests(unittest.TestCase):
         def deterministic_run(emu_ref, count):
             call_count[0] += 1
             pc = 0x08000100 + (call_count[0] * 2)
-            emu_ref._coverage.add(pc)
+            emu_ref._add_coverage_pc(pc)
 
         emu._run_callback = deterministic_run
         eng.seed(42)
@@ -604,7 +615,7 @@ class FuzzEngineTests(unittest.TestCase):
         eng, emu, uart = self._make_engine()
 
         def same_pc_run(emu_ref, count):
-            emu_ref._coverage.add(0x08000200)
+            emu_ref._add_coverage_pc(0x08000200)
 
         emu._run_callback = same_pc_run
         eng.seed(42)
@@ -628,7 +639,7 @@ class FuzzEngineTests(unittest.TestCase):
                 raise RuntimeError("HardFault at 0x08000200")
             import random
             pc = random.randint(0x08000100, 0x08000FFF) & ~1
-            emu_ref._coverage.add(pc)
+            emu_ref._add_coverage_pc(pc)
 
         emu._run_callback = crashing_run
         eng.seed(42)
@@ -824,7 +835,7 @@ class FuzzEngineTests(unittest.TestCase):
         emu.coverage_enabled = True
 
         def simulate_return(emu_ref, count):
-            emu_ref._coverage.add(0x08001000)
+            emu_ref._add_coverage_pc(0x08001000)
             emu_ref.pc = 0x0800FFFE
 
         emu._run_callback = simulate_return
@@ -848,7 +859,7 @@ class FuzzEngineTests(unittest.TestCase):
         emu.coverage_enabled = True
 
         def simulate_reach_pc(emu_ref, count):
-            emu_ref._coverage.add(0x08001000)
+            emu_ref._add_coverage_pc(0x08001000)
             emu_ref.pc = 0x08005000
 
         emu._run_callback = simulate_reach_pc
@@ -893,7 +904,7 @@ class FuzzEngineTests(unittest.TestCase):
         emu.coverage_enabled = True
 
         def simulate_return(emu_ref, count):
-            emu_ref._coverage.add(0x08001002)
+            emu_ref._add_coverage_pc(0x08001002)
             emu_ref.pc = 0x0800FFFE
 
         emu._run_callback = simulate_return
@@ -905,7 +916,7 @@ class FuzzEngineTests(unittest.TestCase):
     def test_crash_finding_has_trace(self):
         eng, emu, uart = self._make_engine()
         def crash_run(emu_ref, count):
-            emu_ref._coverage.add(0x08000200)
+            emu_ref._add_coverage_pc(0x08000200)
             emu_ref._pc_hist[0x08000200] = 10
             raise RuntimeError("HardFault")
         emu._run_callback = crash_run
@@ -923,7 +934,7 @@ class FuzzEngineTests(unittest.TestCase):
         call_count = [0]
         def coverage_run(emu_ref, count):
             call_count[0] += 1
-            emu_ref._coverage.add(0x08000100 + call_count[0] * 2)
+            emu_ref._add_coverage_pc(0x08000100 + call_count[0] * 2)
         emu._run_callback = coverage_run
         eng.seed(42)
         eng.run(iterations=3, steps_per_iter=100)
@@ -961,7 +972,7 @@ class FuzzEngineTests(unittest.TestCase):
         eng.capture_mmio = True
 
         def mmio_run(emu_ref, count):
-            emu_ref._coverage.add(0x08000300)
+            emu_ref._add_coverage_pc(0x08000300)
             bus.read(0x40004400, 4)
             bus.write(0x40004404, 4, 0x80)
 
@@ -983,7 +994,7 @@ class FuzzEngineTests(unittest.TestCase):
         crash_count = [0]
         def crash_run(emu_ref, count):
             crash_count[0] += 1
-            emu_ref._coverage.add(0x08000200)
+            emu_ref._add_coverage_pc(0x08000200)
             emu_ref._pc_hist[0x08000200] = 5
             if crash_count[0] <= 2:
                 raise RuntimeError("HardFault")
@@ -1002,7 +1013,7 @@ class FuzzEngineTests(unittest.TestCase):
     def test_replay_format(self):
         eng, emu, uart = self._make_engine()
         def crash_run(emu_ref, count):
-            emu_ref._coverage.add(0x08000200)
+            emu_ref._add_coverage_pc(0x08000200)
             raise RuntimeError("boom")
         emu._run_callback = crash_run
         eng.seed(42)
@@ -1063,6 +1074,87 @@ class FuzzEngineTests(unittest.TestCase):
         ))
         text = eng.format_findings()
         self.assertIn("[trace]", text)
+
+    def test_edge_coverage_mode(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "edge"
+        call_count = [0]
+
+        def distinct_paths(emu_ref, count):
+            call_count[0] += 1
+            if call_count[0] % 2 == 0:
+                emu_ref._add_coverage_pc(0x08001000)
+                emu_ref._add_coverage_pc(0x08001010)
+            else:
+                emu_ref._add_coverage_pc(0x08001000)
+                emu_ref._add_coverage_pc(0x08001020)
+
+        emu._run_callback = distinct_paths
+        eng.seed(42)
+        eng.run(iterations=4, steps_per_iter=100)
+        self.assertGreater(len(eng._global_edge_coverage), 0)
+        self.assertGreater(eng.stats.coverage_current, 0)
+
+    def test_edge_vs_block_difference(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "edge"
+        call_count = [0]
+        a, b, c, d = 0x08001000, 0x08001010, 0x08001020, 0x08001030
+
+        def two_paths(emu_ref, count):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                emu_ref._add_coverage_pc(a)
+                emu_ref._add_coverage_pc(b)
+                emu_ref._add_coverage_pc(d)
+            else:
+                emu_ref._add_coverage_pc(a)
+                emu_ref._add_coverage_pc(c)
+                emu_ref._add_coverage_pc(d)
+
+        emu._run_callback = two_paths
+        eng.seed(42)
+        eng.run(iterations=2, steps_per_iter=100)
+        self.assertGreater(
+            len(eng._global_edge_coverage), len(eng._global_coverage),
+            "edge coverage should exceed block coverage for paths "
+            "A->B->D vs A->C->D (same blocks, different edges)"
+        )
+
+    def test_block_coverage_mode(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "block"
+        call_count = [0]
+
+        def add_pcs(emu_ref, count):
+            call_count[0] += 1
+            emu_ref._add_coverage_pc(0x08001000 + call_count[0] * 2)
+
+        emu._run_callback = add_pcs
+        eng.seed(42)
+        eng.run(iterations=3, steps_per_iter=100)
+        self.assertEqual(eng.stats.coverage_current, len(eng._global_coverage))
+        self.assertEqual(eng.stats.coverage_current, 3)
+
+    def test_edge_coverage_format_stats(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "edge"
+        text = eng.format_stats()
+        self.assertIn("edges", text)
+        self.assertIn("coverage mode:   edge", text)
+
+    def test_block_coverage_format_stats(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "block"
+        text = eng.format_stats()
+        self.assertIn("PCs", text)
+        self.assertIn("coverage mode:   block", text)
+
+    def test_reset_clears_edge_coverage(self):
+        eng, emu, uart = self._make_engine()
+        eng._global_edge_coverage.add(12345)
+        eng.reset()
+        self.assertEqual(len(eng._global_edge_coverage), 0)
 
 
 # ── FuzzStats Tests ────────────────────────────────────────────────
@@ -1275,6 +1367,18 @@ class FuzzShellCommandTests(unittest.TestCase):
         self.assertIn("capture_mmio = on", out)
         out = self.cmds.cmd_fuzz(["config", "capture_mmio", "off"])
         self.assertIn("capture_mmio = off", out)
+
+    def test_fuzz_config_coverage_mode(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["config", "coverage_mode", "edge"])
+        self.assertIn("coverage_mode = edge", out)
+        out = self.cmds.cmd_fuzz(["config", "coverage_mode", "block"])
+        self.assertIn("coverage_mode = block", out)
+
+    def test_fuzz_config_coverage_mode_invalid(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["config", "coverage_mode", "invalid"])
+        self.assertIn("must be", out)
 
     def test_fuzz_replay_usage(self):
         out = self.cmds.cmd_fuzz(["replay"])
