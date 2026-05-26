@@ -340,7 +340,7 @@ class FuzzEngine:
                             target_name=target_name,
                             target_kind=target_kind,
                             new_pcs=new_pcs_count,
-                            detail=f"+{new_pcs_count} PCs",
+                            detail=f"+{new_pcs_count} {'edges' if self.coverage_mode == 'edge' else 'PCs'}",
                             trace=trace,
                         )
                         self.findings.append(finding)
@@ -494,7 +494,8 @@ class FuzzEngine:
                     lines.append(f"  ... and {len(trace.pc_freq) - 10} more")
 
             if trace.new_pcs:
-                lines.append(f"new coverage: +{len(trace.new_pcs)} PCs")
+                cov_label = "edges" if self.coverage_mode == "edge" else "PCs"
+                lines.append(f"new coverage: +{len(trace.new_pcs)} {cov_label}")
 
             if trace.mmio_log:
                 reads = sum(1 for k, *_ in trace.mmio_log if k == "r")
@@ -637,10 +638,11 @@ class FuzzEngine:
             if len(f.input_data) > 16:
                 data_preview += "..."
             tag = " [trace]" if f.trace is not None else ""
+            cov_label = "edges" if self.coverage_mode == "edge" else "PCs"
             lines.append(
                 f"  [{f.iteration:5d}] {f.kind:14s} "
                 f"{f.target_kind}:{f.target_name:8s} "
-                f"+{f.new_pcs}PCs  "
+                f"+{f.new_pcs}{cov_label}  "
                 f"data={data_preview}  {f.detail}{tag}"
             )
         if len(self.findings) > max_show:

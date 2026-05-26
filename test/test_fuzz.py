@@ -1144,6 +1144,29 @@ class FuzzEngineTests(unittest.TestCase):
         self.assertIn("edges", text)
         self.assertIn("coverage mode:   edge", text)
 
+    def test_edge_mode_findings_say_edges(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "edge"
+        eng.findings.append(FuzzFinding(
+            iteration=1, kind="new_coverage", input_data=b"\x01",
+            target_name="USART1", target_kind="uart",
+            new_pcs=3, detail="+3 edges",
+        ))
+        text = eng.format_findings()
+        self.assertIn("+3edges", text)
+        self.assertNotIn("+3PCs", text)
+
+    def test_block_mode_findings_say_pcs(self):
+        eng, emu, uart = self._make_engine()
+        eng.coverage_mode = "block"
+        eng.findings.append(FuzzFinding(
+            iteration=1, kind="new_coverage", input_data=b"\x01",
+            target_name="USART1", target_kind="uart",
+            new_pcs=3, detail="+3 PCs",
+        ))
+        text = eng.format_findings()
+        self.assertIn("+3PCs", text)
+
     def test_block_coverage_format_stats(self):
         eng, emu, uart = self._make_engine()
         eng.coverage_mode = "block"
