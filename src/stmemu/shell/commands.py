@@ -3076,7 +3076,9 @@ class Commands:
     def _fuzz_add_target(self, argv: list[str]) -> str:
         target_usage = (
             "usage: fuzz target memory <name> <addr> [size_reg] | "
-            "fuzz target function <name> <entry_addr> <buffer_addr>"
+            "fuzz target function <name> <entry_addr> <buffer_addr> [key=value ...]"
+            "\n  function options: abi=ptr_len|ptr|regs  stop=steps|return|pc"
+            "\n    return_addr=<addr>  stop_pc=<addr>  buf_reg=<reg>  len_reg=<reg>"
         )
         if len(argv) < 3:
             return target_usage
@@ -3103,11 +3105,41 @@ class Commands:
             name = argv[1]
             entry_addr = _int(argv[2])
             buffer_addr = _int(argv[3])
-            eng.injector.add_function_target(name, entry_addr, buffer_addr)
-            return (
-                f"added function target '{name}' "
-                f"entry=0x{entry_addr:08X} buf=0x{buffer_addr:08X}"
+
+            kv: dict[str, str] = {}
+            for tok in argv[4:]:
+                if "=" not in tok:
+                    return f"expected key=value, got: {tok!r}\n{target_usage}"
+                k, v = tok.split("=", 1)
+                kv[k.lower()] = v
+
+            from stmemu.fuzz.injector import FunctionTargetConfig
+            try:
+                cfg = FunctionTargetConfig(
+                    abi=kv.get("abi", "ptr_len"),
+                    stop=kv.get("stop", "steps"),
+                    return_addr=_int(kv["return_addr"]) if "return_addr" in kv else 0,
+                    stop_pc=_int(kv["stop_pc"]) if "stop_pc" in kv else 0,
+                    buf_reg=kv.get("buf_reg", "r0"),
+                    len_reg=kv.get("len_reg", "r1"),
+                )
+            except ValueError as e:
+                return f"error: {e}"
+
+            eng.injector.add_function_target(
+                name, entry_addr, buffer_addr, fn_config=cfg,
             )
+
+            parts = [
+                f"added function target '{name}'",
+                f"entry=0x{entry_addr:08X} buf=0x{buffer_addr:08X}",
+                f"abi={cfg.abi} stop={cfg.stop}",
+            ]
+            if cfg.stop == "return" and cfg.return_addr:
+                parts.append(f"return_addr=0x{cfg.return_addr:08X}")
+            if cfg.stop == "pc" and cfg.stop_pc:
+                parts.append(f"stop_pc=0x{cfg.stop_pc:08X}")
+            return " ".join(parts)
 
         return target_usage
 

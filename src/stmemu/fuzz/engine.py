@@ -162,14 +162,18 @@ class FuzzEngine:
                 self.injector.inject_all(input_data)
                 target_name = "all"
                 target_kind = "all"
+                active_target = None
             else:
-                target = self._pick_target(target_idx)
+                active_target = self._pick_target(target_idx)
                 target_idx += 1
-                self.injector.inject(target, input_data)
-                target_name = target.name
-                target_kind = target.kind
+                self.injector.inject(active_target, input_data)
+                target_name = active_target.name
+                target_kind = active_target.kind
 
-            # 5. Run emulator
+            # 5. Install temporary stop-condition breakpoint
+            stop_bp = self._install_stop_bp(active_target)
+
+            # 6. Run emulator
             crashed = False
             hung = False
             detail = ""
@@ -180,8 +184,11 @@ class FuzzEngine:
                 crashed = True
                 detail = str(e)
 
-            # 6. Check for hang (stuck loop detection)
-            if not crashed and hasattr(self.emu, '_pc_hist'):
+            # 7. Cleanup stop-condition breakpoint, detect normal return
+            returned = self._cleanup_stop_bp(stop_bp)
+
+            # 8. Check for hang (skip if function returned normally)
+            if not crashed and not returned and hasattr(self.emu, '_pc_hist'):
                 threshold = max(0, int(getattr(self.emu, 'stuck_loop_threshold', 5000)))
                 if threshold > 0:
                     for count in self.emu._pc_hist.values():
@@ -190,13 +197,13 @@ class FuzzEngine:
                             detail = "stuck loop detected"
                             break
 
-            # 7. Analyze coverage against the engine's global set
+            # 9. Analyze coverage against the engine's global set
             iter_coverage = set(self.emu._coverage)
             new_pcs = iter_coverage - self._global_coverage
             new_pcs_count = len(new_pcs)
             self._global_coverage |= iter_coverage
 
-            # 8. Record findings
+            # 10. Record findings
             if crashed:
                 self.stats.crashes += 1
                 crash_hash = self._crash_hash(detail)
@@ -270,6 +277,40 @@ class FuzzEngine:
 
         self.stats.elapsed = time.monotonic() - self.stats.start_time
         return session_findings
+
+    def _install_stop_bp(self, target: InjectionTarget | None) -> int | None:
+        """Add a temporary breakpoint for a function target's stop condition.
+
+        Returns the breakpoint address, or None if no stop condition applies.
+        """
+        if target is None or target.kind != "function":
+            return None
+        cfg = target.fn_config
+        if cfg is None:
+            return None
+        addr: int | None = None
+        if cfg.stop == "return" and cfg.return_addr:
+            addr = cfg.return_addr & ~1
+        elif cfg.stop == "pc" and cfg.stop_pc:
+            addr = cfg.stop_pc & ~1
+        if addr is not None and hasattr(self.emu, "add_breakpoint"):
+            self.emu.add_breakpoint(addr)
+        return addr
+
+    def _cleanup_stop_bp(self, addr: int | None) -> bool:
+        """Remove a temporary stop-condition breakpoint.
+
+        Returns True if the breakpoint was hit (function returned / target
+        PC reached), False otherwise.
+        """
+        if addr is None:
+            return False
+        if hasattr(self.emu, "remove_breakpoint"):
+            self.emu.remove_breakpoint(addr)
+        bp = getattr(self.emu, "last_pc_break", None)
+        if bp is not None and (int(bp) & ~1) == addr:
+            return True
+        return False
 
     def _next_input(self, iteration: int) -> bytearray:
         """Pick or generate the next fuzz input."""
