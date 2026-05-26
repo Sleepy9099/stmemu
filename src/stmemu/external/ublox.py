@@ -26,17 +26,6 @@ def _ubx_checksum(cls: int, msg_id: int, payload: bytes) -> tuple[int, int]:
 
 def ubx_frame(cls: int, msg_id: int, payload: bytes = b"") -> bytes:
     ck_a, ck_b = _ubx_checksum(cls, msg_id, payload)
-    length = len(payload)
-    return (
-        UBX_SYNC
-        + struct.pack("<BBHB", cls, msg_id, length, 0)[:-1]
-        + struct.pack("<H", length)[-2:]
-    )
-    # Simpler correct construction:
-
-
-def ubx_frame(cls: int, msg_id: int, payload: bytes = b"") -> bytes:
-    ck_a, ck_b = _ubx_checksum(cls, msg_id, payload)
     hdr = struct.pack("<BBH", cls, msg_id, len(payload))
     return UBX_SYNC + hdr + payload + bytes([ck_a, ck_b])
 
