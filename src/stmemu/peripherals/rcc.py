@@ -11,6 +11,13 @@ from stmemu.utils.logger import get_logger
 log = get_logger(__name__)
 
 
+def _strip_suffix(name: str, suffix: str) -> str:
+    """Strip *suffix* only from the end of *name*, e.g. GPIOAEN -> GPIOA."""
+    if name.endswith(suffix) and len(name) > len(suffix):
+        return name[: -len(suffix)].rstrip("_")
+    return ""
+
+
 @dataclass
 class RccPeripheral(GenericRegisterFilePeripheral):
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
@@ -23,7 +30,7 @@ class RccPeripheral(GenericRegisterFilePeripheral):
     _cr_rdy_bits: list[tuple[str, int, int]] = field(
         default_factory=list, init=False, repr=False,
     )
-    _cfgr_sws_bits: list[tuple[str, int, int]] = field(
+    _cfgr_sws_fields: list[tuple[int, int, int, int]] = field(
         default_factory=list, init=False, repr=False,
     )
     _enr_field_map: dict[tuple[int, int], str] = field(
@@ -50,24 +57,36 @@ class RccPeripheral(GenericRegisterFilePeripheral):
                         self._cr_rdy_bits.append((fn, f.bit_offset, enable_bit))
             elif rname in ("CFGR", "CFGR1"):
                 self._cfgr_offset = reg.offset
-                for f in reg.fields:
-                    fn = f.name.upper()
-                    if fn.startswith("SWS"):
-                        sw_name = fn.replace("SWS", "SW", 1)
-                        sw_bit = self._find_field_bit(reg, sw_name)
-                        self._cfgr_sws_bits.append((fn, f.bit_offset, sw_bit))
+                self._scan_sw_sws_fields(reg)
             elif "ENR" in rname and "RSTR" not in rname:
                 self._enr_offsets[rname] = reg.offset
                 for f in reg.fields:
-                    pname = f.name.upper().replace("EN", "").rstrip("_")
+                    pname = _strip_suffix(f.name.upper(), "EN")
                     if pname:
                         self._enr_field_map[(reg.offset, f.bit_offset)] = pname
             elif "RSTR" in rname:
                 self._rstr_offsets[rname] = reg.offset
                 for f in reg.fields:
-                    pname = f.name.upper().replace("RST", "").rstrip("_")
+                    pname = _strip_suffix(f.name.upper(), "RST")
                     if pname:
                         self._rstr_field_map[(reg.offset, f.bit_offset)] = pname
+
+    def _scan_sw_sws_fields(self, reg) -> None:
+        fields_by_name = {f.name.upper(): f for f in reg.fields}
+        matched: set[str] = set()
+        for fn, f in fields_by_name.items():
+            if not fn.startswith("SWS"):
+                continue
+            sw_name = "SW" + fn[3:]
+            sw_field = fields_by_name.get(sw_name)
+            if sw_field is None and fn == "SWS":
+                sw_field = fields_by_name.get("SW")
+            if sw_field is not None and fn not in matched:
+                matched.add(fn)
+                self._cfgr_sws_fields.append((
+                    f.bit_offset, f.bit_width,
+                    sw_field.bit_offset, sw_field.bit_width,
+                ))
 
     @staticmethod
     def _find_field_bit(reg, name: str) -> int:
@@ -121,16 +140,15 @@ class RccPeripheral(GenericRegisterFilePeripheral):
     def _sync_sws_bits(self) -> None:
         cfgr = self.read_register_value(self._cfgr_offset)
         changed = False
-        for sws_name, sws_bit, sw_bit in self._cfgr_sws_bits:
-            if sw_bit >= 0:
-                sw_val = (cfgr >> sw_bit) & 1
-                sws_val = (cfgr >> sws_bit) & 1
-                if sws_val != sw_val:
-                    if sw_val:
-                        cfgr |= (1 << sws_bit)
-                    else:
-                        cfgr &= ~(1 << sws_bit)
-                    changed = True
+        for sws_off, sws_width, sw_off, sw_width in self._cfgr_sws_fields:
+            width = min(sws_width, sw_width)
+            mask = (1 << width) - 1
+            sw_val = (cfgr >> sw_off) & mask
+            sws_val = (cfgr >> sws_off) & mask
+            if sws_val != sw_val:
+                cfgr &= ~(mask << sws_off)
+                cfgr |= (sw_val << sws_off)
+                changed = True
         if changed:
             self.write_register_value(self._cfgr_offset, cfgr)
 

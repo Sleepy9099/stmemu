@@ -313,6 +313,35 @@ class RccTests(unittest.TestCase):
         cfgr = rcc.read(0x08, 4)
         self.assertTrue(cfgr & (1 << 2), "SWS0 should follow SW0")
 
+    def test_sws_multibit_follows_sw(self):
+        regs = (
+            SvdRegister(name="CR", offset=0x00),
+            SvdRegister(name="CFGR", offset=0x08, fields=(
+                SvdField(name="SW", bit_offset=0, bit_width=2),
+                SvdField(name="SWS", bit_offset=2, bit_width=2),
+            )),
+        )
+        rcc = RccPeripheral(_make_peripheral("RCC", regs))
+        rcc.write(0x08, 4, 0x02)  # SW=2 (PLL)
+        cfgr = rcc.read(0x08, 4)
+        sws = (cfgr >> 2) & 0x3
+        self.assertEqual(sws, 2, "SWS[1:0] should mirror SW[1:0]")
+
+    def test_sws_multibit_all_values(self):
+        regs = (
+            SvdRegister(name="CR", offset=0x00),
+            SvdRegister(name="CFGR", offset=0x08, fields=(
+                SvdField(name="SW", bit_offset=0, bit_width=2),
+                SvdField(name="SWS", bit_offset=2, bit_width=2),
+            )),
+        )
+        rcc = RccPeripheral(_make_peripheral("RCC", regs))
+        for sw_val in range(4):
+            rcc.write(0x08, 4, sw_val)
+            cfgr = rcc.read(0x08, 4)
+            sws = (cfgr >> 2) & 0x3
+            self.assertEqual(sws, sw_val, f"SWS should be {sw_val} when SW={sw_val}")
+
     def test_enable_register_tracks_peripherals(self):
         rcc = self._make_rcc()
         rcc.write(0x30, 4, (1 << 0) | (1 << 21))  # GPIOAEN + DMA1EN
@@ -381,6 +410,19 @@ class RccTests(unittest.TestCase):
     def test_is_peripheral_enabled_permissive_when_empty(self):
         rcc = self._make_rcc()
         self.assertTrue(rcc.is_peripheral_enabled("ANYTHING"))
+
+    def test_enr_suffix_stripping(self):
+        regs = (
+            SvdRegister(name="CR", offset=0x00),
+            SvdRegister(name="AHB1ENR", offset=0x30, fields=(
+                SvdField(name="OTGFSEN", bit_offset=7, bit_width=1),
+                SvdField(name="CRCEN", bit_offset=12, bit_width=1),
+            )),
+        )
+        rcc = RccPeripheral(_make_peripheral("RCC", regs))
+        rcc.write(0x30, 4, (1 << 7) | (1 << 12))
+        self.assertTrue(rcc.is_peripheral_enabled("OTGFS"))
+        self.assertTrue(rcc.is_peripheral_enabled("CRC"))
 
 
 # ── SysTick VAL write tests ──────────────────────────────────────
