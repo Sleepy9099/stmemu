@@ -63,7 +63,7 @@ if "stmemu.core.emulator" not in sys.modules:
 
 
 from stmemu.fuzz.mutator import Mutator
-from stmemu.fuzz.injector import Injector, InjectionTarget
+from stmemu.fuzz.injector import Injector, InjectionTarget, FunctionTargetConfig
 from stmemu.fuzz.engine import FuzzEngine, FuzzStats, CorpusEntry, FuzzFinding
 from stmemu.core.symbols import SymbolTable
 from stmemu.core.semihosting import SemihostingHandler
@@ -188,6 +188,8 @@ class _FakeEmu:
         self._regs = {"r0": 0, "r1": 0, "sp": 0x20001000, "lr": 0, "pc": 0x08000100}
         self._memory: dict[int, bytes] = {}
         self.last_fault_report = None
+        self.last_pc_break: int | None = None
+        self._breakpoints: set[int] = set()
 
     def save_snapshot(self, name):
         self._snapshots[name] = {
@@ -202,9 +204,17 @@ class _FakeEmu:
             raise KeyError(name)
         self._pc_hist.clear()
         self.last_fault_report = None
+        self.last_pc_break = None
         return types.SimpleNamespace(name=name)
 
+    def add_breakpoint(self, addr):
+        self._breakpoints.add(addr & ~1)
+
+    def remove_breakpoint(self, addr):
+        self._breakpoints.discard(addr & ~1)
+
     def run(self, count):
+        self.last_pc_break = None
         if self._run_callback:
             self._run_callback(self, count)
         else:
@@ -213,6 +223,8 @@ class _FakeEmu:
                 pc = random.randint(0x08000100, 0x08000FFF) & ~1
                 self._coverage.add(pc)
                 self._coverage_hits[pc] = self._coverage_hits.get(pc, 0) + 1
+        if (self.pc & ~1) in self._breakpoints:
+            self.last_pc_break = self.pc & ~1
 
     def mem_write(self, addr, data):
         self._memory[addr] = bytes(data)
@@ -459,6 +471,84 @@ class InjectorTests(unittest.TestCase):
         kinds = [t.kind for t in inj.targets]
         self.assertIn("memory", kinds)
         self.assertIn("function", kinds)
+
+    def test_inject_function_ptr_len_abi(self):
+        emu = _FakeEmu()
+        cfg = FunctionTargetConfig(abi="ptr_len", buf_reg="r0", len_reg="r1")
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_function_target(
+            "fn", 0x08001000, 0x20000400, fn_config=cfg,
+        )
+        desc = inj.inject(target, b"\xAA\xBB\xCC")
+        self.assertIn("function", desc)
+        self.assertIn("ptr_len", desc)
+        self.assertEqual(emu._regs["r0"], 0x20000400)
+        self.assertEqual(emu._regs["r1"], 3)
+        self.assertEqual(emu.pc, 0x08001000)
+
+    def test_inject_function_ptr_abi(self):
+        emu = _FakeEmu()
+        cfg = FunctionTargetConfig(abi="ptr", buf_reg="r2")
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_function_target(
+            "fn", 0x08002000, 0x20000800, fn_config=cfg,
+        )
+        desc = inj.inject(target, b"\x01\x02")
+        self.assertIn("ptr", desc)
+        self.assertEqual(emu._regs["r2"], 0x20000800)
+        self.assertEqual(emu.mem_read(0x20000800, 2), b"\x01\x02")
+        self.assertEqual(emu.pc, 0x08002000)
+
+    def test_inject_function_regs_abi(self):
+        emu = _FakeEmu()
+        cfg = FunctionTargetConfig(abi="regs")
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_function_target(
+            "fn", 0x08003000, 0x20000400, fn_config=cfg,
+        )
+        data = b"\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00"
+        desc = inj.inject(target, data)
+        self.assertIn("regs", desc)
+        self.assertEqual(emu._regs["r0"], 1)
+        self.assertEqual(emu._regs["r1"], 2)
+        self.assertEqual(emu._regs["r2"], 3)
+        self.assertEqual(emu._regs["r3"], 4)
+        self.assertEqual(emu.pc, 0x08003000)
+
+    def test_inject_function_regs_abi_short_data(self):
+        emu = _FakeEmu()
+        cfg = FunctionTargetConfig(abi="regs")
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_function_target(
+            "fn", 0x08003000, 0x20000400, fn_config=cfg,
+        )
+        desc = inj.inject(target, b"\xFF\x00")
+        self.assertEqual(emu._regs["r0"], 0x000000FF)
+
+    def test_inject_function_return_stop_sets_lr(self):
+        emu = _FakeEmu()
+        cfg = FunctionTargetConfig(stop="return", return_addr=0x0800FFFE)
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_function_target(
+            "fn", 0x08001000, 0x20000400, fn_config=cfg,
+        )
+        desc = inj.inject(target, b"\x01")
+        self.assertIn("return", desc)
+        self.assertEqual(emu._regs["lr"], 0x0800FFFE | 1)
+
+    def test_function_config_validation(self):
+        with self.assertRaises(ValueError):
+            FunctionTargetConfig(abi="invalid")
+        with self.assertRaises(ValueError):
+            FunctionTargetConfig(stop="invalid")
+
+    def test_inject_function_default_config(self):
+        emu = _FakeEmu()
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_function_target("fn", 0x08001000, 0x20000400)
+        self.assertIsNotNone(target.fn_config)
+        self.assertEqual(target.fn_config.abi, "ptr_len")
+        self.assertEqual(target.fn_config.stop, "steps")
 
 
 # ── FuzzEngine Tests ───────────────────────────────────────────────
@@ -720,6 +810,98 @@ class FuzzEngineTests(unittest.TestCase):
         kinds = [t.kind for t in eng.injector.targets]
         self.assertIn("function", kinds)
 
+    def test_return_stop_condition(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        cfg = FunctionTargetConfig(stop="return", return_addr=0x0800FFFE)
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.add_function_target(
+            "fn", 0x08001000, 0x20000400, fn_config=cfg,
+        )
+        eng._snapshot_name = "__fuzz_ret"
+        emu.save_snapshot("__fuzz_ret")
+        emu.coverage_enabled = True
+
+        def simulate_return(emu_ref, count):
+            emu_ref._coverage.add(0x08001000)
+            emu_ref.pc = 0x0800FFFE
+
+        emu._run_callback = simulate_return
+        eng.seed(42)
+        findings = eng.run(iterations=3, steps_per_iter=100)
+        self.assertEqual(eng.stats.iterations, 3)
+        self.assertEqual(eng.stats.hangs, 0)
+        self.assertGreater(len(eng._global_coverage), 0)
+
+    def test_pc_stop_condition(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        cfg = FunctionTargetConfig(stop="pc", stop_pc=0x08005000)
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.add_function_target(
+            "fn", 0x08001000, 0x20000400, fn_config=cfg,
+        )
+        eng._snapshot_name = "__fuzz_pc"
+        emu.save_snapshot("__fuzz_pc")
+        emu.coverage_enabled = True
+
+        def simulate_reach_pc(emu_ref, count):
+            emu_ref._coverage.add(0x08001000)
+            emu_ref.pc = 0x08005000
+
+        emu._run_callback = simulate_reach_pc
+        eng.seed(42)
+        eng.run(iterations=2, steps_per_iter=100)
+        self.assertEqual(eng.stats.iterations, 2)
+        self.assertEqual(eng.stats.hangs, 0)
+
+    def test_stop_bp_cleaned_up_on_crash(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        cfg = FunctionTargetConfig(stop="return", return_addr=0x0800FFFE)
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.add_function_target(
+            "fn", 0x08001000, 0x20000400, fn_config=cfg,
+        )
+        eng._snapshot_name = "__fuzz_crash"
+        emu.save_snapshot("__fuzz_crash")
+        emu.coverage_enabled = True
+
+        def crash_run(emu_ref, count):
+            raise RuntimeError("boom")
+
+        emu._run_callback = crash_run
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+        self.assertEqual(eng.stats.crashes, 1)
+        self.assertNotIn(0x0800FFFE, emu._breakpoints)
+
+    def test_regs_abi_in_engine(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        cfg = FunctionTargetConfig(abi="regs", stop="return", return_addr=0x0800FFFE)
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.add_function_target(
+            "fn", 0x08001000, 0x20000400, fn_config=cfg,
+        )
+        eng._snapshot_name = "__fuzz_regs"
+        emu.save_snapshot("__fuzz_regs")
+        emu.coverage_enabled = True
+
+        def simulate_return(emu_ref, count):
+            emu_ref._coverage.add(0x08001002)
+            emu_ref.pc = 0x0800FFFE
+
+        emu._run_callback = simulate_return
+        eng.seed(42)
+        eng.run(iterations=2, steps_per_iter=100)
+        self.assertEqual(eng.stats.iterations, 2)
+        self.assertEqual(eng.stats.hangs, 0)
+
 
 # ── FuzzStats Tests ────────────────────────────────────────────────
 
@@ -865,6 +1047,56 @@ class FuzzShellCommandTests(unittest.TestCase):
         self.assertIn("memory", targets_out)
         self.assertIn("parse", targets_out)
         self.assertIn("BUF", targets_out)
+
+    def test_fuzz_target_function_with_abi(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz([
+            "target", "function", "fn", "0x08001000", "0x20000400",
+            "abi=regs",
+        ])
+        self.assertIn("abi=regs", out)
+
+    def test_fuzz_target_function_with_return_stop(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz([
+            "target", "function", "fn", "0x08001000", "0x20000400",
+            "stop=return", "return_addr=0x0800FFFE",
+        ])
+        self.assertIn("stop=return", out)
+        self.assertIn("return_addr=0x0800FFFE", out)
+
+    def test_fuzz_target_function_with_pc_stop(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz([
+            "target", "function", "fn", "0x08001000", "0x20000400",
+            "stop=pc", "stop_pc=0x08005000",
+        ])
+        self.assertIn("stop=pc", out)
+        self.assertIn("stop_pc=0x08005000", out)
+
+    def test_fuzz_target_function_with_custom_regs(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz([
+            "target", "function", "fn", "0x08001000", "0x20000400",
+            "abi=ptr", "buf_reg=r2",
+        ])
+        self.assertIn("abi=ptr", out)
+
+    def test_fuzz_target_function_invalid_abi(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz([
+            "target", "function", "fn", "0x08001000", "0x20000400",
+            "abi=invalid",
+        ])
+        self.assertIn("error:", out)
+
+    def test_fuzz_target_function_invalid_kv(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz([
+            "target", "function", "fn", "0x08001000", "0x20000400",
+            "notakeyvalue",
+        ])
+        self.assertIn("expected key=value", out)
 
 
 if __name__ == "__main__":
