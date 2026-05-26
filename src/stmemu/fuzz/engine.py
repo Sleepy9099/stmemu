@@ -3,12 +3,42 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from stmemu.fuzz.mutator import Mutator
 from stmemu.fuzz.injector import Injector, InjectionTarget
+
+
+@dataclass(frozen=True)
+class IterationTrace:
+    """Execution context captured when a finding is recorded."""
+    regs: dict[str, int]
+    pc_freq: tuple[tuple[int, int], ...]
+    new_pcs: tuple[int, ...]
+    mmio_log: tuple[tuple[str, int, int, int], ...] | None = None
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "regs": {k: f"0x{int(v):08X}" for k, v in self.regs.items()},
+            "pc_freq": [
+                {"pc": f"0x{pc:08X}", "count": c} for pc, c in self.pc_freq
+            ],
+            "new_pcs": [f"0x{pc:08X}" for pc in self.new_pcs],
+        }
+        if self.mmio_log is not None:
+            d["mmio_log"] = [
+                {
+                    "kind": k,
+                    "addr": f"0x{a:08X}",
+                    "size": s,
+                    "value": f"0x{v:08X}",
+                }
+                for k, a, s, v in self.mmio_log
+            ]
+        return d
 
 
 @dataclass(frozen=True)
@@ -22,6 +52,7 @@ class FuzzFinding:
     new_pcs: int
     detail: str
     fault_report: dict | None = None
+    trace: IterationTrace | None = None
 
 
 @dataclass
@@ -79,11 +110,17 @@ class FuzzEngine:
     min_input_len: int = 1
     max_input_len: int = 256
     max_mutations: int = 4
-    target_filter: list[str] | None = None  # limit to specific target names
+    target_filter: list[str] | None = None
     mode: str = "random"  # "random", "round_robin", "all"
+    coverage_mode: str = "edge"  # "edge" or "block"
+    coverage_filter: tuple[int, int] | None = None  # (start, end) or None
+    fault_policy: dict[str, bool] = field(default_factory=dict)
+    capture_mmio: bool = False
+    _mmio_ring_size: int = 256
     _snapshot_name: str = ""
     _crash_hashes: set[str] = field(default_factory=set)
     _global_coverage: set[int] = field(default_factory=set)
+    _global_edge_coverage: set[int] = field(default_factory=set)
     _rng_seed: int | None = None
 
     def setup(self, snapshot_name: str = "__fuzz_baseline") -> str:
@@ -108,8 +145,17 @@ class FuzzEngine:
             return "no injectable targets found"
 
         self.emu.coverage_enabled = True
+        if self.coverage_filter and hasattr(self.emu, "_coverage_filter_start"):
+            self.emu._coverage_filter_start = self.coverage_filter[0]
+            self.emu._coverage_filter_end = self.coverage_filter[1]
         self._global_coverage = set(self.emu._coverage)
-        self.stats.coverage_at_start = len(self._global_coverage)
+        self._global_edge_coverage = set(
+            getattr(self.emu, "_edge_coverage", set())
+        )
+        if self.coverage_mode == "edge":
+            self.stats.coverage_at_start = len(self._global_edge_coverage)
+        else:
+            self.stats.coverage_at_start = len(self._global_coverage)
 
         if self._rng_seed is not None:
             self.mutator.set_seed(self._rng_seed)
@@ -133,10 +179,7 @@ class FuzzEngine:
             self.seed_corpus.append(bytes(data))
 
     def run(self, iterations: int = 1000, steps_per_iter: int = 5000) -> list[FuzzFinding]:
-        """Run the fuzzer for the specified number of iterations.
-
-        Returns list of findings (crashes, hangs, new coverage).
-        """
+        """Run the fuzzer for the specified number of iterations."""
         if not self.injector or not self.injector.targets:
             return []
 
@@ -144,145 +187,384 @@ class FuzzEngine:
         session_findings: list[FuzzFinding] = []
         target_idx = 0
 
-        for i in range(iterations):
-            self.stats.iterations += 1
+        mmio_log: deque | None = None
+        orig_read = orig_write = None
+        if self.capture_mmio:
+            mmio_log = deque(maxlen=self._mmio_ring_size)
+            orig_read = self.bus.read
+            orig_write = self.bus.write
 
-            # 1. Restore snapshot
-            self.emu.load_snapshot(self._snapshot_name)
+            def _tr(addr, size):
+                val = orig_read(addr, size)
+                mmio_log.append(("r", int(addr), int(size), int(val)))
+                return val
 
-            # 2. Clear per-iteration coverage so we only see this iteration's PCs
-            self.emu._coverage.clear()
-            self.emu._coverage_hits.clear()
+            def _tw(addr, size, value):
+                mmio_log.append(("w", int(addr), int(size), int(value)))
+                return orig_write(addr, size, value)
 
-            # 3. Generate or mutate input
-            input_data = self._next_input(i)
+            self.bus.read = _tr
+            self.bus.write = _tw
 
-            # 4. Inject into target(s)
-            if self.mode == "all":
-                self.injector.inject_all(input_data)
-                target_name = "all"
-                target_kind = "all"
-                active_target = None
-            else:
-                active_target = self._pick_target(target_idx)
-                target_idx += 1
-                self.injector.inject(active_target, input_data)
-                target_name = active_target.name
-                target_kind = active_target.kind
+        try:
+            for i in range(iterations):
+                self.stats.iterations += 1
 
-            # 5. Install temporary stop-condition breakpoint
-            stop_bp = self._install_stop_bp(active_target)
+                self.emu.load_snapshot(self._snapshot_name)
+                self.emu._coverage.clear()
+                self.emu._coverage_hits.clear()
+                if hasattr(self.emu, "_edge_coverage"):
+                    self.emu._edge_coverage.clear()
+                    self.emu._edge_coverage_hits.clear()
+                    self.emu._prev_coverage_pc = 0
+                if mmio_log is not None:
+                    mmio_log.clear()
 
-            # 6. Run emulator
-            crashed = False
-            hung = False
-            detail = ""
-            try:
-                self.emu.run(steps_per_iter)
-                self.stats.total_instructions += steps_per_iter
-            except Exception as e:
-                crashed = True
-                detail = str(e)
+                input_data = self._next_input(i)
 
-            # 7. Cleanup stop-condition breakpoint, detect normal return
-            returned = self._cleanup_stop_bp(stop_bp)
+                if self.mode == "all":
+                    self.injector.inject_all(input_data)
+                    target_name = "all"
+                    target_kind = "all"
+                    active_target = None
+                else:
+                    active_target = self._pick_target(target_idx)
+                    target_idx += 1
+                    self.injector.inject(active_target, input_data)
+                    target_name = active_target.name
+                    target_kind = active_target.kind
 
-            # 8. Check for hang (skip if function returned normally)
-            if not crashed and not returned and hasattr(self.emu, '_pc_hist'):
-                threshold = max(0, int(getattr(self.emu, 'stuck_loop_threshold', 5000)))
-                if threshold > 0:
-                    for count in self.emu._pc_hist.values():
-                        if int(count) >= threshold:
-                            hung = True
-                            detail = "stuck loop detected"
-                            break
+                stop_bp = self._install_stop_bp(active_target)
 
-            # 9. Analyze coverage against the engine's global set
-            iter_coverage = set(self.emu._coverage)
-            new_pcs = iter_coverage - self._global_coverage
-            new_pcs_count = len(new_pcs)
-            self._global_coverage |= iter_coverage
+                crashed = False
+                hung = False
+                detail = ""
+                try:
+                    self.emu.run(steps_per_iter)
+                    self.stats.total_instructions += steps_per_iter
+                except Exception as e:
+                    crashed = True
+                    detail = str(e)
 
-            # 10. Record findings
-            if crashed:
-                self.stats.crashes += 1
-                crash_hash = self._crash_hash(detail)
-                kind = "crash"
-                if crash_hash not in self._crash_hashes:
-                    self._crash_hashes.add(crash_hash)
-                    self.stats.unique_crashes += 1
-                    kind = "unique_crash"
+                returned = self._cleanup_stop_bp(stop_bp)
 
-                fault_report = None
-                if hasattr(self.emu, 'capture_fault_report'):
-                    try:
-                        fault_report = self.emu.capture_fault_report(
-                            "fuzz_crash", detail=detail
+                if not crashed and not returned and hasattr(self.emu, '_pc_hist'):
+                    threshold = max(
+                        0, int(getattr(self.emu, 'stuck_loop_threshold', 5000))
+                    )
+                    if threshold > 0:
+                        for count in self.emu._pc_hist.values():
+                            if int(count) >= threshold:
+                                hung = True
+                                detail = "stuck loop detected"
+                                break
+
+                iter_block_cov = set(self.emu._coverage)
+                new_blocks = iter_block_cov - self._global_coverage
+                self._global_coverage |= iter_block_cov
+
+                if self.coverage_mode == "edge" and hasattr(self.emu, "_edge_coverage"):
+                    iter_edge_cov = set(self.emu._edge_coverage)
+                    new_edges = iter_edge_cov - self._global_edge_coverage
+                    self._global_edge_coverage |= iter_edge_cov
+                    new_pcs_count = len(new_edges)
+                    novelty_pcs = new_edges
+                else:
+                    new_pcs_count = len(new_blocks)
+                    novelty_pcs = new_blocks
+
+                has_finding = crashed or hung or new_pcs_count > 0
+                trace = (
+                    self._capture_trace(new_blocks, mmio_log)
+                    if has_finding else None
+                )
+
+                if crashed:
+                    self.stats.crashes += 1
+
+                    fault_report = None
+                    if hasattr(self.emu, 'capture_fault_report'):
+                        try:
+                            fault_report = self.emu.capture_fault_report(
+                                "fuzz_crash", detail=detail
+                            )
+                        except Exception:
+                            pass
+
+                    if self._fault_matches_policy(detail, fault_report):
+                        crash_hash = self._crash_hash(detail)
+                        kind = "crash"
+                        if crash_hash not in self._crash_hashes:
+                            self._crash_hashes.add(crash_hash)
+                            self.stats.unique_crashes += 1
+                            kind = "unique_crash"
+
+                        finding = FuzzFinding(
+                            iteration=self.stats.iterations,
+                            kind=kind,
+                            input_data=bytes(input_data),
+                            target_name=target_name,
+                            target_kind=target_kind,
+                            new_pcs=new_pcs_count,
+                            detail=detail,
+                            fault_report=fault_report,
+                            trace=trace,
                         )
-                    except Exception:
-                        pass
+                        self.findings.append(finding)
+                        session_findings.append(finding)
 
-                finding = FuzzFinding(
-                    iteration=self.stats.iterations,
-                    kind=kind,
-                    input_data=bytes(input_data),
-                    target_name=target_name,
-                    target_kind=target_kind,
-                    new_pcs=new_pcs_count,
-                    detail=detail,
-                    fault_report=fault_report,
-                )
-                self.findings.append(finding)
-                session_findings.append(finding)
-
-            elif hung:
-                self.stats.hangs += 1
-                finding = FuzzFinding(
-                    iteration=self.stats.iterations,
-                    kind="hang",
-                    input_data=bytes(input_data),
-                    target_name=target_name,
-                    target_kind=target_kind,
-                    new_pcs=new_pcs_count,
-                    detail=detail,
-                )
-                self.findings.append(finding)
-                session_findings.append(finding)
-
-            if new_pcs_count > 0:
-                self.stats.new_coverage_inputs += 1
-                self.corpus.append(CorpusEntry(
-                    data=bytes(input_data),
-                    target_name=target_name,
-                    target_kind=target_kind,
-                    new_pcs=new_pcs_count,
-                    iteration_found=self.stats.iterations,
-                    total_coverage_at_find=len(self._global_coverage),
-                ))
-                self.stats.corpus_size = len(self.corpus)
-                if not crashed and not hung:
+                elif hung:
+                    self.stats.hangs += 1
                     finding = FuzzFinding(
                         iteration=self.stats.iterations,
-                        kind="new_coverage",
+                        kind="hang",
                         input_data=bytes(input_data),
                         target_name=target_name,
                         target_kind=target_kind,
                         new_pcs=new_pcs_count,
-                        detail=f"+{new_pcs_count} PCs",
+                        detail=detail,
+                        trace=trace,
                     )
                     self.findings.append(finding)
                     session_findings.append(finding)
 
-            self.stats.coverage_current = len(self._global_coverage)
+                if new_pcs_count > 0:
+                    self.stats.new_coverage_inputs += 1
+                    self.corpus.append(CorpusEntry(
+                        data=bytes(input_data),
+                        target_name=target_name,
+                        target_kind=target_kind,
+                        new_pcs=new_pcs_count,
+                        iteration_found=self.stats.iterations,
+                        total_coverage_at_find=len(self._global_coverage),
+                    ))
+                    self.stats.corpus_size = len(self.corpus)
+                    if not crashed and not hung:
+                        finding = FuzzFinding(
+                            iteration=self.stats.iterations,
+                            kind="new_coverage",
+                            input_data=bytes(input_data),
+                            target_name=target_name,
+                            target_kind=target_kind,
+                            new_pcs=new_pcs_count,
+                            detail=f"+{new_pcs_count} {'edges' if self.coverage_mode == 'edge' else 'PCs'}",
+                            trace=trace,
+                        )
+                        self.findings.append(finding)
+                        session_findings.append(finding)
+
+                if self.coverage_mode == "edge":
+                    self.stats.coverage_current = len(self._global_edge_coverage)
+                else:
+                    self.stats.coverage_current = len(self._global_coverage)
+        finally:
+            if orig_read is not None:
+                self.bus.read = orig_read
+                self.bus.write = orig_write
 
         self.stats.elapsed = time.monotonic() - self.stats.start_time
         return session_findings
 
-    def _install_stop_bp(self, target: InjectionTarget | None) -> int | None:
-        """Add a temporary breakpoint for a function target's stop condition.
+    def replay(
+        self,
+        finding_index: int,
+        *,
+        steps: int = 5000,
+        enable_trace: bool = False,
+    ) -> dict:
+        """Replay a finding deterministically, returning detailed execution info."""
+        if finding_index < 0 or finding_index >= len(self.findings):
+            raise IndexError(
+                f"finding index {finding_index} out of range "
+                f"(0..{len(self.findings) - 1})"
+            )
+        if not self._snapshot_name:
+            raise RuntimeError("no snapshot — run 'fuzz setup' first")
 
-        Returns the breakpoint address, or None if no stop condition applies.
-        """
+        finding = self.findings[finding_index]
+
+        self.emu.load_snapshot(self._snapshot_name)
+        self.emu._coverage.clear()
+        self.emu._coverage_hits.clear()
+        if hasattr(self.emu, "_edge_coverage"):
+            self.emu._edge_coverage.clear()
+            self.emu._edge_coverage_hits.clear()
+            self.emu._prev_coverage_pc = 0
+
+        target = self._find_target(finding.target_name, finding.target_kind)
+
+        if enable_trace and hasattr(self.emu, "trace_enabled"):
+            self.emu.trace_enabled = True
+
+        mmio_log: deque[tuple[str, int, int, int]] = deque(maxlen=4096)
+        orig_read = self.bus.read
+        orig_write = self.bus.write
+
+        def _tr(addr, size):
+            val = orig_read(addr, size)
+            mmio_log.append(("r", int(addr), int(size), int(val)))
+            return val
+
+        def _tw(addr, size, value):
+            mmio_log.append(("w", int(addr), int(size), int(value)))
+            return orig_write(addr, size, value)
+
+        self.bus.read = _tr
+        self.bus.write = _tw
+
+        if finding.target_kind == "all" and self.injector:
+            self.injector.inject_all(finding.input_data)
+        elif target is not None and self.injector:
+            self.injector.inject(target, finding.input_data)
+
+        stop_bp = self._install_stop_bp(target)
+
+        crashed = False
+        detail = ""
+        try:
+            self.emu.run(steps)
+        except Exception as e:
+            crashed = True
+            detail = str(e)
+        finally:
+            self.bus.read = orig_read
+            self.bus.write = orig_write
+            if enable_trace and hasattr(self.emu, "trace_enabled"):
+                self.emu.trace_enabled = False
+
+        returned = self._cleanup_stop_bp(stop_bp)
+
+        new_pcs = set(self.emu._coverage) - self._global_coverage
+        trace = self._capture_trace(new_pcs, mmio_log)
+
+        fault_report = None
+        if crashed and hasattr(self.emu, "capture_fault_report"):
+            try:
+                fault_report = self.emu.capture_fault_report(
+                    "replay_crash", detail=detail
+                )
+            except Exception:
+                pass
+
+        return {
+            "finding_index": finding_index,
+            "finding_kind": finding.kind,
+            "input_hex": finding.input_data.hex(),
+            "input_len": len(finding.input_data),
+            "target_name": finding.target_name,
+            "target_kind": finding.target_kind,
+            "crashed": crashed,
+            "returned": returned,
+            "detail": detail,
+            "trace": trace,
+            "fault_report": fault_report,
+        }
+
+    def format_replay(self, result: dict) -> str:
+        """Format a replay result as a human-readable string."""
+        status = (
+            "CRASH" if result["crashed"]
+            else "returned" if result["returned"]
+            else "completed"
+        )
+        lines = [
+            f"replay finding #{result['finding_index']} ({result['finding_kind']})",
+            f"target: {result['target_kind']}:{result['target_name']}",
+            f"input:  {result['input_len']}B "
+            f"{result['input_hex'][:64]}{'...' if result['input_len'] > 32 else ''}",
+            f"result: {status}",
+        ]
+        if result["detail"]:
+            lines.append(f"detail: {result['detail']}")
+
+        trace: IterationTrace | None = result.get("trace")
+        if trace is not None:
+            regs = trace.regs
+            keys = [k for k in ("r0", "r1", "r2", "r3", "sp", "lr", "pc") if k in regs]
+            if keys:
+                lines.append(
+                    "regs:   "
+                    + " ".join(f"{k}=0x{regs[k]:08X}" for k in keys)
+                )
+            extra = [k for k in sorted(regs) if k not in keys]
+            if extra:
+                lines.append(
+                    "        "
+                    + " ".join(f"{k}=0x{regs[k]:08X}" for k in extra[:8])
+                )
+
+            if trace.pc_freq:
+                lines.append(f"top PCs ({len(trace.pc_freq)}):")
+                for pc, count in trace.pc_freq[:10]:
+                    lines.append(f"  0x{pc:08X}  {count:6d}")
+                if len(trace.pc_freq) > 10:
+                    lines.append(f"  ... and {len(trace.pc_freq) - 10} more")
+
+            if trace.new_pcs:
+                cov_label = "edges" if self.coverage_mode == "edge" else "PCs"
+                lines.append(f"new coverage: +{len(trace.new_pcs)} {cov_label}")
+
+            if trace.mmio_log:
+                reads = sum(1 for k, *_ in trace.mmio_log if k == "r")
+                writes = len(trace.mmio_log) - reads
+                lines.append(
+                    f"mmio: {reads} reads, {writes} writes "
+                    f"(last {len(trace.mmio_log)}):"
+                )
+                for k, addr, size, val in list(trace.mmio_log)[-10:]:
+                    lines.append(
+                        f"  {k.upper()} 0x{addr:08X} sz={size} val=0x{val:08X}"
+                    )
+
+        fault = result.get("fault_report")
+        if fault:
+            lines.append(f"fault:  {fault.get('reason', 'unknown')}")
+
+        return "\n".join(lines)
+
+    # ── internal helpers ──────────────────────────────────────────
+
+    def _capture_trace(
+        self, new_pcs: set[int], mmio_log: deque | None = None,
+    ) -> IterationTrace:
+        regs: dict[str, int] = {}
+        if hasattr(self.emu, "read_regs"):
+            regs = {
+                k: int(v) & 0xFFFFFFFF
+                for k, v in self.emu.read_regs().items()
+            }
+
+        pc_freq = sorted(
+            ((int(k), int(v)) for k, v in self.emu._pc_hist.items()),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:32]
+
+        mmio: tuple[tuple[str, int, int, int], ...] | None = None
+        if mmio_log is not None:
+            mmio = tuple(mmio_log)
+
+        return IterationTrace(
+            regs=regs,
+            pc_freq=tuple(pc_freq),
+            new_pcs=tuple(sorted(new_pcs)),
+            mmio_log=mmio,
+        )
+
+    def _find_target(
+        self, name: str, kind: str,
+    ) -> InjectionTarget | None:
+        if not self.injector:
+            return None
+        for t in self.injector.targets:
+            if t.name == name and t.kind == kind:
+                return t
+        for t in self.injector.targets:
+            if t.name == name:
+                return t
+        return None
+
+    def _install_stop_bp(self, target: InjectionTarget | None) -> int | None:
         if target is None or target.kind != "function":
             return None
         cfg = target.fn_config
@@ -298,11 +580,6 @@ class FuzzEngine:
         return addr
 
     def _cleanup_stop_bp(self, addr: int | None) -> bool:
-        """Remove a temporary stop-condition breakpoint.
-
-        Returns True if the breakpoint was hit (function returned / target
-        PC reached), False otherwise.
-        """
         if addr is None:
             return False
         if hasattr(self.emu, "remove_breakpoint"):
@@ -313,13 +590,11 @@ class FuzzEngine:
         return False
 
     def _next_input(self, iteration: int) -> bytearray:
-        """Pick or generate the next fuzz input."""
         if iteration < len(self.seed_corpus):
             data = bytearray(self.seed_corpus[iteration])
             if self.max_input_len > 0 and len(data) > self.max_input_len:
                 data = data[:self.max_input_len]
             return data
-
         if self.corpus:
             base = self.mutator._rng.choice(self.corpus).data
             if len(self.corpus) > 1 and self.mutator._rng.random() < 0.1:
@@ -328,25 +603,52 @@ class FuzzEngine:
             return self.mutator.mutate(
                 base, self.max_mutations, max_len=self.max_input_len,
             )
-
         return self.mutator.generate(self.min_input_len, self.max_input_len)
 
     def _pick_target(self, idx: int) -> InjectionTarget:
-        """Pick injection target based on mode."""
         targets = self.injector.targets
         if self.mode == "round_robin":
             return targets[idx % len(targets)]
-        # default: random
         return self.mutator._rng.choice(targets)
 
     def _crash_hash(self, detail: str) -> str:
-        """Simple hash for crash deduplication."""
         pc = getattr(self.emu, 'pc', 0)
         return f"{pc:08x}:{detail[:64]}"
 
+    def _fault_matches_policy(
+        self, detail: str, fault_report: dict | None,
+    ) -> bool:
+        """Return True if the crash matches the fault policy.
+
+        An empty policy (the default) accepts all crashes.
+        """
+        if not self.fault_policy:
+            return True
+        dl = detail.lower()
+        if self.fault_policy.get("hardfault") and "hardfault" in dl:
+            return True
+        if self.fault_policy.get("busfault") and "busfault" in dl:
+            return True
+        if self.fault_policy.get("memfault") and ("memfault" in dl or "memmana" in dl):
+            return True
+        if self.fault_policy.get("usagefault") and "usagefault" in dl:
+            return True
+        if fault_report:
+            cfsr = int(fault_report.get("cfsr", 0))
+            hfsr = int(fault_report.get("hfsr", 0))
+            if self.fault_policy.get("busfault") and (cfsr & 0x0000FF00):
+                return True
+            if self.fault_policy.get("memfault") and (cfsr & 0x000000FF):
+                return True
+            if self.fault_policy.get("usagefault") and (cfsr & 0xFFFF0000):
+                return True
+            if self.fault_policy.get("hardfault") and hfsr:
+                return True
+        return False
+
     def format_stats(self) -> str:
-        """Format current statistics as a human-readable string."""
         s = self.stats
+        cov_unit = "edges" if self.coverage_mode == "edge" else "PCs"
         lines = [
             f"iterations:      {s.iterations}",
             f"exec/sec:        {s.execs_per_sec():.1f}",
@@ -354,14 +656,18 @@ class FuzzEngine:
             f"crashes:         {s.crashes} ({s.unique_crashes} unique)",
             f"hangs:           {s.hangs}",
             f"new cov inputs:  {s.new_coverage_inputs}",
-            f"coverage start:  {s.coverage_at_start} PCs",
-            f"coverage now:    {s.coverage_current} PCs",
-            f"coverage gained: +{s.coverage_current - s.coverage_at_start} PCs",
+            f"coverage mode:   {self.coverage_mode}",
+            f"coverage start:  {s.coverage_at_start} {cov_unit}",
+            f"coverage now:    {s.coverage_current} {cov_unit}",
+            f"coverage gained: +{s.coverage_current - s.coverage_at_start} {cov_unit}",
         ]
+        if self.coverage_mode == "edge":
+            lines.append(
+                f"block coverage:  {len(self._global_coverage)} PCs"
+            )
         return "\n".join(lines)
 
     def format_findings(self, max_show: int = 20) -> str:
-        """Format findings list."""
         if not self.findings:
             return "no findings"
         lines = [f"{len(self.findings)} finding(s):"]
@@ -369,21 +675,22 @@ class FuzzEngine:
             data_preview = f.input_data[:16].hex()
             if len(f.input_data) > 16:
                 data_preview += "..."
+            tag = " [trace]" if f.trace is not None else ""
+            cov_label = "edges" if self.coverage_mode == "edge" else "PCs"
             lines.append(
                 f"  [{f.iteration:5d}] {f.kind:14s} "
                 f"{f.target_kind}:{f.target_name:8s} "
-                f"+{f.new_pcs}PCs  "
-                f"data={data_preview}  {f.detail}"
+                f"+{f.new_pcs}{cov_label}  "
+                f"data={data_preview}  {f.detail}{tag}"
             )
         if len(self.findings) > max_show:
             lines.append(f"  ... and {len(self.findings) - max_show} more")
         return "\n".join(lines)
 
     def export_findings(self, path: Path) -> int:
-        """Export findings to a JSON file. Returns count exported."""
         entries = []
         for f in self.findings:
-            entry = {
+            entry: dict = {
                 "iteration": f.iteration,
                 "kind": f.kind,
                 "input_hex": f.input_data.hex(),
@@ -402,13 +709,14 @@ class FuzzEngine:
                     except (TypeError, ValueError):
                         safe_report[k] = str(v)
                 entry["fault_report"] = safe_report
+            if f.trace is not None:
+                entry["trace"] = f.trace.to_dict()
             entries.append(entry)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
         return len(entries)
 
     def export_corpus(self, directory: Path) -> int:
-        """Export corpus inputs to a directory (one file per entry)."""
         directory.mkdir(parents=True, exist_ok=True)
         for i, entry in enumerate(self.corpus):
             filename = f"id_{i:06d}_{entry.target_kind}_{entry.target_name}.bin"
@@ -416,7 +724,6 @@ class FuzzEngine:
         return len(self.corpus)
 
     def import_corpus(self, directory: Path, target_name: str | None = None) -> int:
-        """Import seed inputs from a directory of binary files."""
         if not directory.is_dir():
             return 0
         count = 0
@@ -429,9 +736,12 @@ class FuzzEngine:
         return count
 
     def reset(self) -> None:
-        """Reset fuzzer state for a new session."""
         self.stats = FuzzStats()
         self.corpus.clear()
         self.findings.clear()
         self._crash_hashes.clear()
         self._global_coverage.clear()
+        self._global_edge_coverage.clear()
+        if hasattr(self.emu, "_coverage_filter_start"):
+            self.emu._coverage_filter_start = 0
+            self.emu._coverage_filter_end = 0
