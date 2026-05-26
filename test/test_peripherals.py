@@ -8,6 +8,8 @@ from stmemu.peripherals.flash import FlashPeripheral
 from stmemu.peripherals.spi import SpiPeripheral
 from stmemu.peripherals.i2c import I2cPeripheral
 from stmemu.peripherals.dma import DmaPeripheral
+from stmemu.peripherals.rcc import RccPeripheral
+from stmemu.peripherals.core_cm import CortexMCorePeripheral
 
 
 def _make_peripheral(name: str, registers: tuple[SvdRegister, ...] = (), interrupts=()) -> SvdPeripheral:
@@ -233,6 +235,183 @@ class DmaTests(unittest.TestCase):
         dma.write(0x08, 4, 1 << 5)  # Clear TCIF0 via LIFCR
         lisr = dma.read(0x00, 4)
         self.assertFalse(lisr & (1 << 5))
+
+
+# ── RCC register definitions ──────────────────────────────────────
+
+_RCC_REGS = (
+    SvdRegister(
+        name="CR", offset=0x00, fields=(
+            SvdField(name="HSION", bit_offset=0, bit_width=1),
+            SvdField(name="HSIRDY", bit_offset=1, bit_width=1),
+            SvdField(name="HSEON", bit_offset=16, bit_width=1),
+            SvdField(name="HSERDY", bit_offset=17, bit_width=1),
+            SvdField(name="PLLON", bit_offset=24, bit_width=1),
+            SvdField(name="PLLRDY", bit_offset=25, bit_width=1),
+        ),
+    ),
+    SvdRegister(
+        name="CFGR", offset=0x08, fields=(
+            SvdField(name="SW0", bit_offset=0, bit_width=1),
+            SvdField(name="SW1", bit_offset=1, bit_width=1),
+            SvdField(name="SWS0", bit_offset=2, bit_width=1),
+            SvdField(name="SWS1", bit_offset=3, bit_width=1),
+        ),
+    ),
+    SvdRegister(name="AHB1ENR", offset=0x30, fields=(
+        SvdField(name="GPIOAEN", bit_offset=0, bit_width=1),
+        SvdField(name="GPIOBEN", bit_offset=1, bit_width=1),
+        SvdField(name="DMA1EN", bit_offset=21, bit_width=1),
+    )),
+    SvdRegister(name="APB1ENR", offset=0x40, fields=(
+        SvdField(name="USART2EN", bit_offset=17, bit_width=1),
+        SvdField(name="SPI2EN", bit_offset=14, bit_width=1),
+    )),
+    SvdRegister(name="AHB1RSTR", offset=0x10, fields=(
+        SvdField(name="GPIOARST", bit_offset=0, bit_width=1),
+    )),
+    SvdRegister(name="APB1RSTR", offset=0x20, fields=(
+        SvdField(name="USART2RST", bit_offset=17, bit_width=1),
+    )),
+)
+
+
+class RccTests(unittest.TestCase):
+    def _make_rcc(self):
+        p = _make_peripheral("RCC", _RCC_REGS)
+        return RccPeripheral(p)
+
+    def test_hsirdy_follows_hsion(self):
+        rcc = self._make_rcc()
+        rcc.write(0x00, 4, 1 << 0)  # HSION=1
+        cr = rcc.read(0x00, 4)
+        self.assertTrue(cr & (1 << 1), "HSIRDY should be set when HSION is set")
+
+    def test_hserdy_follows_hseon(self):
+        rcc = self._make_rcc()
+        rcc.write(0x00, 4, 1 << 16)  # HSEON=1
+        cr = rcc.read(0x00, 4)
+        self.assertTrue(cr & (1 << 17), "HSERDY should be set when HSEON is set")
+
+    def test_pllrdy_follows_pllon(self):
+        rcc = self._make_rcc()
+        rcc.write(0x00, 4, 1 << 24)  # PLLON=1
+        cr = rcc.read(0x00, 4)
+        self.assertTrue(cr & (1 << 25), "PLLRDY should be set when PLLON is set")
+
+    def test_rdy_clears_when_on_clears(self):
+        rcc = self._make_rcc()
+        rcc.write(0x00, 4, 1 << 0)  # HSION=1
+        rcc.read(0x00, 4)
+        rcc.write(0x00, 4, 0)  # HSION=0
+        cr = rcc.read(0x00, 4)
+        self.assertFalse(cr & (1 << 1), "HSIRDY should clear when HSION clears")
+
+    def test_sws_follows_sw(self):
+        rcc = self._make_rcc()
+        rcc.write(0x08, 4, 0x01)  # SW0=1
+        cfgr = rcc.read(0x08, 4)
+        self.assertTrue(cfgr & (1 << 2), "SWS0 should follow SW0")
+
+    def test_enable_register_tracks_peripherals(self):
+        rcc = self._make_rcc()
+        rcc.write(0x30, 4, (1 << 0) | (1 << 21))  # GPIOAEN + DMA1EN
+        self.assertTrue(rcc.is_peripheral_enabled("GPIOA"))
+        self.assertTrue(rcc.is_peripheral_enabled("DMA1"))
+        self.assertFalse(rcc.is_peripheral_enabled("GPIOB"))
+
+    def test_disable_peripheral(self):
+        rcc = self._make_rcc()
+        rcc.write(0x30, 4, 1 << 0)  # GPIOAEN
+        self.assertTrue(rcc.is_peripheral_enabled("GPIOA"))
+        rcc.write(0x30, 4, 0)  # clear
+        self.assertFalse(rcc.is_peripheral_enabled("GPIOA"))
+
+    def test_reset_register_calls_model_reset(self):
+        from stmemu.peripherals.bus import PeripheralBus
+        from stmemu.svd.address_map import AddressMap, AddressRange
+
+        rcc_svd = SvdPeripheral(
+            name="RCC", base_address=0x40023800, size=0x400,
+            registers=_RCC_REGS, interrupts=(),
+        )
+        gpio_svd = SvdPeripheral(
+            name="GPIOA", base_address=0x40020000, size=0x400,
+            registers=_GPIO_REGS, interrupts=(),
+        )
+        ranges = (
+            AddressRange(base=0x40020000, end=0x40020400, peripheral=gpio_svd),
+            AddressRange(base=0x40023800, end=0x40023C00, peripheral=rcc_svd),
+        )
+        amap = AddressMap(
+            device_name="TEST", peripherals=(rcc_svd, gpio_svd), ranges=ranges,
+        )
+        bus = PeripheralBus(amap)
+
+        rcc = RccPeripheral(rcc_svd)
+        gpio = GpioPeripheral(gpio_svd)
+        bus.register_peripheral("RCC", rcc)
+        bus.register_peripheral("GPIOA", gpio)
+
+        gpio.write(0x18, 4, 0x01)  # Set pin 0 via BSRR
+        odr_before = gpio.read(0x14, 4)
+        self.assertTrue(odr_before & 1)
+
+        rcc.write(0x10, 4, 1 << 0)  # GPIOARST=1
+        odr_after = gpio.read(0x14, 4)
+        self.assertFalse(odr_after & 1, "GPIO ODR should be 0 after RCC reset")
+
+    def test_reset_clears_enabled_set(self):
+        rcc = self._make_rcc()
+        rcc.write(0x30, 4, 1 << 0)
+        self.assertTrue(rcc.is_peripheral_enabled("GPIOA"))
+        rcc.reset()
+        self.assertEqual(len(rcc.enabled_peripherals()), 0)
+
+    def test_snapshot_restore_enabled_peripherals(self):
+        rcc = self._make_rcc()
+        rcc.write(0x30, 4, (1 << 0) | (1 << 1))
+        state = rcc.snapshot_state()
+        rcc.reset()
+        self.assertEqual(len(rcc.enabled_peripherals()), 0)
+        rcc.restore_state(state)
+        self.assertTrue(rcc.is_peripheral_enabled("GPIOA"))
+        self.assertTrue(rcc.is_peripheral_enabled("GPIOB"))
+
+    def test_is_peripheral_enabled_permissive_when_empty(self):
+        rcc = self._make_rcc()
+        self.assertTrue(rcc.is_peripheral_enabled("ANYTHING"))
+
+
+# ── SysTick VAL write tests ──────────────────────────────────────
+
+
+class SysTickValTests(unittest.TestCase):
+    def _make_core(self):
+        return CortexMCorePeripheral(vtor=0x08000000)
+
+    def test_write_val_clears_counter(self):
+        core = self._make_core()
+        core.write(0xE010, 4, 0x01)   # ENABLE
+        core.write(0xE014, 4, 1000)    # LOAD=1000
+        core.write(0xE018, 4, 500)     # VAL — any write should clear to 0
+        val = core.read_register_value(0xE018)
+        self.assertEqual(val, 0, "writing SYST_CVR should clear it to 0")
+
+    def test_write_val_clears_countflag(self):
+        core = self._make_core()
+        core.write_register_value(0xE010, 0x01)  # ENABLE
+        core.write_register_value(0xE014, 10)      # LOAD=10
+        core.write_register_value(0xE018, 0)       # clear VAL
+        core.tick(15)
+        ctrl = core.read_register_value(0xE010)
+        self.assertTrue(ctrl & (1 << 16), "COUNTFLAG should be set after underflow")
+        core.write(0xE018, 4, 0xFF)
+        ctrl_after = core.read_register_value(0xE010)
+        self.assertFalse(
+            ctrl_after & (1 << 16),
+            "writing SYST_CVR should clear COUNTFLAG",
+        )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from stmemu.peripherals.dma import build_dma
 from stmemu.peripherals.flash import build_flash
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.peripherals.gpio import build_gpio
+from stmemu.peripherals.rcc import build_rcc
 from stmemu.peripherals.i2c import build_i2c
 from stmemu.peripherals.memory import RawMemoryPeripheral
 from stmemu.peripherals.spi import build_spi
@@ -76,32 +77,6 @@ class PeripheralFactoryRegistry:
 
 def create_default_registry() -> PeripheralFactoryRegistry:
     registry = PeripheralFactoryRegistry()
-
-    def build_rcc(peripheral: SvdPeripheral) -> PeripheralModel:
-        model = GenericRegisterFilePeripheral(peripheral)
-        # Auto-set common clock-ready bits after polling.
-        # Look for CR-like registers at offset 0x00 (most STM32 families)
-        # and CFGR-like registers.
-        cr_offset = 0x00
-        cfgr_offset = 0x10
-        for reg in peripheral.registers:
-            rname = reg.name.upper()
-            if rname == "CR":
-                cr_offset = reg.offset
-            elif rname in ("CFGR", "CFGR1"):
-                cfgr_offset = reg.offset
-
-        # Common RCC CR ready bits (HSIRDY, HSERDY, PLLRDY, etc.)
-        for field in _fields_for_offset(peripheral, cr_offset):
-            if field.name.upper().endswith("RDY"):
-                model.force_bit_after_reads(cr_offset, field.bit_offset, reads_before_set=10)
-
-        # CFGR status bits
-        for field in _fields_for_offset(peripheral, cfgr_offset):
-            if field.name.upper().startswith("SWS"):
-                model.force_bit_after_reads(cfgr_offset, field.bit_offset, reads_before_set=10)
-
-        return model
 
     def build_pwr(peripheral: SvdPeripheral) -> PeripheralModel:
         model = GenericRegisterFilePeripheral(peripheral)
