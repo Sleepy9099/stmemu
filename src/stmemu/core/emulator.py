@@ -194,6 +194,9 @@ class Emulator:
         self._special_step_consumed = False
         self._ignore_breakpoint_once: int | None = None
 
+        if hasattr(self.bus, "set_emulator"):
+            self.bus.set_emulator(self)
+
     def _map_memory(self) -> None:
         image_end = self.flash_base
         mapped_segments = 0

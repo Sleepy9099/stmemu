@@ -246,7 +246,11 @@ class CortexMCorePeripheral(RegisterPeripheral):
         return next_value & 0x00FFFFFF
 
     def _on_write_systick_val(self, current: int, next_value: int) -> int:
-        return next_value & 0x00FFFFFF
+        # ARM: writing any value to SYST_CVR clears it to 0 and clears COUNTFLAG
+        ctrl = self.read_register_value(self._SYST_CSR)
+        if ctrl & self._SYST_CSR_COUNTFLAG:
+            self.write_register_value(self._SYST_CSR, ctrl & ~self._SYST_CSR_COUNTFLAG)
+        return 0
 
     def _add_nvic_bank(
         self,
