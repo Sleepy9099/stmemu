@@ -89,6 +89,7 @@ class PeripheralBus:
         self.access_policy: AccessPolicy = "permissive"
         self._rcc_model: object | None = None
         self._emulator: object | None = None
+        self._serial_lines: dict[str, object] = {}
 
     def register_peripheral(self, name: str, model: PeripheralModel) -> None:
         p = self.amap.find_peripheral_by_name(name)
@@ -157,6 +158,16 @@ class PeripheralBus:
     def mounted_ranges(self) -> tuple[MountedPeripheral, ...]:
         return tuple(self._mounted)
 
+    def attach_serial_line(self, line: object) -> None:
+        """Register a SerialLine so it ticks and snapshots with the bus."""
+        self._serial_lines[line.name] = line
+
+    def detach_serial_line(self, name: str) -> bool:
+        return self._serial_lines.pop(name, None) is not None
+
+    def serial_lines(self) -> dict[str, object]:
+        return dict(self._serial_lines)
+
     def tick(self, cycles: int) -> None:
         seen: set[int] = set()
         for mounted in self._mounted:
@@ -165,6 +176,8 @@ class PeripheralBus:
                 continue
             seen.add(ident)
             mounted.model.tick(cycles)
+        for line in self._serial_lines.values():
+            line.tick(cycles)
 
     def snapshot_models_state(self) -> dict[str, object]:
         states: dict[str, object] = {}
@@ -177,6 +190,10 @@ class PeripheralBus:
             state = mounted.model.snapshot_state()
             if state is not None:
                 states[mounted.name] = state
+        for name, line in self._serial_lines.items():
+            state = line.snapshot_state()
+            if state is not None:
+                states[f"__line__{name}"] = state
         return states
 
     def restore_models_state(self, states: dict[str, object]) -> None:
@@ -189,6 +206,10 @@ class PeripheralBus:
             if mounted.name not in states:
                 continue
             mounted.model.restore_state(states[mounted.name])
+        for name, line in self._serial_lines.items():
+            key = f"__line__{name}"
+            if key in states:
+                line.restore_state(states[key])
 
     def read(self, addr: int, size: int) -> int:
         mounted = self._mount_for_addr(addr)

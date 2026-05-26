@@ -159,3 +159,6 @@ class StmEmuShell(cmd.Cmd):
 
     def do_fuzz(self, arg: str) -> None:
         self.default("fuzz " + arg if arg else "fuzz")
+
+    def do_device(self, arg: str) -> None:
+        self.default("device " + arg if arg else "device")
