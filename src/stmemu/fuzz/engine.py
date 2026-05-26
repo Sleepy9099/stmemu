@@ -83,20 +83,17 @@ class FuzzEngine:
     mode: str = "random"  # "random", "round_robin", "all"
     _snapshot_name: str = ""
     _crash_hashes: set[str] = field(default_factory=set)
-    _baseline_coverage: set[int] = field(default_factory=set)
+    _global_coverage: set[int] = field(default_factory=set)
     _rng_seed: int | None = None
 
     def setup(self, snapshot_name: str = "__fuzz_baseline") -> str:
         """Prepare for fuzzing: save snapshot, discover targets, enable coverage."""
-        # Save a baseline snapshot
         self._snapshot_name = snapshot_name
         self.emu.save_snapshot(snapshot_name)
 
-        # Set up injector
-        self.injector = Injector(bus=self.bus)
+        self.injector = Injector(bus=self.bus, emu=self.emu)
         self.injector.discover_targets()
 
-        # Apply target filter if specified
         if self.target_filter:
             allowed = {n.upper() for n in self.target_filter}
             self.injector.targets = [
@@ -107,12 +104,10 @@ class FuzzEngine:
         if not self.injector.targets:
             return "no injectable targets found"
 
-        # Enable coverage tracking
         self.emu.coverage_enabled = True
-        self._baseline_coverage = set(self.emu._coverage)
-        self.stats.coverage_at_start = len(self._baseline_coverage)
+        self._global_coverage = set(self.emu._coverage)
+        self.stats.coverage_at_start = len(self._global_coverage)
 
-        # Sync seeds
         if self._rng_seed is not None:
             self.mutator.set_seed(self._rng_seed)
             self.injector.set_seed(self._rng_seed)
@@ -152,20 +147,26 @@ class FuzzEngine:
             # 1. Restore snapshot
             self.emu.load_snapshot(self._snapshot_name)
 
-            # 2. Generate or mutate input
+            # 2. Clear per-iteration coverage so we only see this iteration's PCs
+            self.emu._coverage.clear()
+            self.emu._coverage_hits.clear()
+
+            # 3. Generate or mutate input
             input_data = self._next_input(i)
 
-            # 3. Pick target
-            target = self._pick_target(target_idx)
-            target_idx += 1
+            # 4. Inject into target(s)
+            if self.mode == "all":
+                self.injector.inject_all(input_data)
+                target_name = "all"
+                target_kind = "all"
+            else:
+                target = self._pick_target(target_idx)
+                target_idx += 1
+                self.injector.inject(target, input_data)
+                target_name = target.name
+                target_kind = target.kind
 
-            # 4. Record pre-injection coverage
-            pre_coverage = set(self.emu._coverage)
-
-            # 5. Inject
-            inject_desc = self.injector.inject(target, input_data)
-
-            # 6. Run emulator
+            # 5. Run emulator
             crashed = False
             hung = False
             detail = ""
@@ -176,7 +177,7 @@ class FuzzEngine:
                 crashed = True
                 detail = str(e)
 
-            # 7. Check for hang (stuck loop detection)
+            # 6. Check for hang (stuck loop detection)
             if not crashed and hasattr(self.emu, '_pc_hist'):
                 threshold = max(0, int(getattr(self.emu, 'stuck_loop_threshold', 5000)))
                 if threshold > 0:
@@ -186,11 +187,13 @@ class FuzzEngine:
                             detail = "stuck loop detected"
                             break
 
-            # 8. Analyze coverage
-            post_coverage = set(self.emu._coverage)
-            new_pcs = len(post_coverage - pre_coverage)
+            # 7. Analyze coverage against the engine's global set
+            iter_coverage = set(self.emu._coverage)
+            new_pcs = iter_coverage - self._global_coverage
+            new_pcs_count = len(new_pcs)
+            self._global_coverage |= iter_coverage
 
-            # 9. Record findings
+            # 8. Record findings
             if crashed:
                 self.stats.crashes += 1
                 crash_hash = self._crash_hash(detail)
@@ -200,7 +203,6 @@ class FuzzEngine:
                     self.stats.unique_crashes += 1
                     kind = "unique_crash"
 
-                # Capture fault report if available
                 fault_report = None
                 if hasattr(self.emu, 'capture_fault_report'):
                     try:
@@ -214,9 +216,9 @@ class FuzzEngine:
                     iteration=self.stats.iterations,
                     kind=kind,
                     input_data=bytes(input_data),
-                    target_name=target.name,
-                    target_kind=target.kind,
-                    new_pcs=new_pcs,
+                    target_name=target_name,
+                    target_kind=target_kind,
+                    new_pcs=new_pcs_count,
                     detail=detail,
                     fault_report=fault_report,
                 )
@@ -229,23 +231,23 @@ class FuzzEngine:
                     iteration=self.stats.iterations,
                     kind="hang",
                     input_data=bytes(input_data),
-                    target_name=target.name,
-                    target_kind=target.kind,
-                    new_pcs=new_pcs,
+                    target_name=target_name,
+                    target_kind=target_kind,
+                    new_pcs=new_pcs_count,
                     detail=detail,
                 )
                 self.findings.append(finding)
                 session_findings.append(finding)
 
-            if new_pcs > 0:
+            if new_pcs_count > 0:
                 self.stats.new_coverage_inputs += 1
                 self.corpus.append(CorpusEntry(
                     data=bytes(input_data),
-                    target_name=target.name,
-                    target_kind=target.kind,
-                    new_pcs=new_pcs,
+                    target_name=target_name,
+                    target_kind=target_kind,
+                    new_pcs=new_pcs_count,
                     iteration_found=self.stats.iterations,
-                    total_coverage_at_find=len(post_coverage),
+                    total_coverage_at_find=len(self._global_coverage),
                 ))
                 self.stats.corpus_size = len(self.corpus)
                 if not crashed and not hung:
@@ -253,35 +255,36 @@ class FuzzEngine:
                         iteration=self.stats.iterations,
                         kind="new_coverage",
                         input_data=bytes(input_data),
-                        target_name=target.name,
-                        target_kind=target.kind,
-                        new_pcs=new_pcs,
-                        detail=f"+{new_pcs} PCs",
+                        target_name=target_name,
+                        target_kind=target_kind,
+                        new_pcs=new_pcs_count,
+                        detail=f"+{new_pcs_count} PCs",
                     )
                     self.findings.append(finding)
                     session_findings.append(finding)
 
-            self.stats.coverage_current = len(self.emu._coverage)
+            self.stats.coverage_current = len(self._global_coverage)
 
         self.stats.elapsed = time.monotonic() - self.stats.start_time
         return session_findings
 
     def _next_input(self, iteration: int) -> bytearray:
         """Pick or generate the next fuzz input."""
-        # First exhaust seed corpus
         if iteration < len(self.seed_corpus):
-            return bytearray(self.seed_corpus[iteration])
+            data = bytearray(self.seed_corpus[iteration])
+            if self.max_input_len > 0 and len(data) > self.max_input_len:
+                data = data[:self.max_input_len]
+            return data
 
-        # If we have corpus entries, mutate one; sometimes splice two
         if self.corpus:
             base = self.mutator._rng.choice(self.corpus).data
-            # 10% chance of splice with another corpus entry
             if len(self.corpus) > 1 and self.mutator._rng.random() < 0.1:
                 other = self.mutator._rng.choice(self.corpus).data
-                return self.mutator.splice(base, other)
-            return self.mutator.mutate(base, self.max_mutations)
+                return self.mutator.splice(base, other, max_len=self.max_input_len)
+            return self.mutator.mutate(
+                base, self.max_mutations, max_len=self.max_input_len,
+            )
 
-        # No corpus yet — generate random
         return self.mutator.generate(self.min_input_len, self.max_input_len)
 
     def _pick_target(self, idx: int) -> InjectionTarget:
@@ -347,7 +350,6 @@ class FuzzEngine:
                 "detail": f.detail,
             }
             if f.fault_report:
-                # Serialize fault report (strip non-serializable bits)
                 safe_report = {}
                 for k, v in f.fault_report.items():
                     try:
@@ -388,4 +390,4 @@ class FuzzEngine:
         self.corpus.clear()
         self.findings.clear()
         self._crash_hashes.clear()
-        self._baseline_coverage.clear()
+        self._global_coverage.clear()

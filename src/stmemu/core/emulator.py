@@ -105,6 +105,9 @@ class EmulatorSnapshot:
     exception_stack: tuple[int, ...]
     exception_return_stack: tuple[int, ...]
     pc_hist: dict[int, int]
+    coverage: frozenset[int] | None = None
+    fault_report: dict[str, object] | None = None
+    mutable_ranges: tuple[tuple[int, int], ...] | None = None
 
 def _u32(b: bytes, off: int) -> int:
     return int.from_bytes(b[off : off + 4], "little", signed=False)
@@ -670,7 +673,12 @@ class Emulator:
             chunks.append(SnapshotMemoryChunk(start=int(start), data=data))
         return tuple(chunks)
 
-    def capture_snapshot(self, name: str = "(current)") -> EmulatorSnapshot:
+    def capture_snapshot(
+        self,
+        name: str = "(current)",
+        *,
+        include_coverage: bool = False,
+    ) -> EmulatorSnapshot:
         return EmulatorSnapshot(
             name=str(name),
             regs=self._read_snapshot_regs(),
@@ -679,6 +687,11 @@ class Emulator:
             exception_stack=tuple(int(x) for x in self._exception_stack),
             exception_return_stack=tuple(int(x) for x in self._exception_return_stack),
             pc_hist={int(k): int(v) for k, v in self._pc_hist.items()},
+            coverage=frozenset(self._coverage) if include_coverage else None,
+            fault_report=dict(self.last_fault_report) if self.last_fault_report else None,
+            mutable_ranges=tuple(
+                (int(s), int(e)) for s, e in self._snapshot_ranges()
+            ),
         )
 
     def save_snapshot(self, name: str) -> EmulatorSnapshot:
@@ -725,6 +738,14 @@ class Emulator:
         self.last_pc_break = None
         self.last_mmio_break = None
         self.last_watch_break = None
+
+        if snap.coverage is not None:
+            self._coverage = set(snap.coverage)
+            self._coverage_hits.clear()
+        if snap.fault_report is not None:
+            self.last_fault_report = dict(snap.fault_report)
+        else:
+            self.last_fault_report = None
         return snap
 
     @staticmethod

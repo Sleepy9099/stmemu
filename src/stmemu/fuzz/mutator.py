@@ -34,15 +34,22 @@ class Mutator:
 
     def generate(self, min_len: int = 1, max_len: int = 256) -> bytearray:
         """Generate a fully random input."""
-        length = self._rng.randint(min_len, max_len)
+        length = self._rng.randint(max(1, min_len), max(1, max_len))
         return bytearray(self._rng.getrandbits(8) for _ in range(length))
 
     # ── Mutation strategies ────────────────────────────────────────
 
-    def mutate(self, data: bytes, max_mutations: int = 4) -> bytearray:
-        """Apply 1..max_mutations random mutation strategies to data."""
+    def mutate(
+        self, data: bytes, max_mutations: int = 4, max_len: int = 0,
+    ) -> bytearray:
+        """Apply 1..max_mutations random mutation strategies to data.
+
+        If *max_len* > 0, the result is truncated after each mutation so that
+        insert/duplicate strategies cannot grow inputs beyond the intended
+        packet size.
+        """
         if not data:
-            return self.generate()
+            return self.generate(max_len=max_len if max_len > 0 else 256)
         buf = bytearray(data)
         n = self._rng.randint(1, max(1, max_mutations))
         strategies = [
@@ -64,17 +71,23 @@ class Mutator:
         for _ in range(n):
             strategy = self._rng.choice(strategies)
             buf = strategy(buf)
+            if max_len > 0 and len(buf) > max_len:
+                buf = buf[:max_len]
         return buf
 
-    def splice(self, a: bytes, b: bytes) -> bytearray:
+    def splice(self, a: bytes, b: bytes, max_len: int = 0) -> bytearray:
         """Splice two inputs together at random crossover points."""
         if not a:
-            return bytearray(b)
-        if not b:
-            return bytearray(a)
-        cut_a = self._rng.randint(0, len(a))
-        cut_b = self._rng.randint(0, len(b))
-        return bytearray(a[:cut_a]) + bytearray(b[cut_b:])
+            result = bytearray(b)
+        elif not b:
+            result = bytearray(a)
+        else:
+            cut_a = self._rng.randint(0, len(a))
+            cut_b = self._rng.randint(0, len(b))
+            result = bytearray(a[:cut_a]) + bytearray(b[cut_b:])
+        if max_len > 0 and len(result) > max_len:
+            result = result[:max_len]
+        return result
 
     # ── Individual strategies ──────────────────────────────────────
 

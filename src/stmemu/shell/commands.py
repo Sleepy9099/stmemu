@@ -2981,6 +2981,8 @@ class Commands:
             "fuzz targets | fuzz stats | fuzz findings [max] | "
             "fuzz corpus | fuzz seed <hexbytes|@file> | "
             "fuzz dict <token_hex> | fuzz config <key> <value> | "
+            "fuzz target memory <name> <addr> [size_reg] | "
+            "fuzz target function <name> <entry_addr> <buffer_addr> | "
             "fuzz export findings <file> | fuzz export corpus <dir> | "
             "fuzz import <dir> | fuzz reset"
         )
@@ -3005,6 +3007,9 @@ class Commands:
 
         if sub == "targets":
             return self._fuzz_targets()
+
+        if sub == "target":
+            return self._fuzz_add_target(argv[1:])
 
         if sub == "stats":
             return self._fuzz_stats()
@@ -3067,6 +3072,44 @@ class Commands:
         self._ensure_fuzz_engine()
         result = self._fuzz_engine.setup(snapshot_name=snap_name)
         return f"fuzz setup: {result}"
+
+    def _fuzz_add_target(self, argv: list[str]) -> str:
+        target_usage = (
+            "usage: fuzz target memory <name> <addr> [size_reg] | "
+            "fuzz target function <name> <entry_addr> <buffer_addr>"
+        )
+        if len(argv) < 3:
+            return target_usage
+        self._ensure_fuzz_engine()
+        eng = self._fuzz_engine
+        if eng.injector is None:
+            from stmemu.fuzz.injector import Injector
+            eng.injector = Injector(bus=self.bus, emu=self.emu)
+
+        kind = argv[0].lower()
+        if kind == "memory":
+            name = argv[1]
+            addr = _int(argv[2])
+            size_reg = argv[3] if len(argv) > 3 else None
+            eng.injector.add_memory_target(name, addr, size_reg=size_reg)
+            desc = f"memory target '{name}' @0x{addr:08X}"
+            if size_reg:
+                desc += f" size_reg={size_reg}"
+            return f"added {desc}"
+
+        if kind == "function":
+            if len(argv) < 4:
+                return target_usage
+            name = argv[1]
+            entry_addr = _int(argv[2])
+            buffer_addr = _int(argv[3])
+            eng.injector.add_function_target(name, entry_addr, buffer_addr)
+            return (
+                f"added function target '{name}' "
+                f"entry=0x{entry_addr:08X} buf=0x{buffer_addr:08X}"
+            )
+
+        return target_usage
 
     def _fuzz_run(self, iterations: int, steps: int) -> str:
         self._ensure_fuzz_engine()

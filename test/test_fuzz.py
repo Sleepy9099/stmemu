@@ -185,7 +185,9 @@ class _FakeEmu:
         self._pc_hist: dict[int, int] = {}
         self._snapshots: dict[str, object] = {}
         self._run_callback = None
-        self._regs = {"r0": 0, "sp": 0x20001000, "lr": 0, "pc": 0x08000100}
+        self._regs = {"r0": 0, "r1": 0, "sp": 0x20001000, "lr": 0, "pc": 0x08000100}
+        self._memory: dict[int, bytes] = {}
+        self.last_fault_report = None
 
     def save_snapshot(self, name):
         self._snapshots[name] = {
@@ -199,19 +201,36 @@ class _FakeEmu:
         if snap is None:
             raise KeyError(name)
         self._pc_hist.clear()
+        self.last_fault_report = None
         return types.SimpleNamespace(name=name)
 
     def run(self, count):
-        # Simulate: add some coverage PCs based on run
         if self._run_callback:
             self._run_callback(self, count)
         else:
-            # Default: add a few random PCs to simulate coverage growth
             import random
             for _ in range(random.randint(0, 3)):
                 pc = random.randint(0x08000100, 0x08000FFF) & ~1
                 self._coverage.add(pc)
                 self._coverage_hits[pc] = self._coverage_hits.get(pc, 0) + 1
+
+    def mem_write(self, addr, data):
+        self._memory[addr] = bytes(data)
+
+    def mem_read(self, addr, size):
+        data = self._memory.get(addr, b"")
+        if len(data) >= size:
+            return data[:size]
+        return data + b"\x00" * (size - len(data))
+
+    def write_reg(self, name, value):
+        name = name.lower()
+        self._regs[name] = value & 0xFFFFFFFF
+        if name == "pc":
+            self.pc = value & ~1
+
+    def read_regs(self):
+        return dict(self._regs)
 
     def capture_fault_report(self, reason, *, detail=None):
         return {"reason": reason, "detail": detail or "", "pc": self.pc}
@@ -255,6 +274,13 @@ class MutatorTests(unittest.TestCase):
         result = m.mutate(b"")
         self.assertTrue(len(result) > 0)
 
+    def test_mutate_max_len_enforced(self):
+        m = Mutator(seed=42)
+        original = b"\x00" * 16
+        for _ in range(100):
+            result = m.mutate(original, max_mutations=4, max_len=20)
+            self.assertLessEqual(len(result), 20)
+
     def test_splice(self):
         m = Mutator(seed=42)
         a = b"AAAA"
@@ -267,6 +293,14 @@ class MutatorTests(unittest.TestCase):
         self.assertEqual(m.splice(b"", b"hello"), bytearray(b"hello"))
         self.assertEqual(m.splice(b"hello", b""), bytearray(b"hello"))
 
+    def test_splice_max_len_enforced(self):
+        m = Mutator(seed=42)
+        a = b"A" * 100
+        b_data = b"B" * 100
+        for _ in range(50):
+            result = m.splice(a, b_data, max_len=32)
+            self.assertLessEqual(len(result), 32)
+
     def test_set_seed_reproducible(self):
         m1 = Mutator(seed=123)
         m2 = Mutator(seed=123)
@@ -276,15 +310,12 @@ class MutatorTests(unittest.TestCase):
     def test_dictionary_insert(self):
         m = Mutator(seed=42, dictionary=[b"\xDE\xAD", b"\xBE\xEF"])
         original = b"\x00" * 32
-        # Run many mutations - dictionary should be used sometimes
         found_dict = False
         for _ in range(100):
             result = m.mutate(original, max_mutations=1)
             if b"\xDE\xAD" in result or b"\xBE\xEF" in result:
                 found_dict = True
                 break
-        # Dictionary entries may or may not appear due to randomness,
-        # but the mutation should not crash
         self.assertIsInstance(result, bytearray)
 
     def test_add_dict_entry(self):
@@ -299,15 +330,11 @@ class MutatorTests(unittest.TestCase):
 
 class InjectorTests(unittest.TestCase):
     def _make_bus_with_targets(self):
-        # Build a bus-like object where mounted_ranges returns typed models
         from stmemu.peripherals.usart import Stm32UsartPeripheral
         from stmemu.peripherals.spi import SpiPeripheral
         from stmemu.peripherals.i2c import I2cPeripheral
         from stmemu.peripherals.gpio import GpioPeripheral
 
-        # Use our fakes but mark them as the right type via isinstance
-        # We can't easily do that, so test with the injector using
-        # InjectionTarget directly.
         uart = _FakeUartModel()
         spi = _FakeSpiModel()
         i2c = _FakeI2cModel()
@@ -350,6 +377,43 @@ class InjectorTests(unittest.TestCase):
         self.assertIn("gpio", desc)
         self.assertEqual(gpio._odr & 0xFF, 0xFF)
 
+    def test_inject_memory(self):
+        emu = _FakeEmu()
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_memory_target("PARSE_BUF", 0x20000100, size_reg="r1")
+        desc = inj.inject(target, b"\xAA\xBB\xCC")
+        self.assertIn("memory", desc)
+        self.assertEqual(emu.mem_read(0x20000100, 3), b"\xAA\xBB\xCC")
+        self.assertEqual(emu._regs["r1"], 3)
+
+    def test_inject_memory_no_size_reg(self):
+        emu = _FakeEmu()
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_memory_target("RAW_BUF", 0x20000200)
+        desc = inj.inject(target, b"\x01\x02")
+        self.assertIn("memory", desc)
+        self.assertEqual(emu.mem_read(0x20000200, 2), b"\x01\x02")
+
+    def test_inject_function(self):
+        emu = _FakeEmu()
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        target = inj.add_function_target("parse_pkt", 0x08001000, 0x20000400)
+        desc = inj.inject(target, b"\xDE\xAD\xBE\xEF")
+        self.assertIn("function", desc)
+        self.assertEqual(emu.mem_read(0x20000400, 4), b"\xDE\xAD\xBE\xEF")
+        self.assertEqual(emu._regs["r0"], 0x20000400)
+        self.assertEqual(emu._regs["r1"], 4)
+        self.assertEqual(emu.pc, 0x08001000)
+
+    def test_inject_memory_no_emu(self):
+        inj = Injector(bus=_FakeBus())
+        target = InjectionTarget(
+            name="BUF", kind="memory", model=None, address=0x20000100,
+        )
+        inj.targets.append(target)
+        desc = inj.inject(target, b"\x01")
+        self.assertIn("no emulator", desc)
+
     def test_inject_random_target(self):
         uart = _FakeUartModel()
         spi = _FakeSpiModel()
@@ -386,6 +450,16 @@ class InjectorTests(unittest.TestCase):
         self.assertEqual(result[0]["name"], "USART1")
         self.assertEqual(result[1]["kind"], "spi")
 
+    def test_discover_preserves_manual_targets(self):
+        emu = _FakeEmu()
+        inj = Injector(bus=_FakeBus(), emu=emu)
+        inj.add_memory_target("BUF", 0x20000100)
+        inj.add_function_target("fn", 0x08001000, 0x20000200)
+        inj.discover_targets()
+        kinds = [t.kind for t in inj.targets]
+        self.assertIn("memory", kinds)
+        self.assertIn("function", kinds)
+
 
 # ── FuzzEngine Tests ───────────────────────────────────────────────
 
@@ -395,9 +469,8 @@ class FuzzEngineTests(unittest.TestCase):
         emu = _FakeEmu()
         bus = _FakeBus()
         eng = FuzzEngine(emu=emu, bus=bus)
-        # Manually set up injector with a fake UART target
         uart = _FakeUartModel()
-        eng.injector = Injector(bus=bus)
+        eng.injector = Injector(bus=bus, emu=emu)
         eng.injector.targets = [
             InjectionTarget(name="USART1", kind="uart", model=uart)
         ]
@@ -418,14 +491,41 @@ class FuzzEngineTests(unittest.TestCase):
         eng, emu, uart = self._make_engine()
         eng.seed(42)
         eng.run(iterations=20, steps_per_iter=100)
-        # The fake emu adds random PCs, so coverage should grow
         self.assertGreater(eng.stats.coverage_current, 0)
+
+    def test_global_coverage_tracks_novelty(self):
+        eng, emu, uart = self._make_engine()
+        seen_pcs = set()
+        call_count = [0]
+
+        def deterministic_run(emu_ref, count):
+            call_count[0] += 1
+            pc = 0x08000100 + (call_count[0] * 2)
+            emu_ref._coverage.add(pc)
+
+        emu._run_callback = deterministic_run
+        eng.seed(42)
+        eng.run(iterations=5, steps_per_iter=100)
+        self.assertEqual(len(eng._global_coverage), 5)
+        self.assertEqual(eng.stats.coverage_current, 5)
+        self.assertEqual(eng.stats.new_coverage_inputs, 5)
+
+    def test_global_coverage_no_double_counting(self):
+        eng, emu, uart = self._make_engine()
+
+        def same_pc_run(emu_ref, count):
+            emu_ref._coverage.add(0x08000200)
+
+        emu._run_callback = same_pc_run
+        eng.seed(42)
+        eng.run(iterations=5, steps_per_iter=100)
+        self.assertEqual(len(eng._global_coverage), 1)
+        self.assertEqual(eng.stats.new_coverage_inputs, 1)
 
     def test_corpus_grows_on_new_coverage(self):
         eng, emu, uart = self._make_engine()
         eng.seed(42)
         eng.run(iterations=50, steps_per_iter=100)
-        # With random coverage additions, corpus should have entries
         self.assertGreater(len(eng.corpus), 0)
 
     def test_crash_detection(self):
@@ -436,7 +536,6 @@ class FuzzEngineTests(unittest.TestCase):
             crash_count[0] += 1
             if crash_count[0] % 3 == 0:
                 raise RuntimeError("HardFault at 0x08000200")
-            # Normal: add some coverage
             import random
             pc = random.randint(0x08000100, 0x08000FFF) & ~1
             emu_ref._coverage.add(pc)
@@ -447,7 +546,6 @@ class FuzzEngineTests(unittest.TestCase):
         self.assertGreater(eng.stats.crashes, 0)
         crash_findings = [f for f in findings if "crash" in f.kind]
         self.assertGreater(len(crash_findings), 0)
-        # Check fault report captured
         for cf in crash_findings:
             if cf.fault_report is not None:
                 self.assertIn("reason", cf.fault_report)
@@ -458,10 +556,6 @@ class FuzzEngineTests(unittest.TestCase):
         eng.add_seed_input(b"\xDD\xEE\xFF")
         eng.seed(42)
         eng.run(iterations=2, steps_per_iter=100)
-        # First two iterations should use seed inputs
-        # We can verify by checking the uart received the seed data
-        # (uart is reset each iteration via snapshot, but we can check
-        # that iterations ran)
         self.assertEqual(eng.stats.iterations, 2)
 
     def test_format_stats(self):
@@ -538,6 +632,7 @@ class FuzzEngineTests(unittest.TestCase):
         self.assertEqual(eng.stats.iterations, 0)
         self.assertEqual(len(eng.corpus), 0)
         self.assertEqual(len(eng.findings), 0)
+        self.assertEqual(len(eng._global_coverage), 0)
 
     def test_mode_round_robin(self):
         emu = _FakeEmu()
@@ -545,7 +640,7 @@ class FuzzEngineTests(unittest.TestCase):
         eng = FuzzEngine(emu=emu, bus=bus)
         uart1 = _FakeUartModel()
         uart2 = _FakeUartModel()
-        eng.injector = Injector(bus=bus)
+        eng.injector = Injector(bus=bus, emu=emu)
         eng.injector.targets = [
             InjectionTarget(name="USART1", kind="uart", model=uart1),
             InjectionTarget(name="USART2", kind="uart", model=uart2),
@@ -557,6 +652,47 @@ class FuzzEngineTests(unittest.TestCase):
         eng.seed(42)
         eng.run(iterations=4, steps_per_iter=100)
         self.assertEqual(eng.stats.iterations, 4)
+
+    def test_mode_all(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        uart1 = _FakeUartModel()
+        uart2 = _FakeUartModel()
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.targets = [
+            InjectionTarget(name="USART1", kind="uart", model=uart1),
+            InjectionTarget(name="USART2", kind="uart", model=uart2),
+        ]
+        eng._snapshot_name = "__fuzz_all"
+        emu.save_snapshot("__fuzz_all")
+        emu.coverage_enabled = True
+        eng.mode = "all"
+        eng.seed(42)
+        eng.run(iterations=3, steps_per_iter=100)
+        self.assertEqual(eng.stats.iterations, 3)
+
+    def test_max_input_len_enforced_during_run(self):
+        eng, emu, uart = self._make_engine()
+        eng.max_input_len = 16
+        eng.seed(42)
+        eng.add_seed_input(b"\x00" * 32)
+        eng.run(iterations=20, steps_per_iter=100)
+        for entry in eng.corpus:
+            self.assertLessEqual(len(entry.data), 16)
+
+    def test_function_target_in_engine(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.add_function_target("parse", 0x08001000, 0x20000400)
+        eng._snapshot_name = "__fuzz_fn"
+        emu.save_snapshot("__fuzz_fn")
+        emu.coverage_enabled = True
+        eng.seed(42)
+        eng.run(iterations=3, steps_per_iter=100)
+        self.assertEqual(eng.stats.iterations, 3)
 
 
 # ── FuzzStats Tests ────────────────────────────────────────────────
@@ -588,11 +724,9 @@ class FuzzShellCommandTests(unittest.TestCase):
 
     def test_fuzz_setup(self):
         out = self.cmds.cmd_fuzz(["setup"])
-        # No real targets in our fake bus
         self.assertIn("fuzz setup:", out)
 
     def test_fuzz_config_min_len(self):
-        # Ensure engine is created
         self.cmds.cmd_fuzz(["setup"])
         out = self.cmds.cmd_fuzz(["config", "min_len", "8"])
         self.assertIn("min_input_len = 8", out)
@@ -601,6 +735,11 @@ class FuzzShellCommandTests(unittest.TestCase):
         self.cmds.cmd_fuzz(["setup"])
         out = self.cmds.cmd_fuzz(["config", "mode", "round_robin"])
         self.assertIn("mode = round_robin", out)
+
+    def test_fuzz_config_mode_all(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["config", "mode", "all"])
+        self.assertIn("mode = all", out)
 
     def test_fuzz_config_invalid_mode(self):
         self.cmds.cmd_fuzz(["setup"])
@@ -667,6 +806,28 @@ class FuzzShellCommandTests(unittest.TestCase):
         self.cmds.cmd_fuzz(["setup"])
         out = self.cmds.cmd_fuzz(["import", "/nonexistent/dir"])
         self.assertIn("not a directory", out)
+
+    def test_fuzz_target_memory(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["target", "memory", "PARSE_BUF", "0x20000100", "r1"])
+        self.assertIn("memory target", out)
+        self.assertIn("PARSE_BUF", out)
+
+    def test_fuzz_target_function(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["target", "function", "parse_pkt", "0x08001000", "0x20000400"])
+        self.assertIn("function target", out)
+        self.assertIn("parse_pkt", out)
+
+    def test_fuzz_target_usage(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["target"])
+        self.assertIn("usage:", out)
+
+    def test_fuzz_target_invalid_kind(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["target", "invalid", "x", "0x0"])
+        self.assertIn("usage:", out)
 
 
 if __name__ == "__main__":
