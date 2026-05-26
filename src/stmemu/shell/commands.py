@@ -2983,6 +2983,7 @@ class Commands:
             "fuzz dict <token_hex> | fuzz config <key> <value> | "
             "fuzz target memory <name> <addr> [size_reg] | "
             "fuzz target function <name> <entry_addr> <buffer_addr> | "
+            "fuzz replay <index> [steps] [trace] | "
             "fuzz export findings <file> | fuzz export corpus <dir> | "
             "fuzz import <dir> | fuzz reset"
         )
@@ -3047,6 +3048,11 @@ class Commands:
             if len(argv) != 3:
                 return "usage: fuzz config <key> <value>"
             return self._fuzz_config(argv[1], argv[2])
+
+        if sub == "replay":
+            if len(argv) < 2:
+                return "usage: fuzz replay <index> [steps] [trace]"
+            return self._fuzz_replay(argv[1:])
 
         if sub == "export":
             if len(argv) < 3:
@@ -3226,7 +3232,31 @@ class Commands:
                 eng.target_filter = []
             eng.target_filter.append(value)
             return f"target filter: {eng.target_filter}"
-        return f"unknown config key: {key} (valid: min_len, max_len, max_mutations, mode, seed, target)"
+        if key_lower == "capture_mmio":
+            eng.capture_mmio = value.lower() in ("on", "true", "1", "yes")
+            return f"capture_mmio = {'on' if eng.capture_mmio else 'off'}"
+        return f"unknown config key: {key} (valid: min_len, max_len, max_mutations, mode, seed, target, capture_mmio)"
+
+    def _fuzz_replay(self, argv: list[str]) -> str:
+        self._ensure_fuzz_engine()
+        eng = self._fuzz_engine
+        if not eng._snapshot_name:
+            return "error: run 'fuzz setup' first"
+
+        idx = _int(argv[0])
+        steps = 5000
+        enable_trace = False
+        for tok in argv[1:]:
+            if tok.lower() == "trace":
+                enable_trace = True
+            else:
+                steps = _int(tok)
+
+        try:
+            result = eng.replay(idx, steps=steps, enable_trace=enable_trace)
+        except (IndexError, RuntimeError) as e:
+            return f"error: {e}"
+        return eng.format_replay(result)
 
     def _fuzz_export(self, what: str, path_str: str) -> str:
         self._ensure_fuzz_engine()

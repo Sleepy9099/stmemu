@@ -64,7 +64,7 @@ if "stmemu.core.emulator" not in sys.modules:
 
 from stmemu.fuzz.mutator import Mutator
 from stmemu.fuzz.injector import Injector, InjectionTarget, FunctionTargetConfig
-from stmemu.fuzz.engine import FuzzEngine, FuzzStats, CorpusEntry, FuzzFinding
+from stmemu.fuzz.engine import FuzzEngine, FuzzStats, CorpusEntry, FuzzFinding, IterationTrace
 from stmemu.core.symbols import SymbolTable
 from stmemu.core.semihosting import SemihostingHandler
 
@@ -902,6 +902,168 @@ class FuzzEngineTests(unittest.TestCase):
         self.assertEqual(eng.stats.iterations, 2)
         self.assertEqual(eng.stats.hangs, 0)
 
+    def test_crash_finding_has_trace(self):
+        eng, emu, uart = self._make_engine()
+        def crash_run(emu_ref, count):
+            emu_ref._coverage.add(0x08000200)
+            emu_ref._pc_hist[0x08000200] = 10
+            raise RuntimeError("HardFault")
+        emu._run_callback = crash_run
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+        self.assertEqual(len(eng.findings), 1)
+        finding = eng.findings[0]
+        self.assertIsNotNone(finding.trace)
+        self.assertIn("pc", finding.trace.regs)
+        self.assertGreater(len(finding.trace.pc_freq), 0)
+        self.assertIn(0x08000200, finding.trace.new_pcs)
+
+    def test_new_coverage_finding_has_trace(self):
+        eng, emu, uart = self._make_engine()
+        call_count = [0]
+        def coverage_run(emu_ref, count):
+            call_count[0] += 1
+            emu_ref._coverage.add(0x08000100 + call_count[0] * 2)
+        emu._run_callback = coverage_run
+        eng.seed(42)
+        eng.run(iterations=3, steps_per_iter=100)
+        cov_findings = [f for f in eng.findings if f.kind == "new_coverage"]
+        self.assertGreater(len(cov_findings), 0)
+        for f in cov_findings:
+            self.assertIsNotNone(f.trace)
+
+    def test_trace_to_dict(self):
+        trace = IterationTrace(
+            regs={"r0": 1, "pc": 0x08000100},
+            pc_freq=((0x08000100, 5),),
+            new_pcs=(0x08000200,),
+            mmio_log=(("r", 0x40004400, 4, 0x01),),
+        )
+        d = trace.to_dict()
+        self.assertIn("regs", d)
+        self.assertIn("pc_freq", d)
+        self.assertIn("new_pcs", d)
+        self.assertIn("mmio_log", d)
+        self.assertEqual(len(d["mmio_log"]), 1)
+
+    def test_mmio_capture(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        uart = _FakeUartModel()
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.targets = [
+            InjectionTarget(name="USART1", kind="uart", model=uart)
+        ]
+        eng._snapshot_name = "__fuzz_mmio"
+        emu.save_snapshot("__fuzz_mmio")
+        emu.coverage_enabled = True
+        eng.capture_mmio = True
+
+        def mmio_run(emu_ref, count):
+            emu_ref._coverage.add(0x08000300)
+            bus.read(0x40004400, 4)
+            bus.write(0x40004404, 4, 0x80)
+
+        emu._run_callback = mmio_run
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+        cov_findings = [f for f in eng.findings if f.kind == "new_coverage"]
+        self.assertGreater(len(cov_findings), 0)
+        trace = cov_findings[0].trace
+        self.assertIsNotNone(trace)
+        self.assertIsNotNone(trace.mmio_log)
+        self.assertGreater(len(trace.mmio_log), 0)
+        kinds = [entry[0] for entry in trace.mmio_log]
+        self.assertIn("r", kinds)
+        self.assertIn("w", kinds)
+
+    def test_replay_crash(self):
+        eng, emu, uart = self._make_engine()
+        crash_count = [0]
+        def crash_run(emu_ref, count):
+            crash_count[0] += 1
+            emu_ref._coverage.add(0x08000200)
+            emu_ref._pc_hist[0x08000200] = 5
+            if crash_count[0] <= 2:
+                raise RuntimeError("HardFault")
+        emu._run_callback = crash_run
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+        self.assertEqual(len(eng.findings), 1)
+
+        result = eng.replay(0, steps=100)
+        self.assertIn("finding_index", result)
+        self.assertEqual(result["finding_index"], 0)
+        self.assertTrue(result["crashed"])
+        self.assertIsNotNone(result["trace"])
+        self.assertIsNotNone(result["trace"].regs)
+
+    def test_replay_format(self):
+        eng, emu, uart = self._make_engine()
+        def crash_run(emu_ref, count):
+            emu_ref._coverage.add(0x08000200)
+            raise RuntimeError("boom")
+        emu._run_callback = crash_run
+        eng.seed(42)
+        eng.run(iterations=1, steps_per_iter=100)
+
+        result = eng.replay(0, steps=100)
+        text = eng.format_replay(result)
+        self.assertIn("replay finding #0", text)
+        self.assertIn("CRASH", text)
+        self.assertIn("regs:", text)
+
+    def test_replay_out_of_range(self):
+        eng, emu, uart = self._make_engine()
+        with self.assertRaises(IndexError):
+            eng.replay(99)
+
+    def test_replay_no_setup(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        eng.findings.append(FuzzFinding(
+            iteration=1, kind="crash", input_data=b"\x01",
+            target_name="X", target_kind="uart",
+            new_pcs=0, detail="boom",
+        ))
+        with self.assertRaises(RuntimeError):
+            eng.replay(0)
+
+    def test_export_includes_trace(self):
+        eng, emu, uart = self._make_engine()
+        trace = IterationTrace(
+            regs={"pc": 0x08000200},
+            pc_freq=((0x08000200, 10),),
+            new_pcs=(0x08000200,),
+        )
+        eng.findings.append(FuzzFinding(
+            iteration=1, kind="crash", input_data=b"\xDE\xAD",
+            target_name="USART1", target_kind="uart",
+            new_pcs=1, detail="boom", trace=trace,
+        ))
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "findings.json"
+            eng.export_findings(path)
+            data = json.loads(path.read_text())
+            self.assertIn("trace", data[0])
+            self.assertIn("regs", data[0]["trace"])
+            self.assertIn("pc_freq", data[0]["trace"])
+
+    def test_findings_show_trace_tag(self):
+        eng, emu, uart = self._make_engine()
+        trace = IterationTrace(
+            regs={"pc": 0x08000200}, pc_freq=(), new_pcs=(),
+        )
+        eng.findings.append(FuzzFinding(
+            iteration=1, kind="crash", input_data=b"\x01",
+            target_name="USART1", target_kind="uart",
+            new_pcs=0, detail="boom", trace=trace,
+        ))
+        text = eng.format_findings()
+        self.assertIn("[trace]", text)
+
 
 # ── FuzzStats Tests ────────────────────────────────────────────────
 
@@ -1097,6 +1259,26 @@ class FuzzShellCommandTests(unittest.TestCase):
             "notakeyvalue",
         ])
         self.assertIn("expected key=value", out)
+
+    def test_fuzz_replay_no_findings(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["replay", "0"])
+        self.assertIn("error:", out)
+
+    def test_fuzz_replay_no_setup(self):
+        out = self.cmds.cmd_fuzz(["replay", "0"])
+        self.assertIn("error:", out)
+
+    def test_fuzz_config_capture_mmio(self):
+        self.cmds.cmd_fuzz(["setup"])
+        out = self.cmds.cmd_fuzz(["config", "capture_mmio", "on"])
+        self.assertIn("capture_mmio = on", out)
+        out = self.cmds.cmd_fuzz(["config", "capture_mmio", "off"])
+        self.assertIn("capture_mmio = off", out)
+
+    def test_fuzz_replay_usage(self):
+        out = self.cmds.cmd_fuzz(["replay"])
+        self.assertIn("usage:", out)
 
 
 if __name__ == "__main__":
