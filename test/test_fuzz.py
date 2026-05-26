@@ -694,6 +694,32 @@ class FuzzEngineTests(unittest.TestCase):
         eng.run(iterations=3, steps_per_iter=100)
         self.assertEqual(eng.stats.iterations, 3)
 
+    def test_targets_persist_across_setup(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.add_memory_target("BUF", 0x20000100, size_reg="r1")
+        eng.injector.add_function_target("parse", 0x08001000, 0x20000400)
+        self.assertEqual(len(eng.injector.targets), 2)
+
+        result = eng.setup(snapshot_name="__persist_test")
+        kinds = [t.kind for t in eng.injector.targets]
+        self.assertIn("memory", kinds)
+        self.assertIn("function", kinds)
+        self.assertNotIn("no injectable targets", result)
+
+    def test_setup_twice_preserves_manual_targets(self):
+        emu = _FakeEmu()
+        bus = _FakeBus()
+        eng = FuzzEngine(emu=emu, bus=bus)
+        eng.injector = Injector(bus=bus, emu=emu)
+        eng.injector.add_function_target("fn", 0x08002000, 0x20000800)
+        eng.setup(snapshot_name="__s1")
+        eng.setup(snapshot_name="__s2")
+        kinds = [t.kind for t in eng.injector.targets]
+        self.assertIn("function", kinds)
+
 
 # ── FuzzStats Tests ────────────────────────────────────────────────
 
@@ -828,6 +854,17 @@ class FuzzShellCommandTests(unittest.TestCase):
         self.cmds.cmd_fuzz(["setup"])
         out = self.cmds.cmd_fuzz(["target", "invalid", "x", "0x0"])
         self.assertIn("usage:", out)
+
+    def test_fuzz_target_before_setup_persists(self):
+        self.cmds.cmd_fuzz(["target", "function", "parse", "0x08001000", "0x20000400"])
+        self.cmds.cmd_fuzz(["target", "memory", "BUF", "0x20000100"])
+        out = self.cmds.cmd_fuzz(["setup"])
+        self.assertIn("fuzz setup:", out)
+        targets_out = self.cmds.cmd_fuzz(["targets"])
+        self.assertIn("function", targets_out)
+        self.assertIn("memory", targets_out)
+        self.assertIn("parse", targets_out)
+        self.assertIn("BUF", targets_out)
 
 
 if __name__ == "__main__":

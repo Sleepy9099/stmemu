@@ -91,7 +91,10 @@ class FuzzEngine:
         self._snapshot_name = snapshot_name
         self.emu.save_snapshot(snapshot_name)
 
-        self.injector = Injector(bus=self.bus, emu=self.emu)
+        if self.injector is None:
+            self.injector = Injector(bus=self.bus, emu=self.emu)
+        else:
+            self.injector.emu = self.emu
         self.injector.discover_targets()
 
         if self.target_filter:
