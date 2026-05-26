@@ -88,6 +88,7 @@ class PeripheralBus:
         self.mmio_log_enabled = False
         self.access_policy: AccessPolicy = "permissive"
         self._rcc_model: object | None = None
+        self._emulator: object | None = None
 
     def register_peripheral(self, name: str, model: PeripheralModel) -> None:
         p = self.amap.find_peripheral_by_name(name)
@@ -144,6 +145,14 @@ class PeripheralBus:
                     peripheral=mounted.peripheral,
                 )
             )
+
+    def set_clock_controller(self, model: PeripheralModel) -> None:
+        """Register the RCC (or equivalent) model for clock-gating policy checks."""
+        self._rcc_model = model
+
+    def set_emulator(self, emu: object) -> None:
+        """Attach the emulator instance so peripherals (e.g. DMA) can access memory."""
+        self._emulator = emu
 
     def mounted_ranges(self) -> tuple[MountedPeripheral, ...]:
         return tuple(self._mounted)

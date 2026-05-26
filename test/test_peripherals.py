@@ -483,7 +483,7 @@ class BusAccessPolicyTests(unittest.TestCase):
         gpio = GpioPeripheral(gpio_svd)
         bus.register_peripheral("RCC", rcc)
         bus.register_peripheral("GPIOA", gpio)
-        bus._rcc_model = rcc
+        bus.set_clock_controller(rcc)
         return bus, rcc, gpio
 
     def test_permissive_allows_all(self):

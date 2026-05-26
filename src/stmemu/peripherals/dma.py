@@ -177,12 +177,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
     def _get_emulator(self) -> object | None:
         if not self._context:
             return None
-        bus = self._context.bus
-        for mounted in bus.mounted_ranges():
-            emu = getattr(mounted.model, "emu", None)
-            if emu is not None and hasattr(emu, "mem_read"):
-                return emu
-        return getattr(bus, "_emulator", None)
+        return getattr(self._context.bus, "_emulator", None)
 
     def reset(self) -> None:
         super().reset()

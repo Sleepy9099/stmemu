@@ -161,7 +161,7 @@ def build_default_bus(
         model = registry.build(peripheral)
         bus.register_peripheral(peripheral.name, model)
         if peripheral.name.upper() == "RCC":
-            bus._rcc_model = model
+            bus.set_clock_controller(model)
 
     bus.mount(
         name=core.name,
