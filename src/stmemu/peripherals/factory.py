@@ -158,7 +158,10 @@ def build_default_bus(
     bus.set_interrupt_controller(core)
 
     for peripheral in amap.peripherals:
-        bus.register_peripheral(peripheral.name, registry.build(peripheral))
+        model = registry.build(peripheral)
+        bus.register_peripheral(peripheral.name, model)
+        if peripheral.name.upper() == "RCC":
+            bus._rcc_model = model
 
     bus.mount(
         name=core.name,

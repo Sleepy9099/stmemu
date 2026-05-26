@@ -456,5 +456,139 @@ class SysTickValTests(unittest.TestCase):
         )
 
 
+# ── Bus access policy tests ──────────────────────────────────────
+
+
+class BusAccessPolicyTests(unittest.TestCase):
+    def _make_bus_with_rcc(self):
+        from stmemu.peripherals.bus import PeripheralBus
+        from stmemu.svd.address_map import AddressMap, AddressRange
+
+        rcc_svd = SvdPeripheral(
+            name="RCC", base_address=0x40023800, size=0x400,
+            registers=_RCC_REGS, interrupts=(),
+        )
+        gpio_svd = SvdPeripheral(
+            name="GPIOA", base_address=0x40020000, size=0x400,
+            registers=_GPIO_REGS, interrupts=(),
+        )
+        ranges = (
+            AddressRange(base=0x40020000, end=0x40020400, peripheral=gpio_svd),
+            AddressRange(base=0x40023800, end=0x40023C00, peripheral=rcc_svd),
+        )
+        amap = AddressMap(device_name="TEST", peripherals=(rcc_svd, gpio_svd), ranges=ranges)
+        bus = PeripheralBus(amap)
+
+        rcc = RccPeripheral(rcc_svd)
+        gpio = GpioPeripheral(gpio_svd)
+        bus.register_peripheral("RCC", rcc)
+        bus.register_peripheral("GPIOA", gpio)
+        bus._rcc_model = rcc
+        return bus, rcc, gpio
+
+    def test_permissive_allows_all(self):
+        bus, rcc, gpio = self._make_bus_with_rcc()
+        bus.access_policy = "permissive"
+        bus.write(0x40020018, 4, 0x01)
+        val = bus.read(0x40020014, 4)
+        self.assertTrue(val & 1)
+
+    def test_warn_allows_but_logs(self):
+        bus, rcc, gpio = self._make_bus_with_rcc()
+        bus.access_policy = "warn"
+        rcc.write(0x30, 4, 0)  # no peripherals enabled
+        bus.write(0x40020018, 4, 0x01)
+        val = bus.read(0x40020014, 4)
+        self.assertTrue(val & 1)
+
+    def test_strict_blocks_disabled_peripheral(self):
+        bus, rcc, gpio = self._make_bus_with_rcc()
+        bus.access_policy = "strict"
+        rcc.write(0x30, 4, 0)  # explicitly disable all
+        bus.write(0x40020018, 4, 0x01)
+        val = bus.read(0x40020014, 4)
+        self.assertEqual(val, 0, "strict mode should return 0 for disabled peripheral")
+
+    def test_strict_allows_enabled_peripheral(self):
+        bus, rcc, gpio = self._make_bus_with_rcc()
+        bus.access_policy = "strict"
+        rcc.write(0x30, 4, 1 << 0)  # GPIOAEN
+        bus.write(0x40020018, 4, 0x01)
+        val = bus.read(0x40020014, 4)
+        self.assertTrue(val & 1)
+
+    def test_strict_allows_rcc_itself(self):
+        bus, rcc, _ = self._make_bus_with_rcc()
+        bus.access_policy = "strict"
+        val = bus.read(0x40023800, 4)
+        self.assertIsNotNone(val)
+
+    def test_permissive_before_enr_write(self):
+        bus, rcc, gpio = self._make_bus_with_rcc()
+        bus.access_policy = "strict"
+        bus.write(0x40020018, 4, 0x01)
+        val = bus.read(0x40020014, 4)
+        self.assertTrue(val & 1, "before ENR write, should be permissive")
+
+
+# ── DMA transfer tests ───────────────────────────────────────────
+
+
+class DmaTransferTests(unittest.TestCase):
+    def test_auto_complete_sets_tcif(self):
+        dma = DmaPeripheral(
+            _make_peripheral("DMA1", (
+                SvdRegister(name="LISR", offset=0x00),
+                SvdRegister(name="HISR", offset=0x04),
+                SvdRegister(name="LIFCR", offset=0x08),
+                SvdRegister(name="HIFCR", offset=0x0C),
+            ))
+        )
+        dma.write(0x10, 4, 0x01)  # Enable stream 0
+        lisr = dma.read(0x00, 4)
+        self.assertTrue(lisr & (1 << 5), "TCIF0 should be set")
+
+    def test_auto_complete_clears_en(self):
+        dma = DmaPeripheral(
+            _make_peripheral("DMA1", (
+                SvdRegister(name="LISR", offset=0x00),
+                SvdRegister(name="HISR", offset=0x04),
+                SvdRegister(name="LIFCR", offset=0x08),
+                SvdRegister(name="HIFCR", offset=0x0C),
+            ))
+        )
+        dma.write(0x10, 4, 0x01)
+        cr = dma.read(0x10, 4)
+        self.assertFalse(cr & 1, "EN should be cleared after completion")
+
+    def test_ifcr_clears_isr(self):
+        dma = DmaPeripheral(
+            _make_peripheral("DMA1", (
+                SvdRegister(name="LISR", offset=0x00),
+                SvdRegister(name="HISR", offset=0x04),
+                SvdRegister(name="LIFCR", offset=0x08),
+                SvdRegister(name="HIFCR", offset=0x0C),
+            ))
+        )
+        dma.write(0x10, 4, 0x01)
+        dma.write(0x08, 4, 1 << 5)  # Clear TCIF0
+        lisr = dma.read(0x00, 4)
+        self.assertFalse(lisr & (1 << 5))
+
+    def test_ndtr_cleared_on_complete(self):
+        dma = DmaPeripheral(
+            _make_peripheral("DMA1", (
+                SvdRegister(name="LISR", offset=0x00),
+                SvdRegister(name="HISR", offset=0x04),
+                SvdRegister(name="LIFCR", offset=0x08),
+                SvdRegister(name="HIFCR", offset=0x0C),
+            ))
+        )
+        dma.write_register_value(0x14, 100)  # NDTR=100
+        dma.write(0x10, 4, 0x01)  # Enable
+        ndtr = dma.read(0x14, 4)
+        self.assertEqual(ndtr, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from stmemu.utils.logger import get_logger
 log = get_logger(__name__)
 
 AccessType = Literal["r", "w", "rw"]
+AccessPolicy = Literal["permissive", "warn", "strict"]
 
 
 class InterruptController(Protocol):
@@ -85,6 +86,8 @@ class PeripheralBus:
         self._mounted: list[MountedPeripheral] = []
         self._interrupts: Optional[InterruptController] = None
         self.mmio_log_enabled = False
+        self.access_policy: AccessPolicy = "permissive"
+        self._rcc_model: object | None = None
 
     def register_peripheral(self, name: str, model: PeripheralModel) -> None:
         p = self.amap.find_peripheral_by_name(name)
@@ -182,6 +185,9 @@ class PeripheralBus:
         mounted = self._mount_for_addr(addr)
         if mounted is None:
             raise KeyError(f"no peripheral for addr 0x{addr:08X}")
+        blocked = self._check_clock_policy(mounted, "R")
+        if blocked:
+            return 0
         offset = addr - mounted.base
         val = mounted.model.read(offset, size)
         if self.mmio_log_enabled:
@@ -193,11 +199,40 @@ class PeripheralBus:
         mounted = self._mount_for_addr(addr)
         if mounted is None:
             raise KeyError(f"no peripheral for addr 0x{addr:08X}")
+        blocked = self._check_clock_policy(mounted, "W")
+        if blocked:
+            return
         offset = addr - mounted.base
         if self.mmio_log_enabled:
             rname = self._describe_access(mounted, addr)
             log.info("MMIO W  %s.%s [0x%08X size=%d] <- 0x%X", mounted.name, rname, addr, size, value)
         mounted.model.write(offset, size, value)
+
+    def _check_clock_policy(self, mounted: MountedPeripheral, access: str) -> bool:
+        """Return True if access should be blocked (strict mode only)."""
+        if self.access_policy == "permissive":
+            return False
+        rcc = self._rcc_model
+        if rcc is None:
+            return False
+        if not hasattr(rcc, "is_peripheral_enabled"):
+            return False
+        name = mounted.name.upper()
+        if name in ("RCC", "PWR", "CORE", "SYSMEM", "FLASH"):
+            return False
+        if rcc.is_peripheral_enabled(name):
+            return False
+        if self.access_policy == "warn":
+            log.warning(
+                "MMIO %s %s [0x%08X] — peripheral clock not enabled",
+                access, name, mounted.base,
+            )
+            return False
+        log.error(
+            "MMIO %s %s [0x%08X] BLOCKED — peripheral clock not enabled",
+            access, name, mounted.base,
+        )
+        return True
 
     def _mount_for_addr(self, addr: int) -> Optional[MountedPeripheral]:
         for mounted in self._mounted:
