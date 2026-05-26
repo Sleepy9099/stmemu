@@ -233,6 +233,9 @@ class UbloxGpsDevice(ExternalDevice):
     def _send_nak(self, cls: int, msg_id: int) -> None:
         self._tx_buf.extend(ubx_frame(UBX_ACK, ACK_NAK, bytes([cls, msg_id])))
 
+    def pending_tx_len(self) -> int:
+        return len(self._tx_buf)
+
     def snapshot_state(self) -> object | None:
         return {
             "mode": self.mode,

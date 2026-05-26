@@ -3486,10 +3486,7 @@ class Commands:
             for attr in ("mode", "lat", "lon", "alt", "fix_type", "sats", "rate_cycles"):
                 if hasattr(dev, attr):
                     parts.append(f"  {attr}={getattr(dev, attr)}")
-            tx_pending = len(dev.read_tx_to_mcu(0)) if hasattr(dev, "_tx_buf") else 0
-            if hasattr(dev, "_tx_buf"):
-                tx_pending = len(dev._tx_buf)
-            parts.append(f"  tx_pending={tx_pending}")
+            parts.append(f"  tx_pending={dev.pending_tx_len()}")
             result.append("\n".join(parts))
         return "\n".join(result)
 

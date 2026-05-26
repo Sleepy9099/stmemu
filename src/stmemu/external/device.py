@@ -22,6 +22,10 @@ class ExternalDevice:
         del max_bytes
         return b""
 
+    def pending_tx_len(self) -> int:
+        """Number of bytes queued for transmission to the MCU."""
+        return 0
+
     def snapshot_state(self) -> object | None:
         return None
 
