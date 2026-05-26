@@ -2,7 +2,39 @@
 from __future__ import annotations
 
 import struct
+import sys
+import types
 import unittest
+
+# ── Stub external dependencies for shell command tests ───────────
+
+if "capstone" not in sys.modules:
+    _cs = types.ModuleType("capstone")
+    class _Cs:
+        def __init__(self, *a, **k): self.detail = False
+        def disasm(self, code, addr, count=0): return []
+    _cs.Cs = _Cs
+    _cs.CS_ARCH_ARM = 0
+    _cs.CS_MODE_THUMB = 0
+    sys.modules["capstone"] = _cs
+
+if "unicorn" not in sys.modules:
+    _uc = types.ModuleType("unicorn")
+    _uc_const = types.ModuleType("unicorn.unicorn_const")
+    _uc_const.UC_HOOK_CODE = 0
+    _uc.unicorn_const = _uc_const
+    sys.modules["unicorn"] = _uc
+    sys.modules["unicorn.unicorn_const"] = _uc_const
+
+if "stmemu.core.emulator" not in sys.modules:
+    _emu = types.ModuleType("stmemu.core.emulator")
+    class _PcRegWrite:
+        pass
+    class _Emulator:
+        pass
+    _emu.PcRegWrite = _PcRegWrite
+    _emu.Emulator = _Emulator
+    sys.modules["stmemu.core.emulator"] = _emu
 
 from stmemu.external.device import ExternalDevice
 from stmemu.external.serial_line import SerialLine
@@ -334,6 +366,227 @@ class UbloxSerialIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed[0], UBX_NAV)
         self.assertEqual(parsed[1], NAV_PVT)
+
+
+# ── Bus serial line integration ──────────────────────────────────
+
+
+class _FakeBusWithLines:
+    """Minimal bus fake that supports serial lines and model lookup."""
+    def __init__(self):
+        self._serial_lines: dict[str, object] = {}
+        self._models: dict[str, object] = {}
+        self._mounted: list[object] = []
+
+    def attach_serial_line(self, line):
+        self._serial_lines[line.name] = line
+
+    def detach_serial_line(self, name):
+        return self._serial_lines.pop(name, None) is not None
+
+    def serial_lines(self):
+        return dict(self._serial_lines)
+
+    def model_for_name(self, name):
+        return self._models.get(name.upper())
+
+    def mounted_ranges(self):
+        return tuple(self._mounted)
+
+    def tick(self, cycles):
+        for line in self._serial_lines.values():
+            line.tick(cycles)
+
+    def snapshot_models_state(self):
+        states = {}
+        for name, line in self._serial_lines.items():
+            state = line.snapshot_state()
+            if state is not None:
+                states[f"__line__{name}"] = state
+        return states
+
+    def restore_models_state(self, states):
+        for name, line in self._serial_lines.items():
+            key = f"__line__{name}"
+            if key in states:
+                line.restore_state(states[key])
+
+
+class BusSerialLineTests(unittest.TestCase):
+    def test_bus_tick_ticks_serial_lines(self):
+        bus = _FakeBusWithLines()
+        uart = _FakeUart()
+        gps = UbloxGpsDevice(mode="nmea", rate_cycles=50)
+        line = SerialLine("gps0", uart=uart, device=gps)
+        bus.attach_serial_line(line)
+        bus.tick(50)
+        self.assertIn(b"$GPGGA,", bytes(uart._rx))
+
+    def test_bus_snapshot_restore_serial_lines(self):
+        bus = _FakeBusWithLines()
+        uart = _FakeUart()
+        gps = UbloxGpsDevice(mode="nmea", rate_cycles=1000)
+        gps._time_seconds = 50000
+        line = SerialLine("gps0", uart=uart, device=gps)
+        bus.attach_serial_line(line)
+
+        states = bus.snapshot_models_state()
+        gps._time_seconds = 99999
+        bus.restore_models_state(states)
+        self.assertEqual(gps._time_seconds, 50000)
+
+    def test_bus_detach_serial_line(self):
+        bus = _FakeBusWithLines()
+        uart = _FakeUart()
+        gps = UbloxGpsDevice(mode="nmea", rate_cycles=50)
+        line = SerialLine("gps0", uart=uart, device=gps)
+        bus.attach_serial_line(line)
+        self.assertEqual(len(bus.serial_lines()), 1)
+        self.assertTrue(bus.detach_serial_line("gps0"))
+        self.assertEqual(len(bus.serial_lines()), 0)
+        self.assertFalse(bus.detach_serial_line("gps0"))
+
+
+# ── Shell device command tests ───────────────────────────────────
+
+
+class _FakeMountedUart:
+    def __init__(self, name, model):
+        self.name = name
+        self.model = model
+        self.base = 0x40004400
+        self.end = 0x40004800
+
+
+class _ShellBus:
+    """Minimal bus for shell command tests."""
+    def __init__(self, models=None):
+        self._models = {k.upper(): v for k, v in (models or {}).items()}
+        self._serial_lines: dict[str, object] = {}
+        self._mounted = [
+            _FakeMountedUart(n, m) for n, m in self._models.items()
+        ]
+
+    def model_for_name(self, name):
+        return self._models.get(name.upper())
+
+    def mounted_ranges(self):
+        return tuple(self._mounted)
+
+    def serial_lines(self):
+        return dict(self._serial_lines)
+
+    def attach_serial_line(self, line):
+        self._serial_lines[line.name] = line
+
+    def detach_serial_line(self, name):
+        return self._serial_lines.pop(name, None) is not None
+
+    def snapshot_models_state(self):
+        return {}
+
+    def restore_models_state(self, states):
+        pass
+
+    def read(self, addr, size):
+        return 0
+
+    def write(self, addr, size, value):
+        pass
+
+
+class DeviceShellCommandTests(unittest.TestCase):
+    def setUp(self):
+        from stmemu.shell.commands import Commands
+        from stmemu.core.symbols import SymbolTable
+        from stmemu.core.semihosting import SemihostingHandler
+
+        self.uart = _FakeUart()
+        self.bus = _ShellBus({"USART1": self.uart})
+
+        class _FakeEmu:
+            symbols = SymbolTable()
+            semihosting = SemihostingHandler()
+            coverage_enabled = False
+            _coverage = set()
+            _coverage_hits = {}
+            flash_base = 0x08000000
+            flash_end = 0x08010000
+            pc = 0x08000100
+        self.emu = _FakeEmu()
+        self.cmds = Commands(emu=self.emu, bus=self.bus)
+
+    def test_device_list_empty(self):
+        out = self.cmds.cmd_device([])
+        self.assertIn("usage:", out)
+
+    def test_device_list_no_devices(self):
+        out = self.cmds.cmd_device(["list"])
+        self.assertIn("no external devices", out)
+
+    def test_device_attach_ublox(self):
+        out = self.cmds.cmd_device(["attach", "uart", "USART1", "ublox"])
+        self.assertIn("attached", out)
+        self.assertIn("USART1", out)
+        self.assertEqual(len(self.bus.serial_lines()), 1)
+
+    def test_device_attach_with_options(self):
+        out = self.cmds.cmd_device([
+            "attach", "uart", "USART1", "ublox",
+            "mode=ubx", "lat=51.5", "name=gps0",
+        ])
+        self.assertIn("attached", out)
+        self.assertIn("gps0", out)
+        lines = self.bus.serial_lines()
+        self.assertIn("gps0", lines)
+
+    def test_device_attach_unknown_type(self):
+        out = self.cmds.cmd_device(["attach", "uart", "USART1", "bogus"])
+        self.assertIn("unknown device type", out)
+
+    def test_device_attach_unknown_peripheral(self):
+        out = self.cmds.cmd_device(["attach", "uart", "USART99", "ublox"])
+        self.assertIn("unknown peripheral", out)
+
+    def test_device_list_after_attach(self):
+        self.cmds.cmd_device(["attach", "uart", "USART1", "ublox", "name=gps0"])
+        out = self.cmds.cmd_device(["list"])
+        self.assertIn("gps0", out)
+        self.assertIn("UbloxGpsDevice", out)
+
+    def test_device_status(self):
+        self.cmds.cmd_device(["attach", "uart", "USART1", "ublox", "name=gps0"])
+        out = self.cmds.cmd_device(["status", "gps0"])
+        self.assertIn("UbloxGpsDevice", out)
+        self.assertIn("mode=", out)
+
+    def test_device_status_unknown(self):
+        out = self.cmds.cmd_device(["status", "bogus"])
+        self.assertIn("unknown device", out)
+
+    def test_device_inject(self):
+        self.cmds.cmd_device(["attach", "uart", "USART1", "ublox", "name=gps0", "mode=ubx"])
+        cmd = ubx_frame(UBX_CFG, CFG_MSG, b"\x01\x07\x01")
+        out = self.cmds.cmd_device(["inject", "gps0", cmd.hex()])
+        self.assertIn("injected", out)
+
+    def test_device_inject_unknown(self):
+        out = self.cmds.cmd_device(["inject", "bogus", "AABB"])
+        self.assertIn("unknown device", out)
+
+    def test_device_detach(self):
+        self.cmds.cmd_device(["attach", "uart", "USART1", "ublox", "name=gps0"])
+        out = self.cmds.cmd_device(["detach", "gps0"])
+        self.assertIn("detached", out)
+        self.assertEqual(len(self.bus.serial_lines()), 0)
+
+    def test_device_detach_unknown(self):
+        out = self.cmds.cmd_device(["detach", "bogus"])
+        self.assertIn("unknown device", out)
+
+    def test_device_types(self):
+        out = self.cmds.cmd_device(["types"])
+        self.assertIn("ublox", out)
 
 
 if __name__ == "__main__":

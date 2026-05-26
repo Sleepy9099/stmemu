@@ -3346,3 +3346,169 @@ class Commands:
         self._ensure_fuzz_engine()
         self._fuzz_engine.reset()
         return "fuzzer state reset"
+
+    # ── External device commands ──────────────────────────────────
+
+    def _get_device_types(self) -> dict[str, type]:
+        if not hasattr(Commands, "_device_types_cache"):
+            from stmemu.external.ublox import UbloxGpsDevice
+            Commands._device_types_cache = {
+                "ublox": UbloxGpsDevice,
+                "ublox-gps": UbloxGpsDevice,
+            }
+        return Commands._device_types_cache
+
+    def cmd_device(self, argv: list[str]) -> str:
+        usage = (
+            "usage: device list | device attach uart <PERIPH> <type> [key=value ...] | "
+            "device status [name] | device inject <name> <hex|@file> | "
+            "device detach <name>"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "list":
+            return self._device_list()
+        if sub == "attach":
+            return self._device_attach(argv[1:])
+        if sub == "status":
+            name = argv[1] if len(argv) > 1 else None
+            return self._device_status(name)
+        if sub == "inject":
+            if len(argv) < 3:
+                return "usage: device inject <name> <hex|@file>"
+            return self._device_inject(argv[1], argv[2])
+        if sub == "detach":
+            if len(argv) != 2:
+                return "usage: device detach <name>"
+            return self._device_detach(argv[1])
+        if sub == "types":
+            _dtypes = self._get_device_types()
+            return "device types: " + ", ".join(sorted(_dtypes))
+        return usage
+
+    def _device_list(self) -> str:
+        lines_dict = self.bus.serial_lines()
+        if not lines_dict:
+            return "(no external devices attached)"
+        lines = [f"{len(lines_dict)} device(s):"]
+        for name, line in lines_dict.items():
+            dev = getattr(line, "device", None)
+            uart = getattr(line, "uart", None)
+            dev_type = type(dev).__name__ if dev else "none"
+            uart_name = "?"
+            for m in self.bus.mounted_ranges():
+                if m.model is uart:
+                    uart_name = m.name
+                    break
+            lines.append(f"  {name:16s} {dev_type:20s} uart={uart_name}")
+        return "\n".join(lines)
+
+    def _device_attach(self, argv: list[str]) -> str:
+        attach_usage = (
+            "usage: device attach uart <PERIPH> <type> [key=value ...]\n"
+            "  types: ublox, ublox-gps"
+        )
+        if len(argv) < 3:
+            return attach_usage
+        transport = argv[0].lower()
+        if transport != "uart":
+            return f"unknown transport: {transport}\n{attach_usage}"
+
+        periph_name = argv[1].upper()
+        dev_type = argv[2].lower()
+
+        _dtypes = self._get_device_types()
+        dev_cls = _dtypes.get(dev_type)
+        if dev_cls is None:
+            return f"unknown device type: {dev_type} (available: {', '.join(sorted(_dtypes))})"
+
+        uart_model = self.bus.model_for_name(periph_name)
+        if uart_model is None:
+            return f"unknown peripheral: {periph_name}"
+        if not hasattr(uart_model, "inject_rx_bytes"):
+            return f"{periph_name} is not a UART peripheral"
+
+        kv: dict[str, str] = {}
+        for tok in argv[3:]:
+            if "=" not in tok:
+                return f"expected key=value, got: {tok!r}"
+            k, v = tok.split("=", 1)
+            kv[k.lower()] = v
+
+        dev = dev_cls()
+        dev.name = kv.pop("name", f"{periph_name.lower()}_{dev_type}")
+        if "mode" in kv:
+            dev.mode = kv.pop("mode")
+        if "lat" in kv:
+            dev.lat = float(kv.pop("lat"))
+        if "lon" in kv:
+            dev.lon = float(kv.pop("lon"))
+        if "alt" in kv:
+            dev.alt = float(kv.pop("alt"))
+        if "rate_cycles" in kv:
+            dev.rate_cycles = _int(kv.pop("rate_cycles"))
+
+        from stmemu.external.serial_line import SerialLine
+        line_name = dev.name
+        line = SerialLine(line_name, uart=uart_model, device=dev)
+        self.bus.attach_serial_line(line)
+
+        parts = [
+            f"attached '{line_name}'",
+            f"type={type(dev).__name__}",
+            f"uart={periph_name}",
+        ]
+        if hasattr(dev, "mode"):
+            parts.append(f"mode={dev.mode}")
+        return " ".join(parts)
+
+    def _device_status(self, name: str | None) -> str:
+        lines_dict = self.bus.serial_lines()
+        if name is not None:
+            line = lines_dict.get(name)
+            if line is None:
+                return f"unknown device: {name}"
+            targets = [(name, line)]
+        elif not lines_dict:
+            return "(no external devices)"
+        else:
+            targets = list(lines_dict.items())
+
+        result = []
+        for lname, line in targets:
+            dev = getattr(line, "device", None)
+            if dev is None:
+                result.append(f"{lname}: no device")
+                continue
+            parts = [f"{lname}: {type(dev).__name__}"]
+            for attr in ("mode", "lat", "lon", "alt", "fix_type", "sats", "rate_cycles"):
+                if hasattr(dev, attr):
+                    parts.append(f"  {attr}={getattr(dev, attr)}")
+            tx_pending = len(dev.read_tx_to_mcu(0)) if hasattr(dev, "_tx_buf") else 0
+            if hasattr(dev, "_tx_buf"):
+                tx_pending = len(dev._tx_buf)
+            parts.append(f"  tx_pending={tx_pending}")
+            result.append("\n".join(parts))
+        return "\n".join(result)
+
+    def _device_inject(self, name: str, data_spec: str) -> str:
+        lines_dict = self.bus.serial_lines()
+        line = lines_dict.get(name)
+        if line is None:
+            return f"unknown device: {name}"
+        dev = getattr(line, "device", None)
+        if dev is None:
+            return f"{name}: no device attached"
+        try:
+            data = self._read_bytes_spec(data_spec)
+        except Exception as e:
+            return f"error: {e}"
+        dev.on_rx_from_mcu(data)
+        return f"injected {len(data)} bytes into {name}"
+
+    def _device_detach(self, name: str) -> str:
+        if self.bus.detach_serial_line(name):
+            return f"detached '{name}'"
+        return f"unknown device: {name}"
