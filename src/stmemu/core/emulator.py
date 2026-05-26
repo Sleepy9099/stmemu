@@ -5,6 +5,8 @@ from typing import Optional, Tuple, List
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.core.disasm import ThumbDisassembler
 from stmemu.core.loader import FirmwareSegment
+from stmemu.core.semihosting import SemihostingHandler, BKPT_SEMIHOST
+from stmemu.core.symbols import SymbolTable
 
 from unicorn import Uc, UcError, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
 from unicorn.arm_const import (
@@ -103,6 +105,9 @@ class EmulatorSnapshot:
     exception_stack: tuple[int, ...]
     exception_return_stack: tuple[int, ...]
     pc_hist: dict[int, int]
+    coverage: frozenset[int] | None = None
+    fault_report: dict[str, object] | None = None
+    mutable_ranges: tuple[tuple[int, int], ...] | None = None
 
 def _u32(b: bytes, off: int) -> int:
     return int.from_bytes(b[off : off + 4], "little", signed=False)
@@ -123,6 +128,8 @@ class Emulator:
     interrupt_stuck_threshold: int = 50000000
     stuck_loop_auto: bool = True
     pc_reg_writes: list[PcRegWrite] = field(default_factory=list)
+    symbols: SymbolTable = field(default_factory=SymbolTable)
+    semihosting: SemihostingHandler = field(default_factory=SemihostingHandler)
 
     def __post_init__(self) -> None:
         self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
@@ -171,6 +178,11 @@ class Emulator:
         self._trace_stop_after_prev: bool = False
         self.pc_reg_writes: List[PcRegWrite] = []
         self._exception_stack: list[int] = []
+        # Code coverage tracking
+        self.coverage_enabled: bool = False
+        self._coverage: set[int] = set()
+        self._coverage_hits: dict[int, int] = {}
+        self._coverage_snapshots: dict[str, set[int]] = {}
         self._exception_return_stack: list[int] = []
         self._special_step_consumed = False
         self._ignore_breakpoint_once: int | None = None
@@ -247,7 +259,7 @@ class Emulator:
         self._snapshot_base_ranges = self._merge_ranges(snapshot_ranges)
 
     def add_pc_reg_write(self, w: PcRegWrite) -> None:
-         self.pc_reg_writes.append(w)
+        self.pc_reg_writes.append(w)
 
     def add_pc_cpu_action(
         self,
@@ -661,7 +673,12 @@ class Emulator:
             chunks.append(SnapshotMemoryChunk(start=int(start), data=data))
         return tuple(chunks)
 
-    def capture_snapshot(self, name: str = "(current)") -> EmulatorSnapshot:
+    def capture_snapshot(
+        self,
+        name: str = "(current)",
+        *,
+        include_coverage: bool = False,
+    ) -> EmulatorSnapshot:
         return EmulatorSnapshot(
             name=str(name),
             regs=self._read_snapshot_regs(),
@@ -670,6 +687,11 @@ class Emulator:
             exception_stack=tuple(int(x) for x in self._exception_stack),
             exception_return_stack=tuple(int(x) for x in self._exception_return_stack),
             pc_hist={int(k): int(v) for k, v in self._pc_hist.items()},
+            coverage=frozenset(self._coverage) if include_coverage else None,
+            fault_report=dict(self.last_fault_report) if self.last_fault_report else None,
+            mutable_ranges=tuple(
+                (int(s), int(e)) for s, e in self._snapshot_ranges()
+            ),
         )
 
     def save_snapshot(self, name: str) -> EmulatorSnapshot:
@@ -716,6 +738,14 @@ class Emulator:
         self.last_pc_break = None
         self.last_mmio_break = None
         self.last_watch_break = None
+
+        if snap.coverage is not None:
+            self._coverage = set(snap.coverage)
+            self._coverage_hits.clear()
+        if snap.fault_report is not None:
+            self.last_fault_report = dict(snap.fault_report)
+        else:
+            self.last_fault_report = None
         return snap
 
     @staticmethod
@@ -1352,7 +1382,7 @@ class Emulator:
             regs["pc"],
             xpsr,
         ]
-        sp = self._read_stack_pointer(use_psp=return_to_psp) - (len(frame) * 4)
+        sp = (self._read_stack_pointer(use_psp=return_to_psp) - (len(frame) * 4)) & 0xFFFFFFFF
         payload = b"".join(int(word & 0xFFFFFFFF).to_bytes(4, "little") for word in frame)
         self.uc.mem_write(sp, payload)
         self._write_stack_pointer(use_psp=return_to_psp, value=sp)
@@ -1375,17 +1405,34 @@ class Emulator:
             self.uc.reg_write(UC_ARM_REG_CPSR, words[7])
         except Exception:
             pass
-        new_sp = sp + 32
+        new_sp = (sp + 32) & 0xFFFFFFFF
         self._write_stack_pointer(use_psp=use_psp, value=new_sp)
         self._set_control_spsel(use_psp)
         self.uc.reg_write(UC_ARM_REG_SP, new_sp)
 
     def _hook_code(self, uc, address, size, user_data):
         pc = int(address)
+        if self.coverage_enabled:
+            clean_pc = pc & ~1
+            self._coverage.add(clean_pc)
+            self._coverage_hits[clean_pc] = self._coverage_hits.get(clean_pc, 0) + 1
         if self.trace_enabled:
             self._trace_finalize_pending(next_pc=pc & ~1)
         else:
             self._trace_reset_pending()
+
+        # Semihosting: intercept BKPT 0xAB (opcode 0xBEAB)
+        if size == 2 and self.semihosting.enabled:
+            try:
+                opcode = int.from_bytes(bytes(uc.mem_read(pc, 2)), "little")
+                if opcode == BKPT_SEMIHOST:
+                    r0 = uc.reg_read(UC_ARM_REG_R0)
+                    r1 = uc.reg_read(UC_ARM_REG_R1)
+                    result = self.semihosting.handle(r0, r1, uc.mem_read, uc.mem_write, uc)
+                    uc.reg_write(UC_ARM_REG_R0, result & 0xFFFFFFFF)
+                    return
+            except Exception:
+                pass
 
         if self._intercept_pop_exc_return(uc, pc, size):
             return
@@ -1400,7 +1447,7 @@ class Emulator:
         if self._watch_break_if_needed("x", pc & ~1, size, pc=pc):
             return
 
-        self._apply_pc_reg_writes( int(address))
+        self._apply_pc_reg_writes(int(address))
         if self._apply_pc_cpu_actions(uc, int(address), int(size)):
             return
 
@@ -1640,7 +1687,7 @@ class Emulator:
         if exc_return not in EXC_RETURN_VALUES:
             return False
 
-        uc.reg_write(UC_ARM_REG_SP, sp + frame_size)
+        uc.reg_write(UC_ARM_REG_SP, (sp + frame_size) & 0xFFFFFFFF)
         self._special_step_consumed = True
         self._perform_exception_return(exc_return)
         try:

@@ -10,13 +10,19 @@ from pathlib import Path
 
 from stmemu.core.emulator import Emulator, PcRegWrite
 from stmemu.peripherals.bus import PeripheralBus
+from stmemu.peripherals.gpio import GpioPeripheral
+from stmemu.peripherals.i2c import I2cPeripheral
+from stmemu.peripherals.spi import SpiPeripheral
 from stmemu.peripherals.usart import Stm32UsartPeripheral
 from stmemu.utils.hexdump import hexdump
 from stmemu.core.disasm import ThumbDisassembler
 from unicorn.unicorn_const import UC_HOOK_CODE
 
 def _int(s: str) -> int:
-    return int(s, 0)
+    try:
+        return int(s, 0)
+    except ValueError:
+        raise ValueError(f"invalid integer: {s!r}")
 
 
 @dataclass
@@ -328,7 +334,18 @@ class Commands:
                 return "usage: periph read <P.REG|addr>"
             addr = self._resolve_periph_addr(argv[1])
             val = self.bus.read(addr, 4)
-            return f"[0x{addr:08X}] = 0x{val:08X}"
+            lines = [f"[0x{addr:08X}] = 0x{val:08X}"]
+            # Field decode: find the peripheral and register for this address
+            p = self.bus.amap.find_peripheral(addr)
+            if p is not None:
+                reg = self.bus.amap.find_register(p, addr)
+                if reg is not None and reg.fields:
+                    for f in sorted(reg.fields, key=lambda f: f.bit_offset, reverse=True):
+                        mask = (1 << f.bit_width) - 1
+                        fval = (val >> f.bit_offset) & mask
+                        bits = f"[{f.bit_offset + f.bit_width - 1}:{f.bit_offset}]" if f.bit_width > 1 else f"[{f.bit_offset}]"
+                        lines.append(f"  {f.name:20} {bits:>8} = 0x{fval:X} ({fval})")
+            return "\n".join(lines)
 
         if sub == "write":
             if len(argv) != 3:
@@ -663,11 +680,12 @@ class Commands:
             raise ValueError("expected P.REG or address")
         p_name, r_name = s.split(".", 1)
 
-        p = next((x for x in self.bus.amap.peripherals if x.name == p_name), None)
+        p = self.bus.amap.find_peripheral_by_name(p_name)
         if not p:
             raise KeyError(f"unknown peripheral: {p_name}")
 
-        r = next((x for x in p.registers if x.name == r_name), None)
+        r_upper = r_name.upper()
+        r = next((x for x in p.registers if x.name.upper() == r_upper), None)
         if not r:
             raise KeyError(f"unknown register: {p_name}.{r_name}")
 
@@ -1209,14 +1227,14 @@ class Commands:
             max_steps = _int(argv[2]) if len(argv) == 3 else 100000
             if max_steps < 0:
                 raise ValueError("max_steps must be >= 0")
-            for i in range(max_steps + 1):
+            for _ in range(max_steps):
                 current = int(getattr(self.emu, "pc", 0)) & ~1
                 if current == target:
                     return
-                if i == max_steps:
-                    break
                 self.emu.step(1)
             current = int(getattr(self.emu, "pc", 0)) & ~1
+            if current == target:
+                return
             raise AssertionError(
                 f"wait pc timeout: target=0x{target:08X} current=0x{current:08X} steps={max_steps}"
             )
@@ -1227,12 +1245,12 @@ class Commands:
             max_steps = _int(argv[1]) if len(argv) == 2 else 100000
             if max_steps < 0:
                 raise ValueError("max_steps must be >= 0")
-            for i in range(max_steps + 1):
+            for _ in range(max_steps):
                 if getattr(self.emu, "last_fault_report", None) is not None:
                     return
-                if i == max_steps:
-                    break
                 self.emu.step(1)
+            if getattr(self.emu, "last_fault_report", None) is not None:
+                return
             raise AssertionError(f"wait fault timeout: steps={max_steps}")
 
         raise ValueError("usage: wait pc <addr> [max_steps] | wait fault [max_steps]")
@@ -1922,11 +1940,12 @@ class Commands:
         if "." in s:
             periph_name, reg_name = s.split(".", 1)
 
-            p = next((x for x in self.bus.amap.peripherals if x.name == periph_name), None)
+            p = self.bus.amap.find_peripheral_by_name(periph_name)
             if not p:
                 raise ValueError(f"unknown peripheral: {periph_name}")
 
-            r = next((x for x in p.registers if x.name == reg_name), None)
+            reg_upper = reg_name.upper()
+            r = next((x for x in p.registers if x.name.upper() == reg_upper), None)
             if not r:
                 raise ValueError(f"unknown register: {periph_name}.{reg_name}")
 
@@ -1939,7 +1958,7 @@ class Commands:
             return (f"{p.name}.{r.name}", start, end)
 
         # --- PERIPH ---
-        p = next((x for x in self.bus.amap.peripherals if x.name == s), None)
+        p = self.bus.amap.find_peripheral_by_name(s)
         if not p:
             raise ValueError(f"unknown peripheral: {s}")
 
@@ -2365,3 +2384,846 @@ class Commands:
     def _parse_int(self, s: str) -> int:
         s = s.strip()
         return int(s, 0)  # supports 0x..., decimal
+
+    # --- SPI commands ---
+    def _resolve_spi_model(self, name: str) -> SpiPeripheral:
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, SpiPeripheral):
+            raise KeyError(f"unknown spi peripheral: {name}")
+        return model
+
+    def cmd_spi(self, argv: list[str]) -> str:
+        usage = (
+            "usage: spi list | spi status <name> | spi rx <name> <hexbytes|@file|hex@file> | "
+            "spi tx <name> [clear] | spi xfer <name> <hexbytes> [steps]"
+        )
+        if not argv:
+            return usage
+
+        sub = argv[0].lower()
+        if sub == "list":
+            lines: list[str] = []
+            for peripheral in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(peripheral.name)
+                if isinstance(model, SpiPeripheral):
+                    tx_len = len(model.drain_tx() if False else model._tx_fifo)
+                    rx_len = len(model._rx_fifo)
+                    lines.append(f"{peripheral.name:8} tx={tx_len} rx={rx_len}")
+            return "\n".join(lines) if lines else "(no spi peripherals)"
+
+        if sub == "status":
+            if len(argv) != 2:
+                return "usage: spi status <name>"
+            model = self._resolve_spi_model(argv[1])
+            return f"{argv[1].upper()} tx={len(model._tx_fifo)} rx={len(model._rx_fifo)}"
+
+        if sub == "rx":
+            if len(argv) != 3:
+                return "usage: spi rx <name> <hexbytes|@file|hex@file>"
+            model = self._resolve_spi_model(argv[1])
+            try:
+                payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
+            model.inject_rx(payload)
+            return f"injected {len(payload)} byte(s) into {argv[1].upper()} rx"
+
+        if sub == "tx":
+            if len(argv) not in {2, 3}:
+                return "usage: spi tx <name> [clear]"
+            model = self._resolve_spi_model(argv[1])
+            clear = len(argv) == 3 and argv[2].lower() == "clear"
+            payload = model.drain_tx() if clear else bytes(model._tx_fifo)
+            if not payload:
+                return f"{argv[1].upper()} tx: (empty)"
+            return f"{argv[1].upper()} tx ({len(payload)} bytes): {payload.hex()}"
+
+        if sub == "xfer":
+            if len(argv) < 3:
+                return "usage: spi xfer <name> <hexbytes> [steps]"
+            model = self._resolve_spi_model(argv[1])
+            try:
+                rx_payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
+            steps = _int(argv[3]) if len(argv) > 3 else 10000
+            model.inject_rx(rx_payload)
+            model._tx_fifo.clear()
+            self.emu.step(steps)
+            tx_data = model.drain_tx()
+            return f"spi xfer: injected {len(rx_payload)} rx bytes, ran {steps} steps, got {len(tx_data)} tx bytes: {tx_data.hex()}"
+
+        return usage
+
+    # --- I2C commands ---
+    def _resolve_i2c_model(self, name: str) -> I2cPeripheral:
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, I2cPeripheral):
+            raise KeyError(f"unknown i2c peripheral: {name}")
+        return model
+
+    def cmd_i2c(self, argv: list[str]) -> str:
+        usage = (
+            "usage: i2c list | i2c status <name> | i2c rx <name> <hexbytes|@file|hex@file> | "
+            "i2c tx <name> [clear]"
+        )
+        if not argv:
+            return usage
+
+        sub = argv[0].lower()
+        if sub == "list":
+            lines: list[str] = []
+            for peripheral in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(peripheral.name)
+                if isinstance(model, I2cPeripheral):
+                    tx_len = len(model._tx_fifo)
+                    rx_len = len(model._rx_fifo)
+                    lines.append(f"{peripheral.name:8} tx={tx_len} rx={rx_len}")
+            return "\n".join(lines) if lines else "(no i2c peripherals)"
+
+        if sub == "status":
+            if len(argv) != 2:
+                return "usage: i2c status <name>"
+            model = self._resolve_i2c_model(argv[1])
+            return f"{argv[1].upper()} tx={len(model._tx_fifo)} rx={len(model._rx_fifo)}"
+
+        if sub == "rx":
+            if len(argv) != 3:
+                return "usage: i2c rx <name> <hexbytes|@file|hex@file>"
+            model = self._resolve_i2c_model(argv[1])
+            try:
+                payload = self._read_bytes_spec(argv[2])
+            except Exception as e:
+                return f"error: {e}"
+            model.inject_rx(payload)
+            return f"injected {len(payload)} byte(s) into {argv[1].upper()} rx"
+
+        if sub == "tx":
+            if len(argv) not in {2, 3}:
+                return "usage: i2c tx <name> [clear]"
+            model = self._resolve_i2c_model(argv[1])
+            clear = len(argv) == 3 and argv[2].lower() == "clear"
+            payload = model.drain_tx() if clear else bytes(model._tx_fifo)
+            if not payload:
+                return f"{argv[1].upper()} tx: (empty)"
+            return f"{argv[1].upper()} tx ({len(payload)} bytes): {payload.hex()}"
+
+        return usage
+
+    # --- GPIO commands ---
+    def _resolve_gpio_model(self, name: str) -> GpioPeripheral:
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, GpioPeripheral):
+            raise KeyError(f"unknown gpio peripheral: {name}")
+        return model
+
+    def cmd_gpio(self, argv: list[str]) -> str:
+        usage = (
+            "usage: gpio list | gpio read <name> | "
+            "gpio set <name> <pin> | gpio clear <name> <pin> | "
+            "gpio toggle <name> <pin>"
+        )
+        if not argv:
+            return usage
+
+        sub = argv[0].lower()
+        if sub == "list":
+            lines: list[str] = []
+            for peripheral in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(peripheral.name)
+                if isinstance(model, GpioPeripheral):
+                    odr = model.read_register_value(model._ODR)
+                    lines.append(f"{peripheral.name:8} ODR=0x{odr:04X}")
+            return "\n".join(lines) if lines else "(no gpio peripherals)"
+
+        if sub == "read":
+            if len(argv) != 2:
+                return "usage: gpio read <name>"
+            model = self._resolve_gpio_model(argv[1])
+            odr = model.read_register_value(model._ODR)
+            idr = model.read(model._IDR, 4)
+            moder = model.read_register_value(model._MODER)
+            lines = [f"{argv[1].upper()} ODR=0x{odr:04X}  IDR=0x{idr:04X}  MODER=0x{moder:08X}"]
+            # Show per-pin status
+            pin_info = []
+            for pin in range(16):
+                mode = (moder >> (pin * 2)) & 0x3
+                mode_str = ["IN", "OUT", "AF", "AN"][mode]
+                state = "H" if (odr >> pin) & 1 else "L"
+                pin_info.append(f"P{pin}:{mode_str}/{state}")
+            lines.append("  ".join(pin_info[:8]))
+            lines.append("  ".join(pin_info[8:]))
+            return "\n".join(lines)
+
+        if sub == "set":
+            if len(argv) != 3:
+                return "usage: gpio set <name> <pin>"
+            model = self._resolve_gpio_model(argv[1])
+            pin = _int(argv[2])
+            if not (0 <= pin <= 15):
+                return "pin must be 0-15"
+            model.write(model._BSRR, 4, 1 << pin)
+            return f"{argv[1].upper()} pin {pin} set (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        if sub == "clear":
+            if len(argv) != 3:
+                return "usage: gpio clear <name> <pin>"
+            model = self._resolve_gpio_model(argv[1])
+            pin = _int(argv[2])
+            if not (0 <= pin <= 15):
+                return "pin must be 0-15"
+            model.write(model._BSRR, 4, 1 << (pin + 16))
+            return f"{argv[1].upper()} pin {pin} cleared (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        if sub == "toggle":
+            if len(argv) != 3:
+                return "usage: gpio toggle <name> <pin>"
+            model = self._resolve_gpio_model(argv[1])
+            pin = _int(argv[2])
+            if not (0 <= pin <= 15):
+                return "pin must be 0-15"
+            odr = model.read_register_value(model._ODR)
+            if odr & (1 << pin):
+                model.write(model._BSRR, 4, 1 << (pin + 16))
+            else:
+                model.write(model._BSRR, 4, 1 << pin)
+            return f"{argv[1].upper()} pin {pin} toggled (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        return usage
+
+    # ── Symbol table commands ──────────────────────────────────────
+
+    def cmd_sym(self, argv: list[str]) -> str:
+        usage = "usage: sym search <pattern> | sym addr <address> | sym name <name> | sym stats"
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "stats":
+            t = self.emu.symbols
+            return f"symbols loaded: {t.count}"
+
+        if sub == "search":
+            if len(argv) != 2:
+                return "usage: sym search <pattern>"
+            results = self.emu.symbols.search(argv[1])
+            if not results:
+                return "(no matches)"
+            lines = []
+            for s in results[:50]:
+                lines.append(f"0x{s.address:08X}  {s.sym_type:6}  size={s.size:<6}  {s.name}")
+            if len(results) > 50:
+                lines.append(f"... and {len(results) - 50} more")
+            return "\n".join(lines)
+
+        if sub == "addr":
+            if len(argv) != 2:
+                return "usage: sym addr <address>"
+            addr = _int(argv[1])
+            return self.emu.symbols.format_addr(addr)
+
+        if sub == "name":
+            if len(argv) != 2:
+                return "usage: sym name <name>"
+            s = self.emu.symbols.lookup_name(argv[1])
+            if s is None:
+                return f"symbol not found: {argv[1]}"
+            return f"0x{s.address:08X}  {s.sym_type:6}  size={s.size}  {s.name}"
+
+        return usage
+
+    # ── Semihosting commands ───────────────────────────────────────
+
+    def cmd_semihost(self, argv: list[str]) -> str:
+        usage = "usage: semihost on|off|status|drain|echo on|off"
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "on":
+            self.emu.semihosting.enabled = True
+            return "semihosting enabled"
+
+        if sub == "off":
+            self.emu.semihosting.enabled = False
+            return "semihosting disabled"
+
+        if sub == "status":
+            sh = self.emu.semihosting
+            buf_len = len(sh.output)
+            return (
+                f"enabled={sh.enabled}  echo={sh._console_echo}  "
+                f"buffer={buf_len} bytes"
+            )
+
+        if sub == "drain":
+            data = self.emu.semihosting.drain_output()
+            if not data:
+                return "(empty)"
+            try:
+                text = data.decode("utf-8", errors="replace")
+            except Exception:
+                text = repr(data)
+            return f"--- semihosting output ({len(data)} bytes) ---\n{text}"
+
+        if sub == "echo":
+            if len(argv) != 2:
+                return "usage: semihost echo on|off"
+            self.emu.semihosting._console_echo = argv[1].lower() == "on"
+            return f"semihost echo = {'on' if self.emu.semihosting._console_echo else 'off'}"
+
+        return usage
+
+    # ── Coverage commands ──────────────────────────────────────────
+
+    def cmd_coverage(self, argv: list[str]) -> str:
+        usage = (
+            "usage: coverage on|off|status|clear|report [top]|hotspots [top]|"
+            "functions [top]|ranges|diff <snapshot>|"
+            "snapshot <name>|snapshots|"
+            "export <file>|lcov <file>|pct"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "on":
+            self.emu.coverage_enabled = True
+            return "coverage tracking enabled"
+
+        if sub == "off":
+            self.emu.coverage_enabled = False
+            return "coverage tracking disabled"
+
+        if sub == "status":
+            total_hits = sum(self.emu._coverage_hits.values())
+            return (
+                f"enabled={self.emu.coverage_enabled}  "
+                f"unique_pcs={len(self.emu._coverage)}  "
+                f"total_hits={total_hits}  "
+                f"snapshots={len(self.emu._coverage_snapshots)}"
+            )
+
+        if sub == "clear":
+            self.emu._coverage.clear()
+            self.emu._coverage_hits.clear()
+            return "coverage data cleared"
+
+        if sub == "report":
+            top = _int(argv[1]) if len(argv) > 1 else 30
+            top = max(1, min(top, 200))
+            pcs = sorted(self.emu._coverage)
+            if not pcs:
+                return "no coverage data"
+            lines = [f"unique PCs covered: {len(pcs)}"]
+            if len(pcs) <= top:
+                for pc in pcs:
+                    label = self.emu.symbols.format_addr(pc)
+                    lines.append(f"  {label}")
+            else:
+                lines.append(f"(showing first {top} of {len(pcs)})")
+                for pc in pcs[:top]:
+                    label = self.emu.symbols.format_addr(pc)
+                    lines.append(f"  {label}")
+            return "\n".join(lines)
+
+        if sub == "hotspots":
+            top = _int(argv[1]) if len(argv) > 1 else 20
+            top = max(1, min(top, 200))
+            if not self.emu._coverage_hits:
+                return "no coverage data"
+            ranked = sorted(
+                self.emu._coverage_hits.items(), key=lambda kv: kv[1], reverse=True
+            )[:top]
+            total = sum(self.emu._coverage_hits.values())
+            lines = [f"top {min(top, len(ranked))} hotspots ({total} total instructions):"]
+            for pc, hits in ranked:
+                pct = (hits * 100.0 / total) if total else 0.0
+                label = self.emu.symbols.format_addr(pc)
+                lines.append(f"  {hits:8d}  {pct:5.1f}%  {label}")
+            return "\n".join(lines)
+
+        if sub == "functions":
+            top = _int(argv[1]) if len(argv) > 1 else 20
+            top = max(1, min(top, 200))
+            if not self.emu._coverage_hits:
+                return "no coverage data"
+            return self._coverage_functions(top)
+
+        if sub == "ranges":
+            pcs = sorted(self.emu._coverage)
+            if not pcs:
+                return "no coverage data"
+            return self._coverage_ranges(pcs)
+
+        if sub == "pct":
+            return self._coverage_pct()
+
+        if sub == "diff":
+            if len(argv) != 2:
+                return "usage: coverage diff <snapshot>"
+            return self._coverage_diff(argv[1])
+
+        if sub == "snapshot":
+            if len(argv) != 2:
+                return "usage: coverage snapshot <name>"
+            name = argv[1]
+            self.emu._coverage_snapshots[name] = set(self.emu._coverage)
+            return f"saved coverage snapshot '{name}' ({len(self.emu._coverage)} PCs)"
+
+        if sub == "snapshots":
+            if not self.emu._coverage_snapshots:
+                return "(no coverage snapshots)"
+            lines = []
+            for name, pcs in sorted(self.emu._coverage_snapshots.items()):
+                lines.append(f"  {name:20} {len(pcs)} PCs")
+            return "\n".join(lines)
+
+        if sub == "export":
+            if len(argv) != 2:
+                return "usage: coverage export <file>"
+            pcs = sorted(self.emu._coverage)
+            if not pcs:
+                return "no coverage data to export"
+            try:
+                path = self._prepare_export_path(argv[1])
+                lines = []
+                for pc in pcs:
+                    hits = self.emu._coverage_hits.get(pc, 0)
+                    label = self.emu.symbols.format_addr(pc)
+                    lines.append(f"0x{pc:08X}\t{hits}\t{label}")
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError as e:
+                return f"error: {e}"
+            return f"exported {len(pcs)} addresses to {path}"
+
+        if sub == "lcov":
+            if len(argv) != 2:
+                return "usage: coverage lcov <file>"
+            return self._coverage_lcov_export(argv[1])
+
+        return usage
+
+    def _coverage_functions(self, top: int) -> str:
+        """Aggregate coverage by function using symbol table."""
+        func_hits: dict[str, int] = {}
+        func_pcs: dict[str, int] = {}
+        unknown_hits = 0
+        unknown_pcs = 0
+
+        for pc, hits in self.emu._coverage_hits.items():
+            sym = self.emu.symbols.find_containing(pc)
+            if sym is not None:
+                func_hits[sym.name] = func_hits.get(sym.name, 0) + hits
+                func_pcs[sym.name] = func_pcs.get(sym.name, 0) + 1
+            else:
+                unknown_hits += hits
+                unknown_pcs += 1
+
+        if not func_hits and unknown_pcs == 0:
+            return "no coverage data (or no symbols loaded)"
+
+        ranked = sorted(func_hits.items(), key=lambda kv: kv[1], reverse=True)[:top]
+        total_hits = sum(self.emu._coverage_hits.values())
+        lines = [f"function coverage ({len(func_hits)} functions hit, {total_hits} total instructions):"]
+        for name, hits in ranked:
+            pct = (hits * 100.0 / total_hits) if total_hits else 0.0
+            pcs = func_pcs.get(name, 0)
+            sym = self.emu.symbols.lookup_name(name)
+            size_str = ""
+            if sym and sym.size > 0:
+                # Estimate instruction coverage within this function
+                # Thumb instructions are 2 or 4 bytes; use 2 as estimate
+                est_insns = sym.size // 2
+                func_cov = min(100.0, pcs * 100.0 / est_insns) if est_insns > 0 else 0.0
+                size_str = f"  cov~{func_cov:.0f}%"
+            lines.append(f"  {hits:8d}  {pct:5.1f}%  {pcs:4d} PCs  {name}{size_str}")
+        if unknown_pcs > 0:
+            pct = (unknown_hits * 100.0 / total_hits) if total_hits else 0.0
+            lines.append(f"  {unknown_hits:8d}  {pct:5.1f}%  {unknown_pcs:4d} PCs  (unknown/no symbol)")
+        return "\n".join(lines)
+
+    def _coverage_ranges(self, pcs: list[int]) -> str:
+        """Show contiguous covered address ranges."""
+        if not pcs:
+            return "no coverage data"
+        ranges: list[tuple[int, int, int]] = []
+        start = pcs[0]
+        prev = pcs[0]
+        count = 1
+        for pc in pcs[1:]:
+            # Consider PCs within 4 bytes as contiguous (Thumb instructions are 2 or 4 bytes)
+            if pc <= prev + 4:
+                prev = pc
+                count += 1
+            else:
+                ranges.append((start, prev, count))
+                start = pc
+                prev = pc
+                count = 1
+        ranges.append((start, prev, count))
+
+        lines = [f"{len(ranges)} contiguous range(s) from {len(pcs)} PCs:"]
+        for rstart, rend, rcount in ranges:
+            span = rend - rstart + 2  # +2 for last instruction
+            label_start = self.emu.symbols.format_addr(rstart)
+            label_end = self.emu.symbols.format_addr(rend)
+            lines.append(
+                f"  0x{rstart:08X}-0x{rend + 1:08X}  "
+                f"{span:5d} bytes  {rcount:4d} PCs  "
+                f"{label_start} .. {label_end}"
+            )
+        return "\n".join(lines)
+
+    def _coverage_pct(self) -> str:
+        """Calculate coverage percentage of firmware flash area."""
+        if not self.emu._coverage:
+            return "no coverage data"
+        flash_base = self.emu.flash_base
+        flash_end = self.emu.flash_end
+        flash_size = flash_end - flash_base
+        if flash_size <= 0:
+            return "flash size unknown"
+
+        in_flash = sum(1 for pc in self.emu._coverage if flash_base <= pc < flash_end)
+        # Estimate total instructions: Thumb = 2 bytes average
+        est_total_insns = flash_size // 2
+        pct = (in_flash * 100.0 / est_total_insns) if est_total_insns > 0 else 0.0
+        return (
+            f"flash: 0x{flash_base:08X}-0x{flash_end:08X} ({flash_size} bytes)\n"
+            f"covered: {in_flash} unique PCs of ~{est_total_insns} estimated instructions\n"
+            f"coverage: {pct:.2f}%"
+        )
+
+    def _coverage_diff(self, snapshot_name: str) -> str:
+        """Show coverage difference vs a saved snapshot."""
+        snap = self.emu._coverage_snapshots.get(snapshot_name)
+        if snap is None:
+            return f"unknown coverage snapshot: {snapshot_name}"
+        current = self.emu._coverage
+        added = sorted(current - snap)
+        removed = sorted(snap - current)
+        lines = [
+            f"diff vs '{snapshot_name}': "
+            f"+{len(added)} new PCs, -{len(removed)} lost PCs"
+        ]
+        if added:
+            show = added[:20]
+            lines.append("  new:")
+            for pc in show:
+                lines.append(f"    + {self.emu.symbols.format_addr(pc)}")
+            if len(added) > 20:
+                lines.append(f"    ... and {len(added) - 20} more")
+        if removed:
+            show = removed[:20]
+            lines.append("  lost:")
+            for pc in show:
+                lines.append(f"    - {self.emu.symbols.format_addr(pc)}")
+            if len(removed) > 20:
+                lines.append(f"    ... and {len(removed) - 20} more")
+        return "\n".join(lines)
+
+    def _coverage_lcov_export(self, raw_path: str) -> str:
+        """Export coverage in LCOV tracefile format for use with genhtml/etc."""
+        if not self.emu._coverage_hits:
+            return "no coverage data to export"
+
+        # Group by function
+        func_data: dict[str, list[tuple[int, int]]] = {}
+        unknown_data: list[tuple[int, int]] = []
+        for pc, hits in sorted(self.emu._coverage_hits.items()):
+            sym = self.emu.symbols.find_containing(pc)
+            if sym is not None:
+                func_data.setdefault(sym.name, []).append((pc, hits))
+            else:
+                unknown_data.append((pc, hits))
+
+        try:
+            path = self._prepare_export_path(raw_path)
+            lines: list[str] = []
+            source = "firmware.elf"
+
+            lines.append("TN:")
+            lines.append(f"SF:{source}")
+
+            # Function entries
+            for fname, pcs in sorted(func_data.items()):
+                sym = self.emu.symbols.lookup_name(fname)
+                addr = sym.address if sym else pcs[0][0]
+                total_hits = sum(h for _, h in pcs)
+                lines.append(f"FN:{addr},{fname}")
+                lines.append(f"FNDA:{total_hits},{fname}")
+
+            lines.append(f"FNF:{len(func_data)}")
+            lines.append(f"FNH:{len(func_data)}")
+
+            # Line/address entries (we use PC addresses as "line numbers")
+            for pc, hits in sorted(self.emu._coverage_hits.items()):
+                lines.append(f"DA:{pc},{hits}")
+            lines.append(f"LF:{len(self.emu._coverage_hits)}")
+            lines.append(f"LH:{len(self.emu._coverage_hits)}")
+
+            lines.append("end_of_record")
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as e:
+            return f"error: {e}"
+
+        return (
+            f"exported LCOV data to {path} "
+            f"({len(func_data)} functions, {len(self.emu._coverage_hits)} addresses)"
+        )
+
+    # ── Fuzzer commands ────────────────────────────────────────────
+
+    def cmd_fuzz(self, argv: list[str]) -> str:
+        usage = (
+            "usage: fuzz setup [snapshot_name] | fuzz run <iterations> [steps] | "
+            "fuzz targets | fuzz stats | fuzz findings [max] | "
+            "fuzz corpus | fuzz seed <hexbytes|@file> | "
+            "fuzz dict <token_hex> | fuzz config <key> <value> | "
+            "fuzz target memory <name> <addr> [size_reg] | "
+            "fuzz target function <name> <entry_addr> <buffer_addr> | "
+            "fuzz export findings <file> | fuzz export corpus <dir> | "
+            "fuzz import <dir> | fuzz reset"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "setup":
+            snap_name = argv[1] if len(argv) > 1 else "__fuzz_baseline"
+            return self._fuzz_setup(snap_name)
+
+        if sub == "run":
+            if len(argv) < 2:
+                return "usage: fuzz run <iterations> [steps_per_iter]"
+            iters = _int(argv[1])
+            if iters <= 0:
+                return "iterations must be > 0"
+            steps = _int(argv[2]) if len(argv) > 2 else 5000
+            if steps <= 0:
+                return "steps must be > 0"
+            return self._fuzz_run(iters, steps)
+
+        if sub == "targets":
+            return self._fuzz_targets()
+
+        if sub == "target":
+            return self._fuzz_add_target(argv[1:])
+
+        if sub == "stats":
+            return self._fuzz_stats()
+
+        if sub == "findings":
+            max_show = _int(argv[1]) if len(argv) > 1 else 20
+            return self._fuzz_findings(max_show)
+
+        if sub == "corpus":
+            return self._fuzz_corpus()
+
+        if sub == "seed":
+            if len(argv) != 2:
+                return "usage: fuzz seed <hexbytes|@file>"
+            try:
+                data = self._read_bytes_spec(argv[1])
+            except Exception as e:
+                return f"error: {e}"
+            self._ensure_fuzz_engine()
+            self._fuzz_engine.add_seed_input(data)
+            return f"added seed input ({len(data)} bytes)"
+
+        if sub == "dict":
+            if len(argv) != 2:
+                return "usage: fuzz dict <token_hex>"
+            try:
+                token = bytes.fromhex(argv[1])
+            except ValueError:
+                return "invalid hex for dictionary token"
+            self._ensure_fuzz_engine()
+            self._fuzz_engine.mutator.add_dict_entry(token)
+            return f"added dictionary token ({len(token)} bytes)"
+
+        if sub == "config":
+            if len(argv) != 3:
+                return "usage: fuzz config <key> <value>"
+            return self._fuzz_config(argv[1], argv[2])
+
+        if sub == "export":
+            if len(argv) < 3:
+                return "usage: fuzz export findings <file> | fuzz export corpus <dir>"
+            return self._fuzz_export(argv[1], argv[2])
+
+        if sub == "import":
+            if len(argv) != 2:
+                return "usage: fuzz import <dir>"
+            return self._fuzz_import(argv[1])
+
+        if sub == "reset":
+            return self._fuzz_reset()
+
+        return usage
+
+    def _ensure_fuzz_engine(self):
+        if not hasattr(self, "_fuzz_engine") or self._fuzz_engine is None:
+            from stmemu.fuzz.engine import FuzzEngine
+            self._fuzz_engine = FuzzEngine(emu=self.emu, bus=self.bus)
+
+    def _fuzz_setup(self, snap_name: str) -> str:
+        self._ensure_fuzz_engine()
+        result = self._fuzz_engine.setup(snapshot_name=snap_name)
+        return f"fuzz setup: {result}"
+
+    def _fuzz_add_target(self, argv: list[str]) -> str:
+        target_usage = (
+            "usage: fuzz target memory <name> <addr> [size_reg] | "
+            "fuzz target function <name> <entry_addr> <buffer_addr>"
+        )
+        if len(argv) < 3:
+            return target_usage
+        self._ensure_fuzz_engine()
+        eng = self._fuzz_engine
+        if eng.injector is None:
+            from stmemu.fuzz.injector import Injector
+            eng.injector = Injector(bus=self.bus, emu=self.emu)
+
+        kind = argv[0].lower()
+        if kind == "memory":
+            name = argv[1]
+            addr = _int(argv[2])
+            size_reg = argv[3] if len(argv) > 3 else None
+            eng.injector.add_memory_target(name, addr, size_reg=size_reg)
+            desc = f"memory target '{name}' @0x{addr:08X}"
+            if size_reg:
+                desc += f" size_reg={size_reg}"
+            return f"added {desc}"
+
+        if kind == "function":
+            if len(argv) < 4:
+                return target_usage
+            name = argv[1]
+            entry_addr = _int(argv[2])
+            buffer_addr = _int(argv[3])
+            eng.injector.add_function_target(name, entry_addr, buffer_addr)
+            return (
+                f"added function target '{name}' "
+                f"entry=0x{entry_addr:08X} buf=0x{buffer_addr:08X}"
+            )
+
+        return target_usage
+
+    def _fuzz_run(self, iterations: int, steps: int) -> str:
+        self._ensure_fuzz_engine()
+        if not self._fuzz_engine._snapshot_name:
+            return "error: run 'fuzz setup' first"
+        findings = self._fuzz_engine.run(iterations=iterations, steps_per_iter=steps)
+        lines = [self._fuzz_engine.format_stats()]
+        if findings:
+            lines.append("")
+            crash_count = sum(1 for f in findings if "crash" in f.kind)
+            hang_count = sum(1 for f in findings if f.kind == "hang")
+            cov_count = sum(1 for f in findings if f.kind == "new_coverage")
+            lines.append(
+                f"session: {len(findings)} findings "
+                f"({crash_count} crashes, {hang_count} hangs, {cov_count} new coverage)"
+            )
+        return "\n".join(lines)
+
+    def _fuzz_targets(self) -> str:
+        self._ensure_fuzz_engine()
+        if not self._fuzz_engine.injector:
+            return "(not set up — run 'fuzz setup' first)"
+        targets = self._fuzz_engine.injector.list_targets()
+        if not targets:
+            return "(no injectable targets found)"
+        lines = [f"{len(targets)} target(s):"]
+        for t in targets:
+            lines.append(f"  {t['kind']:6}  {t['name']}")
+        return "\n".join(lines)
+
+    def _fuzz_stats(self) -> str:
+        self._ensure_fuzz_engine()
+        return self._fuzz_engine.format_stats()
+
+    def _fuzz_findings(self, max_show: int) -> str:
+        self._ensure_fuzz_engine()
+        return self._fuzz_engine.format_findings(max_show)
+
+    def _fuzz_corpus(self) -> str:
+        self._ensure_fuzz_engine()
+        corpus = self._fuzz_engine.corpus
+        if not corpus:
+            return "(empty corpus)"
+        lines = [f"{len(corpus)} corpus entry/entries:"]
+        for i, entry in enumerate(corpus[:30]):
+            preview = entry.data[:16].hex()
+            if len(entry.data) > 16:
+                preview += "..."
+            lines.append(
+                f"  [{i:4d}] iter={entry.iteration_found:5d} "
+                f"+{entry.new_pcs}PCs "
+                f"{entry.target_kind}:{entry.target_name:8s} "
+                f"{len(entry.data):3d}B  {preview}"
+            )
+        if len(corpus) > 30:
+            lines.append(f"  ... and {len(corpus) - 30} more")
+        return "\n".join(lines)
+
+    def _fuzz_config(self, key: str, value: str) -> str:
+        self._ensure_fuzz_engine()
+        eng = self._fuzz_engine
+        key_lower = key.lower()
+        if key_lower == "min_len":
+            eng.min_input_len = max(1, _int(value))
+            return f"min_input_len = {eng.min_input_len}"
+        if key_lower == "max_len":
+            eng.max_input_len = max(1, _int(value))
+            return f"max_input_len = {eng.max_input_len}"
+        if key_lower == "max_mutations":
+            eng.max_mutations = max(1, _int(value))
+            return f"max_mutations = {eng.max_mutations}"
+        if key_lower == "mode":
+            if value.lower() not in ("random", "round_robin", "all"):
+                return "mode must be: random, round_robin, or all"
+            eng.mode = value.lower()
+            return f"mode = {eng.mode}"
+        if key_lower == "seed":
+            eng.seed(_int(value))
+            return f"rng seed = {value}"
+        if key_lower == "target":
+            if eng.target_filter is None:
+                eng.target_filter = []
+            eng.target_filter.append(value)
+            return f"target filter: {eng.target_filter}"
+        return f"unknown config key: {key} (valid: min_len, max_len, max_mutations, mode, seed, target)"
+
+    def _fuzz_export(self, what: str, path_str: str) -> str:
+        self._ensure_fuzz_engine()
+        eng = self._fuzz_engine
+        if what == "findings":
+            try:
+                path = self._prepare_export_path(path_str)
+                count = eng.export_findings(path)
+            except OSError as e:
+                return f"error: {e}"
+            return f"exported {count} findings to {path}"
+        if what == "corpus":
+            try:
+                path = Path(path_str).expanduser()
+                count = eng.export_corpus(path)
+            except OSError as e:
+                return f"error: {e}"
+            return f"exported {count} corpus entries to {path}"
+        return "usage: fuzz export findings <file> | fuzz export corpus <dir>"
+
+    def _fuzz_import(self, dir_str: str) -> str:
+        self._ensure_fuzz_engine()
+        directory = Path(dir_str).expanduser()
+        if not directory.is_dir():
+            return f"not a directory: {dir_str}"
+        count = self._fuzz_engine.import_corpus(directory)
+        return f"imported {count} seed inputs from {directory}"
+
+    def _fuzz_reset(self) -> str:
+        self._ensure_fuzz_engine()
+        self._fuzz_engine.reset()
+        return "fuzzer state reset"

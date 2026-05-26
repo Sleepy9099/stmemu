@@ -7,6 +7,7 @@ from stmemu.svd.svd_loader import load_svd
 from stmemu.svd.address_map import build_address_map
 from stmemu.core.loader import load_firmware
 from stmemu.core.emulator import Emulator
+from stmemu.core.symbols import SymbolTable, load_symbols
 from stmemu.shell.shell import StmEmuShell
 from stmemu.peripherals.factory import build_default_bus
 
@@ -28,6 +29,7 @@ def run_app(
     log_level: str,
     quiet: bool,
     args=None,
+    sysmem_base: int | None = None,
 ) -> None:
     setup_logging(level=log_level, quiet=quiet)
 
@@ -45,7 +47,7 @@ def run_app(
     device = load_svd(svd_path)
     amap = build_address_map(device)
 
-    bus, core = build_default_bus(amap, flash_base=firmware.vector_base)
+    bus, core = build_default_bus(amap, flash_base=firmware.vector_base, sysmem_base=sysmem_base)
     emu = Emulator(
         bus=bus,
         flash_base=firmware.vector_base,
@@ -60,6 +62,13 @@ def run_app(
         interrupt_stuck_threshold=interrupt_stuck_threshold,
         stuck_loop_auto=stuck_auto,
     )
+
+    # Load ELF symbols if available
+    if firmware.format == "elf":
+        symbols = load_symbols(image_path)
+        if symbols.count > 0:
+            emu.symbols = symbols
+            log.info("Loaded %d symbols from ELF", symbols.count)
 
     emu.boot_from_vector_table(flash_base=firmware.vector_base)
 

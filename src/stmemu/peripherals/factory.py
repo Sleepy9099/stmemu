@@ -1,27 +1,53 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Optional
 
 from stmemu.peripherals.adc import build_adc
 from stmemu.peripherals.bus import PeripheralBus, PeripheralModel
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
+from stmemu.peripherals.dma import build_dma
+from stmemu.peripherals.flash import build_flash
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
+from stmemu.peripherals.gpio import build_gpio
+from stmemu.peripherals.i2c import build_i2c
 from stmemu.peripherals.memory import RawMemoryPeripheral
-from stmemu.peripherals.timer import (
-    build_tim2,
-    build_tim3,
-    build_tim4,
-    build_tim5,
-    build_tim6,
-    build_tim7,
-)
+from stmemu.peripherals.spi import build_spi
+from stmemu.peripherals.timer import build_timer
 from stmemu.peripherals.usart import build_usart
 from stmemu.peripherals.usb_otg import build_otg_global
 from stmemu.svd.address_map import AddressMap
 from stmemu.svd.model import SvdPeripheral
 
 PeripheralBuilder = Callable[[SvdPeripheral], PeripheralModel]
+
+
+# Patterns for auto-detecting peripheral types from SVD names.
+# Checked in order; first match wins.
+_PERIPHERAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^RCC$", re.IGNORECASE), "rcc"),
+    (re.compile(r"^PWR$", re.IGNORECASE), "pwr"),
+    (re.compile(r"^ADC\d*$", re.IGNORECASE), "adc"),
+    (re.compile(r"^L?P?USART\d*$", re.IGNORECASE), "usart"),
+    (re.compile(r"^UART\d*$", re.IGNORECASE), "usart"),
+    (re.compile(r"^TIM\d+$", re.IGNORECASE), "timer"),
+    (re.compile(r"^GPIO[A-Z]$", re.IGNORECASE), "gpio"),
+    (re.compile(r"^FLASH$", re.IGNORECASE), "flash"),
+    (re.compile(r"^SPI\d*$", re.IGNORECASE), "spi"),
+    (re.compile(r"^I2C\d*$", re.IGNORECASE), "i2c"),
+    (re.compile(r"^DMA\d*$", re.IGNORECASE), "dma"),
+    (re.compile(r"^BDMA\d*$", re.IGNORECASE), "dma"),
+    (re.compile(r"^OTG\d?_[A-Z]+_GLOBAL$", re.IGNORECASE), "otg_global"),
+    (re.compile(r"^USB_OTG_[A-Z]+$", re.IGNORECASE), "otg_global"),
+]
+
+
+def _first_irq(peripheral: SvdPeripheral) -> Optional[int]:
+    """Return the first interrupt number from SVD data, if any."""
+    if peripheral.interrupts:
+        return peripheral.interrupts[0].value
+    return None
 
 
 @dataclass
@@ -32,10 +58,20 @@ class PeripheralFactoryRegistry:
         self._builders[peripheral_name.upper()] = builder
 
     def build(self, peripheral: SvdPeripheral) -> PeripheralModel:
+        # Exact name match first
         builder = self._builders.get(peripheral.name.upper())
-        if builder is None:
-            return GenericRegisterFilePeripheral(peripheral)
-        return builder(peripheral)
+        if builder is not None:
+            return builder(peripheral)
+
+        # Pattern-based fallback
+        for pattern, kind in _PERIPHERAL_PATTERNS:
+            if pattern.match(peripheral.name):
+                builder = self._builders.get(f"__pattern__{kind}")
+                if builder is not None:
+                    return builder(peripheral)
+                break
+
+        return GenericRegisterFilePeripheral(peripheral)
 
 
 def create_default_registry() -> PeripheralFactoryRegistry:
@@ -43,53 +79,104 @@ def create_default_registry() -> PeripheralFactoryRegistry:
 
     def build_rcc(peripheral: SvdPeripheral) -> PeripheralModel:
         model = GenericRegisterFilePeripheral(peripheral)
-        model.force_bit_after_reads(0x00, 2, reads_before_set=10)
-        model.force_bit_after_reads(0x00, 17, reads_before_set=10)
-        model.force_bit_after_reads(0x00, 13, reads_before_set=20)
-        model.force_bit_after_reads(0x00, 25, reads_before_set=30)
-        model.force_bit_after_reads(0x00, 27, reads_before_set=30)
-        model.force_bit_after_reads(0x00, 29, reads_before_set=30)
-        model.force_bit_after_reads(0x10, 3, reads_before_set=10)
-        model.force_bit_after_reads(0x10, 4, reads_before_set=10)
+        # Auto-set common clock-ready bits after polling.
+        # Look for CR-like registers at offset 0x00 (most STM32 families)
+        # and CFGR-like registers.
+        cr_offset = 0x00
+        cfgr_offset = 0x10
+        for reg in peripheral.registers:
+            rname = reg.name.upper()
+            if rname == "CR":
+                cr_offset = reg.offset
+            elif rname in ("CFGR", "CFGR1"):
+                cfgr_offset = reg.offset
+
+        # Common RCC CR ready bits (HSIRDY, HSERDY, PLLRDY, etc.)
+        for field in _fields_for_offset(peripheral, cr_offset):
+            if field.name.upper().endswith("RDY"):
+                model.force_bit_after_reads(cr_offset, field.bit_offset, reads_before_set=10)
+
+        # CFGR status bits
+        for field in _fields_for_offset(peripheral, cfgr_offset):
+            if field.name.upper().startswith("SWS"):
+                model.force_bit_after_reads(cfgr_offset, field.bit_offset, reads_before_set=10)
+
         return model
 
     def build_pwr(peripheral: SvdPeripheral) -> PeripheralModel:
         model = GenericRegisterFilePeripheral(peripheral)
-        candidate_offsets = {0x04, 0x18}
-        for register in peripheral.registers:
-            if register.name.upper() in {"CSR", "CSR1"}:
-                candidate_offsets.add(register.offset)
-
-        for offset in sorted(candidate_offsets):
-            model.force_bit_after_reads(offset, 13, reads_before_set=10)
+        # Find CSR-like registers and auto-set voltage-ready bits
+        for reg in peripheral.registers:
+            rname = reg.name.upper()
+            if "CSR" in rname or "SR" in rname:
+                for f in reg.fields:
+                    if "RDY" in f.name.upper() or "VOF" in f.name.upper():
+                        model.force_bit_after_reads(reg.offset, f.bit_offset, reads_before_set=10)
         return model
 
+    # Exact name registrations (kept for backward compat, but patterns handle the rest)
     registry.register("RCC", build_rcc)
     registry.register("PWR", build_pwr)
-    registry.register("ADC1", build_adc)
-    registry.register("ADC2", build_adc)
-    registry.register("ADC3", build_adc)
-    registry.register("TIM2", build_tim2)
-    registry.register("TIM3", build_tim3)
-    registry.register("TIM4", build_tim4)
-    registry.register("TIM5", build_tim5)
-    registry.register("TIM6", build_tim6)
-    registry.register("TIM7", build_tim7)
-    registry.register("LPUART1", build_usart)
-    registry.register("USART1", build_usart)
-    registry.register("USART2", build_usart)
-    registry.register("USART3", build_usart)
-    registry.register("UART4", build_usart)
-    registry.register("UART5", build_usart)
-    registry.register("USART6", build_usart)
-    registry.register("UART7", build_usart)
-    registry.register("UART8", build_usart)
-    registry.register("OTG1_HS_GLOBAL", build_otg_global)
-    registry.register("OTG2_HS_GLOBAL", build_otg_global)
+
+    # Pattern-based builders
+    registry.register("__pattern__rcc", build_rcc)
+    registry.register("__pattern__pwr", build_pwr)
+    registry.register("__pattern__adc", build_adc)
+    registry.register("__pattern__usart", build_usart)
+    registry.register("__pattern__timer", build_timer)
+    registry.register("__pattern__gpio", build_gpio)
+    registry.register("__pattern__flash", build_flash)
+    registry.register("__pattern__spi", build_spi)
+    registry.register("__pattern__i2c", build_i2c)
+    registry.register("__pattern__dma", build_dma)
+    registry.register("__pattern__otg_global", build_otg_global)
+
     return registry
 
 
-def build_default_bus(amap: AddressMap, flash_base: int) -> tuple[PeripheralBus, CortexMCorePeripheral]:
+def _fields_for_offset(peripheral: SvdPeripheral, offset: int):
+    """Return fields for the register at the given offset."""
+    for reg in peripheral.registers:
+        if reg.offset == offset:
+            return reg.fields
+    return ()
+
+
+# Well-known system memory base addresses by STM32 family prefix.
+_SYSMEM_BASES: dict[str, int] = {
+    "STM32H7": 0x1FF1E000,
+    "STM32H5": 0x0BF8F000,
+    "STM32U5": 0x0BF9F000,
+    "STM32L4": 0x1FFF0000,
+    "STM32L5": 0x0BF9F000,
+    "STM32G0": 0x1FFF0000,
+    "STM32G4": 0x1FFF0000,
+    "STM32F0": 0x1FFFC400,
+    "STM32F1": 0x1FFFF000,
+    "STM32F2": 0x1FFF0000,
+    "STM32F3": 0x1FFFD800,
+    "STM32F4": 0x1FFF0000,
+    "STM32F7": 0x1FF00000,
+    "STM32WB": 0x1FFF0000,
+    "STM32WL": 0x1FFF0000,
+}
+
+
+def _guess_sysmem_base(device_name: str) -> int:
+    """Guess system memory base from device name prefix."""
+    upper = device_name.upper()
+    for prefix, base in _SYSMEM_BASES.items():
+        if upper.startswith(prefix):
+            return base
+    # Default fallback
+    return 0x1FFF0000
+
+
+def build_default_bus(
+    amap: AddressMap,
+    flash_base: int,
+    sysmem_base: Optional[int] = None,
+) -> tuple[PeripheralBus, CortexMCorePeripheral]:
     registry = create_default_registry()
     bus = PeripheralBus(amap)
     core = CortexMCorePeripheral(vtor=flash_base)
@@ -105,13 +192,15 @@ def build_default_bus(amap: AddressMap, flash_base: int) -> tuple[PeripheralBus,
         model=core,
     )
 
-    # STM32H7 system memory page used for unique device ID and related readonly data.
+    # System memory page for unique device ID and related readonly data.
+    if sysmem_base is None:
+        sysmem_base = _guess_sysmem_base(amap.device_name)
     sysmem = bytearray(0x1000)
     uid = bytes.fromhex("01 23 45 67 89 AB CD EF 10 32 54 76")
     sysmem[0x800 : 0x800 + len(uid)] = uid
     bus.mount(
         name="SYSMEM",
-        base=0x1FF1E000,
+        base=sysmem_base,
         size=len(sysmem),
         model=RawMemoryPeripheral(sysmem, readonly=True),
     )
