@@ -87,6 +87,29 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
 
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
+        if context.bus is not None:
+            context.bus.add_dma_listener(self)
+
+    def on_peripheral_request(self, periph_addr: int, direction: str, size: int = 1) -> None:
+        """Handle a DMA request from a peripheral.
+
+        Scans enabled streams to find one configured for this peripheral
+        address and direction, then executes the transfer.
+        """
+        dir_map = {"p2m": self._DIR_P2M, "m2p": self._DIR_M2P}
+        expected_dir = dir_map.get(direction.lower())
+        if expected_dir is None:
+            return
+        for stream in range(8):
+            stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
+            cr = self.read_register_value(stream_offset + self._SxCR)
+            if not (cr & self._SxCR_EN):
+                continue
+            par = self.read_register_value(stream_offset + self._SxPAR)
+            actual_dir = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
+            if par == periph_addr and actual_dir == expected_dir:
+                self._execute_transfer(stream)
+                break
 
     def write(self, offset: int, size: int, value: int) -> None:
         if size == 4 and offset == self._LIFCR:

@@ -90,6 +90,7 @@ class PeripheralBus:
         self._rcc_model: object | None = None
         self._emulator: object | None = None
         self._serial_lines: dict[str, object] = {}
+        self._dma_listeners: list[object] = []
 
     def register_peripheral(self, name: str, model: PeripheralModel) -> None:
         p = self.amap.find_peripheral_by_name(name)
@@ -154,6 +155,21 @@ class PeripheralBus:
     def set_emulator(self, emu: object) -> None:
         """Attach the emulator instance so peripherals (e.g. DMA) can access memory."""
         self._emulator = emu
+
+    def add_dma_listener(self, dma_model: PeripheralModel) -> None:
+        """Register a DMA controller that can respond to peripheral DMA requests."""
+        self._dma_listeners.append(dma_model)
+
+    def request_dma(self, peripheral_addr: int, direction: str, size: int = 1) -> None:
+        """Signal a DMA-capable peripheral event (e.g. RXNE, TXE).
+
+        Called by peripherals when they have data ready for DMA transfer.
+        DMA controllers check if any enabled stream/channel is configured
+        for this peripheral address and direction.
+        """
+        for dma in self._dma_listeners:
+            if hasattr(dma, "on_peripheral_request"):
+                dma.on_peripheral_request(peripheral_addr, direction, size)
 
     def mounted_ranges(self) -> tuple[MountedPeripheral, ...]:
         return tuple(self._mounted)
