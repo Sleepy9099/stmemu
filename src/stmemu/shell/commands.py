@@ -3597,6 +3597,53 @@ class Commands:
             return "\n".join(messages) if messages else "board config applied (empty)"
         return usage
 
+    # ── Timed event commands ─────────────────────────────────────
+
+    def cmd_timed(self, argv: list[str]) -> str:
+        usage = (
+            "usage: timed list | timed clear | "
+            "timed add <at> <action> [key=value ...] | timed count"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "list":
+            events = self.emu.list_timed_events()
+            if not events:
+                return "(no timed events)"
+            lines = [f"{len(events)} timed event(s):"]
+            for e in events:
+                parts = [f"  @{e['at']:>8d} {e['action']}"]
+                for k, v in e.items():
+                    if k not in ("at", "action", "fired"):
+                        parts.append(f"{k}={v}")
+                lines.append(" ".join(parts))
+            return "\n".join(lines)
+
+        if sub == "count":
+            return f"instruction count: {self.emu.instruction_count}"
+
+        if sub == "clear":
+            count = self.emu.clear_timed_events()
+            return f"cleared {count} timed event(s)"
+
+        if sub == "add":
+            if len(argv) < 3:
+                return "usage: timed add <at> <action> [key=value ...]"
+            at = _int(argv[1])
+            action = argv[2]
+            params: dict[str, str] = {}
+            for tok in argv[3:]:
+                if "=" not in tok:
+                    return f"expected key=value, got: {tok!r}"
+                k, v = tok.split("=", 1)
+                params[k] = v
+            self.emu.add_timed_event(at, action, **params)
+            return f"timed event @{at}: {action}"
+
+        return usage
+
     # ── External device commands ──────────────────────────────────
 
     def _get_device_types(self) -> dict[str, type]:

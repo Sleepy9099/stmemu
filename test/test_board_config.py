@@ -383,11 +383,16 @@ class BoardConfigEmulatorTests(unittest.TestCase):
         self.assertTrue(emu.trace_enabled)
         self.assertTrue(emu.coverage_enabled)
 
-    def test_timed_events_stored(self):
+    def test_timed_events_scheduled(self):
         bus, uart, i2c, gpio, adc = _make_bus()
 
         class _FakeEmu:
-            pass
+            _timed_events = []
+            def add_timed_event(self, at, action, **params):
+                evt = {"at": at, "action": action}
+                evt.update(params)
+                self._timed_events.append(evt)
+                return evt
         emu = _FakeEmu()
 
         cfg = {"timed_events": [
@@ -395,8 +400,8 @@ class BoardConfigEmulatorTests(unittest.TestCase):
             {"at": 50000, "action": "uart_inject", "peripheral": "USART1", "hex": "AABB"},
         ]}
         msgs = apply_board_config(cfg, bus, emu)
-        self.assertEqual(len(emu._scenario_timed_events), 2)
-        self.assertTrue(any("2 registered" in m for m in msgs))
+        self.assertEqual(len(emu._timed_events), 2)
+        self.assertTrue(any("2 scheduled" in m for m in msgs))
 
 
 class BoardConfigNestedTests(unittest.TestCase):

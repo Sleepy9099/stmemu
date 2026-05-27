@@ -175,12 +175,13 @@ def apply_board_config(
 
     # 6. Timed events — store on emulator for later
     timed = config.get("timed_events", [])
-    if timed and emu is not None:
-        if not hasattr(emu, "_scenario_timed_events"):
-            emu._scenario_timed_events = []
+    if timed and emu is not None and hasattr(emu, "add_timed_event"):
         for te in timed:
-            emu._scenario_timed_events.append(dict(te))
-        messages.append(f"timed events: {len(timed)} registered")
+            at = _parse_int(te.get("at", 0))
+            action = str(te.get("action", ""))
+            params = {k: v for k, v in te.items() if k not in ("at", "action")}
+            emu.add_timed_event(at, action, **params)
+        messages.append(f"timed events: {len(timed)} scheduled")
 
     # 7. Startup commands
     commands = config.get("startup_commands", [])
