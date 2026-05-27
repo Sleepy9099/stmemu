@@ -2680,6 +2680,73 @@ class Commands:
             raise KeyError(f"unknown ADC peripheral: {name}")
         return model
 
+    # ── Timer commands ─────────────────────────────────────────────
+
+    def cmd_timer(self, argv: list[str]) -> str:
+        usage = (
+            "usage: timer list | timer status <name> | "
+            "timer tick <name> <cycles> | timer force_update <name>"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower().replace("-", "_")
+
+        if sub == "list":
+            from stmemu.peripherals.timer import BasicTimerPeripheral
+            lines: list[str] = []
+            for p in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(p.name)
+                if isinstance(model, BasicTimerPeripheral):
+                    cr1 = model.read_register_value(model._CR1)
+                    cnt = model.read_register_value(model._CNT)
+                    arr = model.read_register_value(model._ARR)
+                    en = "ON" if cr1 & model._CR1_CEN else "off"
+                    lines.append(f"{p.name:8} {en:3} CNT={cnt} ARR={arr}")
+            return "\n".join(lines) if lines else "(no timer peripherals)"
+
+        if sub == "status":
+            if len(argv) != 2:
+                return "usage: timer status <name>"
+            model = self._resolve_timer_model(argv[1])
+            cr1 = model.read_register_value(model._CR1)
+            sr = model.read_register_value(model._SR)
+            cnt = model.read_register_value(model._CNT)
+            arr = model.read_register_value(model._ARR)
+            psc = model.read_register_value(model._PSC)
+            dier = model.read_register_value(model._DIER)
+            return (
+                f"{argv[1].upper()} CR1=0x{cr1:08X} SR=0x{sr:08X} "
+                f"DIER=0x{dier:08X}\n"
+                f"  CNT={cnt} ARR={arr} PSC={psc} "
+                f"updates={model._update_count}"
+            )
+
+        if sub == "tick":
+            if len(argv) != 3:
+                return "usage: timer tick <name> <cycles>"
+            model = self._resolve_timer_model(argv[1])
+            cycles = _int(argv[2])
+            model.tick(cycles)
+            cnt = model.read_register_value(model._CNT)
+            sr = model.read_register_value(model._SR)
+            return f"{argv[1].upper()} ticked {cycles} cycles CNT={cnt} SR=0x{sr:08X}"
+
+        if sub == "force_update":
+            if len(argv) != 2:
+                return "usage: timer force_update <name>"
+            model = self._resolve_timer_model(argv[1])
+            model.write(model._EGR, 4, model._EGR_UG)
+            return f"{argv[1].upper()} update forced CNT={model.read_register_value(model._CNT)}"
+
+        return usage
+
+    def _resolve_timer_model(self, name: str):
+        from stmemu.peripherals.timer import BasicTimerPeripheral
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, BasicTimerPeripheral):
+            raise KeyError(f"unknown timer peripheral: {name}")
+        return model
+
     # ── Symbol table commands ──────────────────────────────────────
 
     def cmd_sym(self, argv: list[str]) -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from stmemu.peripherals.bus import PeripheralContext
+from stmemu.peripherals.bus import PeripheralContext, PeripheralEvent
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.svd.model import SvdPeripheral
 
@@ -14,6 +14,7 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
     _prescaler_accum: int = field(default=0, init=False, repr=False)
     _last_counter: int = field(default=0, init=False, repr=False)
+    _update_count: int = field(default=0, init=False, repr=False)
 
     _CR1 = 0x00
     _DIER = 0x0C
@@ -25,7 +26,10 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     _CCR1 = 0x34
 
     _CR1_CEN = 1 << 0
+    _CR1_OPM = 1 << 3
+    _DIER_UIE = 1 << 0
     _DIER_CC1IE = 1 << 1
+    _SR_UIF = 1 << 0
     _SR_CC1IF = 1 << 1
     _EGR_UG = 1 << 0
 
@@ -33,13 +37,15 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         super().reset()
         self._prescaler_accum = 0
         self._last_counter = 0
+        self._update_count = 0
         self._update_irq()
 
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
 
     def tick(self, cycles: int) -> None:
-        if not (self.read_register_value(self._CR1) & self._CR1_CEN):
+        cr1 = self.read_register_value(self._CR1)
+        if not (cr1 & self._CR1_CEN):
             return
 
         prescaler = self.read_register_value(self._PSC) & 0xFFFF
@@ -53,19 +59,26 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         arr = self.read_register_value(self._ARR) & 0xFFFFFFFF
         period = arr + 1 if arr < 0xFFFFFFFF else 0x100000000
         old_counter = self.read_register_value(self._CNT) & 0xFFFFFFFF
-        new_counter = (old_counter + steps) % period
+        new_counter = old_counter + steps
+
+        overflowed = new_counter >= period
+        if overflowed:
+            new_counter %= period
+            self._on_update_event()
+            if cr1 & self._CR1_OPM:
+                self.write_register_value(self._CR1, cr1 & ~self._CR1_CEN)
+
         self.write_register_value(self._CNT, new_counter)
         self._last_counter = new_counter
 
         compare = self.read_register_value(self._CCR1) & 0xFFFFFFFF
-        if self._crossed_compare(old_counter, new_counter, compare, period):
+        if self._crossed_compare(old_counter, new_counter if not overflowed else old_counter + steps, compare, period):
             self.write_register_value(self._SR, self.read_register_value(self._SR) | self._SR_CC1IF)
 
         self._update_irq()
 
     def write(self, offset: int, size: int, value: int) -> None:
         if size == 4 and offset == self._SR:
-            # TIM status bits clear when software writes 0 to the corresponding bit.
             current = self.read_register_value(self._SR)
             self.write_register_value(self._SR, current & int(value))
             self._update_irq()
@@ -76,6 +89,7 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             if int(value) & self._EGR_UG:
                 self.write_register_value(self._CNT, 0)
                 self._prescaler_accum = 0
+                self._on_update_event()
             self._update_irq()
             return
 
@@ -84,12 +98,35 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             self._catch_up_compare()
             self._update_irq()
 
+    def _on_update_event(self) -> None:
+        self._update_count += 1
+        sr = self.read_register_value(self._SR)
+        self.write_register_value(self._SR, sr | self._SR_UIF)
+        self._emit_update_event()
+        self._update_irq()
+
+    def _emit_update_event(self) -> None:
+        if self._context is None or self._context.bus is None:
+            return
+        self._context.bus.emit(PeripheralEvent(
+            kind="timer_update",
+            source=self._context.name,
+            payload={
+                "cnt": self.read_register_value(self._CNT),
+                "arr": self.read_register_value(self._ARR),
+                "psc": self.read_register_value(self._PSC),
+                "update_count": self._update_count,
+            },
+        ))
+
     def _update_irq(self) -> None:
         if self.irq is None or self._context is None or self._context.interrupts is None:
             return
+        sr = self.read_register_value(self._SR)
+        dier = self.read_register_value(self._DIER)
         pending = bool(
-            (self.read_register_value(self._SR) & self._SR_CC1IF)
-            and (self.read_register_value(self._DIER) & self._DIER_CC1IE)
+            ((sr & self._SR_UIF) and (dier & self._DIER_UIE))
+            or ((sr & self._SR_CC1IF) and (dier & self._DIER_CC1IE))
         )
         self._context.interrupts.set_irq_pending(self.irq, pending)
 
@@ -111,7 +148,6 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             return
         if not (self.read_register_value(self._DIER) & self._DIER_CC1IE):
             return
-
         counter = self.read_register_value(self._CNT) & 0xFFFFFFFF
         compare = self.read_register_value(self._CCR1) & 0xFFFFFFFF
         if ((counter - compare) & 0xFFFFFFFF) < 0x80000000:
@@ -123,6 +159,7 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             base = {}
         base["prescaler_accum"] = int(self._prescaler_accum)
         base["last_counter"] = int(self._last_counter) & 0xFFFFFFFF
+        base["update_count"] = int(self._update_count)
         return base
 
     def restore_state(self, state: object) -> None:
@@ -131,16 +168,15 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             return
         self._prescaler_accum = int(state.get("prescaler_accum", 0))
         self._last_counter = int(state.get("last_counter", 0)) & 0xFFFFFFFF
+        self._update_count = int(state.get("update_count", 0))
         self._update_irq()
 
 
 def _first_irq(peripheral: SvdPeripheral) -> Optional[int]:
-    """Extract the first IRQ number from SVD interrupt data."""
     if peripheral.interrupts:
         return peripheral.interrupts[0].value
     return None
 
 
 def build_timer(peripheral: SvdPeripheral) -> BasicTimerPeripheral:
-    """Build a timer peripheral, extracting IRQ from SVD data."""
     return BasicTimerPeripheral(peripheral=peripheral, irq=_first_irq(peripheral))

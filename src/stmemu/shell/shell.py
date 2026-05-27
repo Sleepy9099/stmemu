@@ -151,6 +151,9 @@ class StmEmuShell(cmd.Cmd):
     def do_adc(self, arg: str) -> None:
         self.default("adc " + arg if arg else "adc")
 
+    def do_timer(self, arg: str) -> None:
+        self.default("timer " + arg if arg else "timer")
+
     def do_sym(self, arg: str) -> None:
         self.default("sym " + arg if arg else "sym")
 
