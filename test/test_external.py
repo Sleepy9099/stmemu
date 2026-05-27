@@ -44,10 +44,12 @@ from stmemu.external.ublox import (
     ubx_frame,
     _ubx_validate,
     UBX_CFG, UBX_NAV, UBX_ACK, UBX_MON,
-    CFG_RATE, CFG_PRT, CFG_RST, CFG_MSG,
-    NAV_PVT, NAV_STATUS,
-    MON_VER,
+    CFG_RATE, CFG_PRT, CFG_RST, CFG_MSG, CFG_NAV5, CFG_GNSS, CFG_CFG,
+    NAV_PVT, NAV_STATUS, NAV_POSLLH, NAV_DOP, NAV_VELNED, NAV_TIMEUTC,
+    NAV_SAT, NAV_SOL,
+    MON_VER, MON_HW,
     ACK_ACK, ACK_NAK,
+    DYN_PEDESTRIAN,
 )
 
 
@@ -125,6 +127,29 @@ class NmeaTests(unittest.TestCase):
         text = s.decode("ascii")
         self.assertIn(",S,", text)
         self.assertIn(",E,", text)
+
+    def test_gsa_produces_valid_sentence(self):
+        s = nmea.gsa(prns=[2, 5, 10, 12], pdop=2.0, hdop=1.2, vdop=1.6)
+        self.assertTrue(s.startswith(b"$GPGSA,"))
+        text = s.decode("ascii")
+        self.assertIn(",02,", text)
+        self.assertIn(",2.0,1.2,1.6*", text)
+
+    def test_gsv_produces_valid_sentence(self):
+        s = nmea.gsv(
+            total_msgs=1, msg_num=1, sats_in_view=2,
+            satellites=[(2, 45, 30, 35), (5, 60, 120, 40)],
+        )
+        self.assertTrue(s.startswith(b"$GPGSV,"))
+
+    def test_vtg_produces_valid_sentence(self):
+        s = nmea.vtg(course_true=90.0, speed_knots=5.0, speed_kmh=9.3)
+        self.assertTrue(s.startswith(b"$GPVTG,"))
+        self.assertIn(b",N,", s)
+
+    def test_gll_produces_valid_sentence(self):
+        s = nmea.gll(lat=34.7304, lon=-86.5861)
+        self.assertTrue(s.startswith(b"$GPGLL,"))
 
 
 # ── SerialLine Tests ──────────────────────────────────────────────
@@ -283,7 +308,7 @@ class UbloxDeviceTests(unittest.TestCase):
         resp = dev.read_tx_to_mcu()
         parsed = _ubx_validate(resp)
         self.assertIsNotNone(parsed)
-        self.assertIn(b"stmemu", parsed[2])
+        self.assertIn(b"ROM CORE", parsed[2])
 
     def test_ubx_nak_on_unknown(self):
         dev = UbloxGpsDevice(mode="ubx")
@@ -343,6 +368,239 @@ class UbloxDeviceTests(unittest.TestCase):
         cmd = ubx_frame(UBX_CFG, CFG_RATE, b"\xE8\x03\x01\x00\x01\x00")
         dev.on_rx_from_mcu(cmd)
         self.assertEqual(dev.read_tx_to_mcu(), b"")
+
+    def test_nmea_emits_gsa_gsv_vtg(self):
+        dev = UbloxGpsDevice(mode="nmea", rate_cycles=100)
+        dev.tick(100)
+        data = dev.read_tx_to_mcu()
+        self.assertIn(b"$GPGSA,", data)
+        self.assertIn(b"$GPGSV,", data)
+        self.assertIn(b"$GPVTG,", data)
+
+    def test_cfg_msg_disables_nmea_sentence(self):
+        dev = UbloxGpsDevice(mode="both", rate_cycles=100)
+        cmd = ubx_frame(UBX_CFG, CFG_MSG, bytes([0xF0, 0x05, 0x00]))
+        dev.on_rx_from_mcu(cmd)
+        dev.read_tx_to_mcu()
+        dev.tick(100)
+        data = dev.read_tx_to_mcu()
+        self.assertNotIn(b"$GPVTG,", data)
+        self.assertIn(b"$GPGGA,", data)
+
+    def test_cfg_msg_poll_returns_rate(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        poll = ubx_frame(UBX_CFG, CFG_MSG, bytes([0xF0, 0x00]))
+        dev.on_rx_from_mcu(poll)
+        data = dev.read_tx_to_mcu()
+        frames = _parse_all_ubx(data)
+        cfg_resp = [f for f in frames if f[0] == UBX_CFG and f[1] == CFG_MSG]
+        self.assertEqual(len(cfg_resp), 1)
+        self.assertEqual(cfg_resp[0][2][0], 0xF0)
+        self.assertEqual(cfg_resp[0][2][1], 0x00)
+
+    def test_cfg_rate_sets_measurement_rate(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        cmd = ubx_frame(UBX_CFG, CFG_RATE, struct.pack("<HHH", 500, 2, 1))
+        dev.on_rx_from_mcu(cmd)
+        data = dev.read_tx_to_mcu()
+        _expect_ack(self, data, UBX_CFG, CFG_RATE)
+        self.assertEqual(dev._meas_rate_ms, 500)
+        self.assertEqual(dev._nav_rate, 2)
+
+    def test_cfg_rate_poll(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        dev._meas_rate_ms = 200
+        poll = ubx_frame(UBX_CFG, CFG_RATE)
+        dev.on_rx_from_mcu(poll)
+        data = dev.read_tx_to_mcu()
+        frames = _parse_all_ubx(data)
+        rate_resp = [f for f in frames if f[0] == UBX_CFG and f[1] == CFG_RATE]
+        self.assertEqual(len(rate_resp), 1)
+        meas = struct.unpack_from("<H", rate_resp[0][2], 0)[0]
+        self.assertEqual(meas, 200)
+
+    def test_cfg_nav5_sets_dyn_model(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        payload = bytearray(36)
+        struct.pack_into("<H", payload, 0, 0x01)
+        payload[2] = DYN_PEDESTRIAN
+        cmd = ubx_frame(UBX_CFG, CFG_NAV5, bytes(payload))
+        dev.on_rx_from_mcu(cmd)
+        _expect_ack(self, dev.read_tx_to_mcu(), UBX_CFG, CFG_NAV5)
+        self.assertEqual(dev._dyn_model, DYN_PEDESTRIAN)
+
+    def test_cfg_nav5_poll(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        poll = ubx_frame(UBX_CFG, CFG_NAV5)
+        dev.on_rx_from_mcu(poll)
+        data = dev.read_tx_to_mcu()
+        frames = _parse_all_ubx(data)
+        nav5 = [f for f in frames if f[0] == UBX_CFG and f[1] == CFG_NAV5]
+        self.assertEqual(len(nav5), 1)
+        self.assertEqual(len(nav5[0][2]), 36)
+
+    def test_cfg_gnss_poll(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        poll = ubx_frame(UBX_CFG, CFG_GNSS)
+        dev.on_rx_from_mcu(poll)
+        data = dev.read_tx_to_mcu()
+        frames = _parse_all_ubx(data)
+        gnss = [f for f in frames if f[0] == UBX_CFG and f[1] == CFG_GNSS]
+        self.assertEqual(len(gnss), 1)
+
+    def test_cfg_cfg_acks(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        cmd = ubx_frame(UBX_CFG, CFG_CFG, b"\x00" * 12)
+        dev.on_rx_from_mcu(cmd)
+        _expect_ack(self, dev.read_tx_to_mcu(), UBX_CFG, CFG_CFG)
+
+    def test_cfg_prt_poll_and_set(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        poll = ubx_frame(UBX_CFG, CFG_PRT)
+        dev.on_rx_from_mcu(poll)
+        data = dev.read_tx_to_mcu()
+        frames = _parse_all_ubx(data)
+        prt = [f for f in frames if f[0] == UBX_CFG and f[1] == CFG_PRT]
+        self.assertEqual(len(prt), 1)
+        self.assertEqual(len(prt[0][2]), 20)
+
+    def test_nav_posllh(self):
+        dev = UbloxGpsDevice(mode="ubx", lat=51.5074, lon=-0.1278)
+        cmd = ubx_frame(UBX_NAV, NAV_POSLLH)
+        dev.on_rx_from_mcu(cmd)
+        data = dev.read_tx_to_mcu()
+        parsed = _ubx_validate(data)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0], UBX_NAV)
+        self.assertEqual(len(parsed[2]), 28)
+
+    def test_nav_dop(self):
+        dev = UbloxGpsDevice(mode="ubx", hdop=1.5, vdop=2.0, pdop=2.5)
+        cmd = ubx_frame(UBX_NAV, NAV_DOP)
+        dev.on_rx_from_mcu(cmd)
+        parsed = _ubx_validate(dev.read_tx_to_mcu())
+        self.assertIsNotNone(parsed)
+        self.assertEqual(len(parsed[2]), 18)
+        hdop = struct.unpack_from("<H", parsed[2], 12)[0]
+        self.assertEqual(hdop, 150)
+
+    def test_nav_velned(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        cmd = ubx_frame(UBX_NAV, NAV_VELNED)
+        dev.on_rx_from_mcu(cmd)
+        parsed = _ubx_validate(dev.read_tx_to_mcu())
+        self.assertIsNotNone(parsed)
+        self.assertEqual(len(parsed[2]), 36)
+
+    def test_nav_timeutc(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        cmd = ubx_frame(UBX_NAV, NAV_TIMEUTC)
+        dev.on_rx_from_mcu(cmd)
+        parsed = _ubx_validate(dev.read_tx_to_mcu())
+        self.assertIsNotNone(parsed)
+        self.assertEqual(len(parsed[2]), 20)
+
+    def test_nav_sat(self):
+        dev = UbloxGpsDevice(mode="ubx", fix_type=3)
+        cmd = ubx_frame(UBX_NAV, NAV_SAT)
+        dev.on_rx_from_mcu(cmd)
+        parsed = _ubx_validate(dev.read_tx_to_mcu())
+        self.assertIsNotNone(parsed)
+        self.assertGreater(len(parsed[2]), 8)
+        num_svs = parsed[2][5]
+        self.assertGreater(num_svs, 0)
+
+    def test_nav_sol(self):
+        dev = UbloxGpsDevice(mode="ubx", fix_type=3)
+        cmd = ubx_frame(UBX_NAV, NAV_SOL)
+        dev.on_rx_from_mcu(cmd)
+        parsed = _ubx_validate(dev.read_tx_to_mcu())
+        self.assertIsNotNone(parsed)
+        self.assertEqual(len(parsed[2]), 52)
+        self.assertEqual(parsed[2][10], 3)
+
+    def test_mon_hw(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        cmd = ubx_frame(UBX_MON, MON_HW)
+        dev.on_rx_from_mcu(cmd)
+        parsed = _ubx_validate(dev.read_tx_to_mcu())
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0], UBX_MON)
+        self.assertEqual(parsed[1], MON_HW)
+
+    def test_mon_ver_realistic(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        cmd = ubx_frame(UBX_MON, MON_VER)
+        dev.on_rx_from_mcu(cmd)
+        parsed = _ubx_validate(dev.read_tx_to_mcu())
+        self.assertIsNotNone(parsed)
+        self.assertIn(b"ROM CORE", parsed[2])
+        self.assertIn(b"PROTVER", parsed[2])
+
+    def test_ttff_simulation(self):
+        dev = UbloxGpsDevice(mode="nmea", rate_cycles=100, ttff_ticks=500, fix_type=3)
+        dev.tick(100)
+        data = dev.read_tx_to_mcu()
+        text = data.decode("ascii", errors="replace")
+        self.assertIn(",0,00,", text)
+        for _ in range(5):
+            dev.tick(100)
+        data = dev.read_tx_to_mcu()
+        text = data.decode("ascii", errors="replace")
+        self.assertIn(",1,08,", text)
+
+    def test_ubx_periodic_output(self):
+        dev = UbloxGpsDevice(mode="ubx", rate_cycles=100)
+        cmd = ubx_frame(UBX_CFG, CFG_MSG, bytes([UBX_NAV, NAV_PVT, 1]))
+        dev.on_rx_from_mcu(cmd)
+        dev.read_tx_to_mcu()
+        dev.tick(100)
+        data = dev.read_tx_to_mcu()
+        parsed = _ubx_validate(data)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0], UBX_NAV)
+        self.assertEqual(parsed[1], NAV_PVT)
+
+    def test_snapshot_restore_config(self):
+        dev = UbloxGpsDevice(mode="ubx")
+        dev._dyn_model = DYN_PEDESTRIAN
+        dev._meas_rate_ms = 200
+        dev._nmea_rates["GLL"] = 1
+        dev._ubx_periodic[(UBX_NAV, NAV_PVT)] = 2
+        state = dev.snapshot_state()
+        dev.reset()
+        self.assertEqual(dev._dyn_model, 4)
+        dev.restore_state(state)
+        self.assertEqual(dev._dyn_model, DYN_PEDESTRIAN)
+        self.assertEqual(dev._meas_rate_ms, 200)
+        self.assertEqual(dev._nmea_rates["GLL"], 1)
+        self.assertEqual(dev._ubx_periodic.get((UBX_NAV, NAV_PVT)), 2)
+
+
+def _parse_all_ubx(data: bytes) -> list[tuple[int, int, bytes]]:
+    results = []
+    while len(data) >= 8:
+        idx = data.find(b"\xB5\x62")
+        if idx < 0:
+            break
+        data = data[idx:]
+        parsed = _ubx_validate(data)
+        if parsed is None:
+            data = data[1:]
+            continue
+        results.append(parsed)
+        frame_len = 6 + len(parsed[2]) + 2
+        data = data[frame_len:]
+    return results
+
+
+def _expect_ack(tc, data: bytes, cls: int, msg_id: int) -> None:
+    frames = _parse_all_ubx(data)
+    acks = [f for f in frames if f[0] == UBX_ACK and f[1] == ACK_ACK]
+    tc.assertTrue(
+        any(a[2] == bytes([cls, msg_id]) for a in acks),
+        f"expected ACK for {cls:02X}:{msg_id:02X}, got {acks}",
+    )
 
 
 # ── Integration: SerialLine + u-blox ─────────────────────────────

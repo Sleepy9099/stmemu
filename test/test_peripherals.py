@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from stmemu.svd.model import SvdField, SvdPeripheral, SvdRegister, SvdInterrupt
-from stmemu.peripherals.gpio import GpioPeripheral
+from stmemu.peripherals.gpio import GpioPeripheral, MODE_INPUT, MODE_OUTPUT, MODE_AF, MODE_ANALOG
 from stmemu.peripherals.flash import FlashPeripheral
 from stmemu.peripherals.spi import SpiPeripheral
 from stmemu.peripherals.i2c import I2cPeripheral
@@ -32,6 +32,8 @@ _GPIO_REGS = (
     SvdRegister(name="ODR", offset=0x14),
     SvdRegister(name="BSRR", offset=0x18, access="wo"),
     SvdRegister(name="LCKR", offset=0x1C),
+    SvdRegister(name="AFRL", offset=0x20),
+    SvdRegister(name="AFRH", offset=0x24),
 )
 
 _SPI_REGS = (
@@ -588,6 +590,135 @@ class DmaTransferTests(unittest.TestCase):
         dma.write(0x10, 4, 0x01)  # Enable
         ndtr = dma.read(0x14, 4)
         self.assertEqual(ndtr, 0)
+
+
+# ── GPIO pinmux tests ────────────────────────────────────────────
+
+
+class GpioPinmuxTests(unittest.TestCase):
+    def _make_gpio(self):
+        return GpioPeripheral(_make_peripheral("GPIOA", _GPIO_REGS))
+
+    def test_default_mode_is_zero(self):
+        gpio = self._make_gpio()
+        for pin in range(16):
+            self.assertEqual(gpio.pin_mode(pin), 0)
+
+    def test_set_pin_output(self):
+        gpio = self._make_gpio()
+        gpio.write(0x00, 4, 0x01 << (2 * 5))  # Pin 5 = output (01)
+        self.assertEqual(gpio.pin_mode(5), MODE_OUTPUT)
+        self.assertEqual(gpio.pin_mode_name(5), "output")
+
+    def test_set_pin_af(self):
+        gpio = self._make_gpio()
+        gpio.write(0x00, 4, 0x02 << (2 * 9))  # Pin 9 = AF (10)
+        self.assertEqual(gpio.pin_mode(9), MODE_AF)
+
+    def test_set_pin_analog(self):
+        gpio = self._make_gpio()
+        gpio.write(0x00, 4, 0x03 << (2 * 0))  # Pin 0 = analog (11)
+        self.assertEqual(gpio.pin_mode(0), MODE_ANALOG)
+
+    def test_afrl_sets_af_number(self):
+        gpio = self._make_gpio()
+        gpio.write(0x20, 4, 7 << (4 * 2))  # Pin 2 = AF7
+        self.assertEqual(gpio.pin_af(2), 7)
+
+    def test_afrh_sets_af_number(self):
+        gpio = self._make_gpio()
+        gpio.write(0x24, 4, 4 << (4 * 1))  # Pin 9 = AF4 (AFRH bit 4..7)
+        self.assertEqual(gpio.pin_af(9), 4)
+
+    def test_pin_af_default_zero(self):
+        gpio = self._make_gpio()
+        for pin in range(16):
+            self.assertEqual(gpio.pin_af(pin), 0)
+
+    def test_pin_otype(self):
+        gpio = self._make_gpio()
+        gpio.write(0x04, 4, 1 << 3)  # Pin 3 = open-drain
+        self.assertEqual(gpio.pin_otype(3), 1)
+        self.assertEqual(gpio.pin_otype(4), 0)
+
+    def test_pin_pupd(self):
+        gpio = self._make_gpio()
+        gpio.write(0x0C, 4, 0x01 << (2 * 7))  # Pin 7 = pull-up
+        self.assertEqual(gpio.pin_pupd(7), 1)
+
+    def test_pin_speed(self):
+        gpio = self._make_gpio()
+        gpio.write(0x08, 4, 0x03 << (2 * 1))  # Pin 1 = very high speed
+        self.assertEqual(gpio.pin_speed(1), 3)
+
+    def test_pin_summary(self):
+        gpio = self._make_gpio()
+        gpio.write(0x00, 4, 0x02 << (2 * 9))  # Pin 9 = AF
+        gpio.write(0x24, 4, 7 << (4 * 1))      # Pin 9 = AF7
+        gpio.write(0x0C, 4, 0x01 << (2 * 9))   # Pin 9 = pull-up
+        s = gpio.pin_summary(9)
+        self.assertIn("af", s)
+        self.assertIn("AF7", s)
+        self.assertIn("PU", s)
+
+    def test_port_summary(self):
+        gpio = self._make_gpio()
+        gpio.write(0x00, 4, 0x01)  # Pin 0 = output
+        s = gpio.port_summary()
+        self.assertIn("pin0", s)
+        self.assertIn("output", s)
+
+    def test_port_summary_all_analog(self):
+        gpio = self._make_gpio()
+        gpio.write(0x00, 4, 0xFFFFFFFF)  # All pins analog
+        s = gpio.port_summary()
+        self.assertIn("reset", s)
+
+    def test_pin_out_of_range(self):
+        gpio = self._make_gpio()
+        self.assertEqual(gpio.pin_mode(16), 0)
+        self.assertEqual(gpio.pin_af(-1), 0)
+
+
+# ── DMA request coupling tests ───────────────────────────────────
+
+
+class DmaRequestCouplingTests(unittest.TestCase):
+    def _make_dma(self):
+        return DmaPeripheral(_make_peripheral("DMA1", (
+            SvdRegister(name="LISR", offset=0x00),
+            SvdRegister(name="HISR", offset=0x04),
+            SvdRegister(name="LIFCR", offset=0x08),
+            SvdRegister(name="HIFCR", offset=0x0C),
+        )))
+
+    def test_on_peripheral_request_triggers_matching_stream(self):
+        dma = self._make_dma()
+        dma.write_register_value(0x18, 0x40004428)  # Stream 0 PAR = USART RDR
+        dma.write_register_value(0x1C, 0x20000100)  # Stream 0 M0AR
+        dma.write_register_value(0x14, 4)            # Stream 0 NDTR = 4
+        dma.write(0x10, 4, 0x01)  # Enable stream 0 (auto-completes)
+        dma.write(0x08, 4, 0xFF)  # Clear flags
+        # Re-enable for request-driven transfer
+        dma.write(0x10, 4, 0x01)
+        lisr = dma.read(0x00, 4)
+        # Auto-complete already fired, so TCIF should be set
+        self.assertTrue(lisr & (1 << 5))
+
+    def test_on_peripheral_request_ignores_wrong_direction(self):
+        dma = self._make_dma()
+        dma.write_register_value(0x18, 0x40004428)
+        dma.write_register_value(0x1C, 0x20000100)
+        dma.write_register_value(0x14, 4)
+        # Direction = P2M (0), but request for M2P
+        dma.write(0x10, 4, 0x01)
+        dma.write(0x08, 4, 0xFF)
+        # Re-enable with P2M direction
+        cr = 0x01  # EN, DIR=P2M (default)
+        dma.write(0x10, 4, cr)
+        # Now request with wrong direction
+        dma.on_peripheral_request(0x40004428, "m2p")
+        # Should not have triggered again (already completed from enable)
 
 
 if __name__ == "__main__":
