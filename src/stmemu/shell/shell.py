@@ -148,6 +148,9 @@ class StmEmuShell(cmd.Cmd):
     def do_gpio(self, arg: str) -> None:
         self.default("gpio " + arg if arg else "gpio")
 
+    def do_adc(self, arg: str) -> None:
+        self.default("adc " + arg if arg else "adc")
+
     def do_sym(self, arg: str) -> None:
         self.default("sym " + arg if arg else "sym")
 

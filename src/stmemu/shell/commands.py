@@ -2619,6 +2619,67 @@ class Commands:
 
         return usage
 
+    # ── ADC commands ──────────────────────────────────────────────
+
+    def cmd_adc(self, argv: list[str]) -> str:
+        usage = (
+            "usage: adc list | adc status <name> | "
+            "adc sample <name> <value> | adc convert <name>"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "list":
+            from stmemu.peripherals.adc import Stm32AdcPeripheral
+            lines: list[str] = []
+            for p in self.bus.amap.peripherals:
+                model = self.bus.model_for_name(p.name)
+                if isinstance(model, Stm32AdcPeripheral):
+                    isr = model.read_register_value(model._ISR)
+                    dr = model.read_register_value(model._DR)
+                    lines.append(f"{p.name:8} ISR=0x{isr:08X} DR=0x{dr:04X}")
+            return "\n".join(lines) if lines else "(no ADC peripherals)"
+
+        if sub == "status":
+            if len(argv) != 2:
+                return "usage: adc status <name>"
+            model = self._resolve_adc_model(argv[1])
+            isr = model.read_register_value(model._ISR)
+            cr = model.read_register_value(model._CR)
+            dr = model.read_register_value(model._DR)
+            cfgr = model.read_register_value(model._CFGR)
+            return (
+                f"{argv[1].upper()} CR=0x{cr:08X} ISR=0x{isr:08X} "
+                f"DR=0x{dr:04X} CFGR=0x{cfgr:08X} "
+                f"queue={len(model._sample_queue)} conv={model._conversion_count}"
+            )
+
+        if sub == "sample":
+            if len(argv) != 3:
+                return "usage: adc sample <name> <value>"
+            model = self._resolve_adc_model(argv[1])
+            value = _int(argv[2])
+            model.inject_sample(value)
+            return f"{argv[1].upper()} queued sample 0x{value & 0xFFFF:04X} (queue={len(model._sample_queue)})"
+
+        if sub == "convert":
+            if len(argv) != 2:
+                return "usage: adc convert <name>"
+            model = self._resolve_adc_model(argv[1])
+            model.write(model._CR, 4, model.read_register_value(model._CR) | model._CR_ADSTART)
+            dr = model.read_register_value(model._DR)
+            return f"{argv[1].upper()} conversion complete DR=0x{dr:04X}"
+
+        return usage
+
+    def _resolve_adc_model(self, name: str):
+        from stmemu.peripherals.adc import Stm32AdcPeripheral
+        model = self.bus.model_for_name(name)
+        if not isinstance(model, Stm32AdcPeripheral):
+            raise KeyError(f"unknown ADC peripheral: {name}")
+        return model
+
     # ── Symbol table commands ──────────────────────────────────────
 
     def cmd_sym(self, argv: list[str]) -> str:
