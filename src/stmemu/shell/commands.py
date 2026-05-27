@@ -3571,6 +3571,29 @@ class Commands:
         self._fuzz_engine.reset()
         return "fuzzer state reset"
 
+    # ── Board config commands ─────────────────────────────────────
+
+    def cmd_board(self, argv: list[str]) -> str:
+        usage = "usage: board load <file.yaml|file.json>"
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+        if sub == "load":
+            if len(argv) != 2:
+                return usage
+            from stmemu.board_config import load_board_config, apply_board_config
+            path = Path(argv[1]).expanduser()
+            try:
+                config = load_board_config(path)
+            except Exception as e:
+                return f"error loading board config: {e}"
+            try:
+                messages = apply_board_config(config, self.bus, self.emu)
+            except Exception as e:
+                return f"error applying board config: {e}"
+            return "\n".join(messages) if messages else "board config applied (empty)"
+        return usage
+
     # ── External device commands ──────────────────────────────────
 
     def _get_device_types(self) -> dict[str, type]:
