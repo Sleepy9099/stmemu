@@ -9,7 +9,7 @@ from stmemu.peripherals.bus import PeripheralBus, PeripheralModel
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.peripherals.dma import build_dma
 from stmemu.peripherals.flash import build_flash
-from stmemu.peripherals.exti import ExtiPeripheral
+from stmemu.peripherals.exti import ExtiPeripheral, _DEFAULT_EXTI_IRQS
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.peripherals.gpio import build_gpio
 from stmemu.peripherals.rcc import build_rcc
@@ -109,7 +109,7 @@ def create_default_registry() -> PeripheralFactoryRegistry:
     registry.register("__pattern__otg_global", build_otg_global)
 
     def build_exti(peripheral: SvdPeripheral) -> PeripheralModel:
-        irq_map = dict(ExtiPeripheral._DEFAULT_EXTI_IRQS) if hasattr(ExtiPeripheral, '_DEFAULT_EXTI_IRQS') else {}
+        irq_map = dict(_DEFAULT_EXTI_IRQS)
         for intr in peripheral.interrupts:
             name = intr.name.upper()
             if "EXTI15_10" in name:
