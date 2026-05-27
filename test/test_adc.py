@@ -104,12 +104,13 @@ class AdcConversionTests(unittest.TestCase):
         self.assertTrue(isr & adc._ISR_EOC)
         self.assertTrue(isr & adc._ISR_EOS)
 
-    def test_eoc_cleared_on_dr_read(self):
+    def test_eoc_and_eos_cleared_on_dr_read(self):
         bus, adc, nvic = _make_bus_adc()
         adc.write(adc._CR, 4, adc._CR_ADEN | adc._CR_ADSTART)
         adc.read(adc._DR, 4)
         isr = adc.read_register_value(adc._ISR)
         self.assertFalse(isr & adc._ISR_EOC)
+        self.assertFalse(isr & adc._ISR_EOS)
 
     def test_isr_write_1_clears(self):
         bus, adc, nvic = _make_bus_adc()

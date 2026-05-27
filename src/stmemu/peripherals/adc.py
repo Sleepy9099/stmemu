@@ -98,7 +98,7 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
                 self.write_register_value(self._CR, cr & ~self._CR_ADCAL)
         if size == 4 and offset == self._DR:
             isr = self.read_register_value(self._ISR)
-            self.write_register_value(self._ISR, isr & ~self._ISR_EOC)
+            self.write_register_value(self._ISR, isr & ~(self._ISR_EOC | self._ISR_EOS))
         return super().read(offset, size)
 
     def _handle_cr_write(self) -> None:
