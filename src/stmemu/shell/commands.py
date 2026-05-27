@@ -73,6 +73,8 @@ class Commands:
                 f"@0x{b['address']:08X} size={b['size']} "
                 f"value={val_s}"
             )
+        if getattr(self.emu, "last_event_break", None):
+            return self._format_event_break(self.emu.last_event_break)
         return f"pc=0x{self.emu.pc:08X}"
 
     def cmd_run(self, argv: list[str]) -> str:
@@ -102,6 +104,8 @@ class Commands:
                 f"@0x{b['address']:08X} size={b['size']} "
                 f"value={val_s}"
             )
+        if getattr(self.emu, "last_event_break", None):
+            return self._format_event_break(self.emu.last_event_break)
         return f"pc=0x{self.emu.pc:08X}"
 
     def cmd_mem(self, argv: list[str]) -> str:
@@ -843,6 +847,22 @@ class Commands:
         )
 
     @staticmethod
+    def _format_event_break(eb: dict[str, object]) -> str:
+        kind = str(eb.get("kind", "?"))
+        source = str(eb.get("source", ""))
+        pc = int(eb.get("pc", 0))
+        bp_id = int(eb.get("bp_id", 0))
+        payload = eb.get("payload")
+        parts = [f"EVENT BP HIT: #{bp_id} {kind}"]
+        if source:
+            parts[0] += f" source={source}"
+        parts.append(f"pc=0x{pc:08X}")
+        if isinstance(payload, dict):
+            for k, v in list(payload.items())[:6]:
+                parts.append(f"{k}={v}")
+        return " ".join(parts)
+
+    @staticmethod
     def _format_fault_report(report: dict[str, object]) -> str:
         reason = str(report.get("reason", "fault"))
         detail = str(report.get("detail", "") or "")
@@ -1049,6 +1069,60 @@ class Commands:
         if len(mem_ranges) > 32:
             lines.append(f"  ... ({len(mem_ranges) - 32} more)")
         return "\n".join(lines)
+
+    def cmd_break(self, argv: list[str]) -> str:
+        usage = (
+            "usage: break event <kind> [source=NAME] | "
+            "break event list | break event remove <id> | break event clear"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub != "event":
+            return usage
+
+        if len(argv) == 1:
+            return usage
+
+        action = argv[1].lower()
+
+        if action == "list":
+            bps = self.emu.list_event_breakpoints()
+            if not bps:
+                return "(no event breakpoints)"
+            lines = [f"{len(bps)} event breakpoint(s):"]
+            for bp in bps:
+                src = f" source={bp['source']}" if bp.get("source") else ""
+                lines.append(
+                    f"  #{bp['id']} {bp['kind']}{src} "
+                    f"hits={bp['hits']} {'ON' if bp['enabled'] else 'off'}"
+                )
+            return "\n".join(lines)
+
+        if action == "remove":
+            if len(argv) != 3:
+                return "usage: break event remove <id>"
+            bp_id = _int(argv[2])
+            if self.emu.remove_event_breakpoint(bp_id):
+                return f"removed event breakpoint #{bp_id}"
+            return f"event breakpoint not found: {bp_id}"
+
+        if action == "clear":
+            count = self.emu.clear_event_breakpoints()
+            return f"cleared {count} event breakpoint(s)"
+
+        kind = action
+        source = None
+        for tok in argv[2:]:
+            if tok.lower().startswith("source="):
+                source = tok.split("=", 1)[1]
+
+        bp_id = self.emu.add_event_breakpoint(kind, source=source)
+        desc = f"added event breakpoint #{bp_id}: {kind}"
+        if source:
+            desc += f" source={source}"
+        return desc
 
     def cmd_snap(self, argv: list[str]) -> str:
         """

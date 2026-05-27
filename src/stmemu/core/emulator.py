@@ -148,6 +148,9 @@ class Emulator:
         self.last_mmio_break: dict | None = None
         self.last_watch_break: dict | None = None
         self.last_pc_break: int | None = None
+        self.last_event_break: dict | None = None
+        self._event_breakpoints: list[dict] = []
+        self._event_bp_next_id: int = 1
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
 
@@ -448,6 +451,68 @@ class Emulator:
         self._watchpoints.clear()
         return count
 
+    # --- Event breakpoints ---
+    def add_event_breakpoint(
+        self, kind: str, *, source: str | None = None, name: str = "",
+    ) -> int:
+        bp_id = self._event_bp_next_id
+        self._event_bp_next_id += 1
+        bp = {
+            "id": bp_id,
+            "kind": kind,
+            "source": source,
+            "name": name or f"evt:{kind}" + (f"/{source}" if source else ""),
+            "enabled": True,
+            "hits": 0,
+        }
+        self._event_breakpoints.append(bp)
+        already_subscribed = any(
+            b["kind"] == kind for b in self._event_breakpoints if b["id"] != bp_id
+        )
+        if not already_subscribed:
+            self.bus.subscribe(kind, self._on_event_for_breakpoint)
+        return bp_id
+
+    def remove_event_breakpoint(self, bp_id: int) -> bool:
+        before = len(self._event_breakpoints)
+        self._event_breakpoints = [
+            bp for bp in self._event_breakpoints if bp["id"] != bp_id
+        ]
+        return len(self._event_breakpoints) < before
+
+    def list_event_breakpoints(self) -> list[dict]:
+        return [dict(bp) for bp in self._event_breakpoints]
+
+    def clear_event_breakpoints(self) -> int:
+        count = len(self._event_breakpoints)
+        self._event_breakpoints.clear()
+        return count
+
+    def _on_event_for_breakpoint(self, event) -> None:
+        if not self._running:
+            return
+        for bp in self._event_breakpoints:
+            if not bp["enabled"]:
+                continue
+            if bp["kind"] != event.kind:
+                continue
+            if bp["source"] is not None and bp["source"].upper() != str(getattr(event, "source", "")).upper():
+                continue
+            bp["hits"] += 1
+            self.last_event_break = {
+                "bp_id": bp["id"],
+                "kind": event.kind,
+                "source": getattr(event, "source", ""),
+                "address": getattr(event, "address", 0),
+                "payload": getattr(event, "payload", None),
+                "pc": self.pc,
+            }
+            try:
+                self.uc.emu_stop()
+            except Exception:
+                pass
+            return
+
     @staticmethod
     def _reg_alias_to_unicorn(name: str):
         reg_name = str(name).lower().strip()
@@ -564,6 +629,7 @@ class Emulator:
         self.last_mmio_break = None
         self.last_watch_break = None
         self.last_pc_break = None
+        self.last_event_break = None
         self._running = True
         err: Exception | None = None
         try:
@@ -583,6 +649,7 @@ class Emulator:
         self.last_mmio_break = None
         self.last_watch_break = None
         self.last_pc_break = None
+        self.last_event_break = None
         self._running = True
         err: Exception | None = None
         try:
@@ -748,6 +815,7 @@ class Emulator:
         self.last_pc_break = None
         self.last_mmio_break = None
         self.last_watch_break = None
+        self.last_event_break = None
 
         self._prev_coverage_pc = 0
         if snap.coverage is not None:
@@ -1260,6 +1328,7 @@ class Emulator:
                 self.last_mmio_break is not None
                 or self.last_watch_break is not None
                 or self.last_pc_break is not None
+                or self.last_event_break is not None
             ):
                 break
 
