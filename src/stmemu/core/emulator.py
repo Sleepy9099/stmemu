@@ -1276,16 +1276,16 @@ class Emulator:
             except Exception:
                 primask = False
 
-        basepri_active = False
+        basepri_val = 0
         if UC_ARM_REG_BASEPRI is not None:
             try:
-                basepri_active = bool(int(self.uc.reg_read(UC_ARM_REG_BASEPRI)) & 0xFF)
+                basepri_val = int(self.uc.reg_read(UC_ARM_REG_BASEPRI)) & 0xFF
             except Exception:
-                basepri_active = False
+                basepri_val = 0
 
         exc_num = self.core_peripheral.next_pending_exception(
             primask=primask,
-            basepri=basepri_active,
+            basepri=basepri_val,
         )
         if exc_num is None:
             return False
