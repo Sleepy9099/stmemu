@@ -309,6 +309,158 @@ class TimedEventTests(unittest.TestCase):
         self.assertEqual(len(emu.list_timed_events()), 0)
 
 
+# ── Edge case and integration validation ─────────────────────────
+
+
+class TimedEventEdgeCaseTests(unittest.TestCase):
+    def test_multiple_overdue_events_all_fire(self):
+        """Events at 100, 101, 102 all fire when run(10000) skips past them."""
+        bus, gpio, uart, adc = _make_bus()
+        emu = _TimedEmu(bus)
+        emu.add_timed_event(100, "gpio_inject", port="GPIOA", pin=0, level="high")
+        emu.add_timed_event(101, "gpio_inject", port="GPIOA", pin=1, level="high")
+        emu.add_timed_event(102, "gpio_inject", port="GPIOA", pin=2, level="high")
+
+        emu.simulate_instructions(200)
+        idr = gpio.read(0x10, 4)
+        self.assertTrue(idr & (1 << 0), "pin 0 should fire at ic=100")
+        self.assertTrue(idr & (1 << 1), "pin 1 should fire at ic=101")
+        self.assertTrue(idr & (1 << 2), "pin 2 should fire at ic=102")
+        self.assertEqual(len(emu.list_timed_events()), 0, "all events consumed")
+
+    def test_overdue_events_fire_in_order(self):
+        """When multiple events become due at the same check, they fire in at-order."""
+        bus, gpio, uart, adc = _make_bus()
+        bus.event_log_enabled = True
+        emu = _TimedEmu(bus)
+        emu.add_timed_event(5, "event_emit", kind="first", source="t")
+        emu.add_timed_event(5, "event_emit", kind="second", source="t")
+        emu.add_timed_event(6, "event_emit", kind="third", source="t")
+
+        emu.simulate_instructions(10)
+        log = bus.drain_event_log()
+        custom = [e.kind for e in log if e.source == "t"]
+        self.assertEqual(custom, ["first", "second", "third"])
+
+    def test_timed_gpio_triggers_exti(self):
+        """Timed GPIO injection should fire EXTI if configured."""
+        from stmemu.peripherals.exti import ExtiPeripheral
+
+        bus, gpio, uart, adc = _make_bus()
+
+        class _FakeNvic:
+            pending = {}
+            def set_irq_pending(self, irq, pending=True):
+                self.pending[irq] = pending
+            def set_system_pending(self, name, pending=True):
+                pass
+        nvic = _FakeNvic()
+        bus._interrupts = nvic
+
+        exti = ExtiPeripheral(irq_map={0: 6})
+        bus.mount(name="EXTI", base=0x40013C00, size=0x400, model=exti)
+        exti.write_register_value(exti._RTSR, 1 << 0)
+        exti.write_register_value(exti._IMR, 1 << 0)
+
+        emu = _TimedEmu(bus)
+        emu.add_timed_event(50, "gpio_inject", port="GPIOA", pin=0, level="high")
+        emu.simulate_instructions(50)
+
+        pr = exti.read_register_value(exti._PR)
+        self.assertTrue(pr & 1, "EXTI PR should be set from timed GPIO injection")
+        self.assertTrue(nvic.pending.get(6, False), "EXTI IRQ should pend")
+
+    def test_timed_uart_inject_feeds_dma(self):
+        """Timed UART injection should trigger DMA if DMAR is enabled."""
+        from stmemu.peripherals.dma import DmaPeripheral
+
+        dma_svd = _make_svd("DMA1", 0x40026000, (
+            SvdRegister(name="LISR", offset=0x00),
+            SvdRegister(name="HISR", offset=0x04),
+            SvdRegister(name="LIFCR", offset=0x08),
+            SvdRegister(name="HIFCR", offset=0x0C),
+        ), interrupts=(SvdInterrupt(name="DMA1_Stream0", value=11),))
+
+        usart_svd = _make_svd("USART1", 0x40004400, _USART_REGS,
+            interrupts=(SvdInterrupt(name="USART1", value=37),))
+
+        ranges = (
+            AddressRange(base=0x40004400, end=0x40004800, peripheral=usart_svd),
+            AddressRange(base=0x40026000, end=0x40026400, peripheral=dma_svd),
+        )
+        amap = AddressMap(device_name="TEST",
+            peripherals=(usart_svd, dma_svd), ranges=ranges)
+        bus = PeripheralBus(amap)
+
+        class _FakeMemEmu:
+            _mem = bytearray(0x1000)
+            def mem_write(self, addr, data):
+                off = addr & 0xFFF
+                self._mem[off:off+len(data)] = data
+            def mem_read(self, addr, size):
+                off = addr & 0xFFF
+                return bytes(self._mem[off:off+size])
+        mem_emu = _FakeMemEmu()
+        bus._emulator = mem_emu
+
+        uart = Stm32UsartPeripheral(peripheral=usart_svd, irq=37)
+        dma = DmaPeripheral(peripheral=dma_svd)
+        bus.register_peripheral("USART1", uart)
+        bus.register_peripheral("DMA1", dma)
+
+        # Enable USART with DMA
+        uart.write(0x00, 4, (1 << 0) | (1 << 2))  # UE + RE
+        uart.write(0x08, 4, 1 << 6)  # CR3.DMAR
+
+        # Configure DMA circular on stream 0 for USART1 RDR
+        rdr_addr = 0x40004400 + 0x24
+        so = dma._STREAM_BASE
+        dma.write_register_value(so + dma._SxNDTR, 8)
+        dma.write_register_value(so + dma._SxPAR, rdr_addr)
+        dma.write_register_value(so + dma._SxM0AR, 0x200)
+        cr = dma._SxCR_EN | dma._SxCR_CIRC | dma._SxCR_MINC
+        dma.write(so + dma._SxCR, 4, cr)
+
+        emu = _TimedEmu(bus)
+        emu.add_timed_event(100, "uart_inject", peripheral="USART1", hex="414243")
+
+        emu.simulate_instructions(100)
+
+        data = mem_emu.mem_read(0x200, 3)
+        self.assertEqual(data, b"ABC", "timed UART inject should flow through DMA to memory")
+
+    def test_event_breakpoint_from_timed_emit(self):
+        """Event breakpoint should fire from a timed event_emit action."""
+        bus, gpio, uart, adc = _make_bus()
+        emu = _TimedEmu(bus)
+
+        # Set up event breakpoint
+        emu._event_breakpoints.append({
+            "id": 1, "kind": "scenario_trigger", "source": None,
+            "enabled": True, "hits": 0, "name": "test",
+        })
+        bus.subscribe("scenario_trigger", lambda e: _fake_bp_handler(emu, e))
+
+        emu.add_timed_event(75, "event_emit", kind="scenario_trigger", source="scenario")
+        emu.simulate_instructions(75)
+
+        self.assertIsNotNone(emu.last_event_break)
+        self.assertEqual(emu.last_event_break["kind"], "scenario_trigger")
+
+
+def _fake_bp_handler(emu, event):
+    if not emu._running:
+        return
+    for bp in emu._event_breakpoints:
+        if bp["kind"] == event.kind and bp["enabled"]:
+            bp["hits"] += 1
+            emu.last_event_break = {
+                "bp_id": bp["id"], "kind": event.kind,
+                "source": getattr(event, "source", ""),
+            }
+            return
+
+
 # ── Board config integration ─────────────────────────────────────
 
 
