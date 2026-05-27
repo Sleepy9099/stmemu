@@ -1266,8 +1266,6 @@ class Emulator:
     def _deliver_pending_exception(self) -> bool:
         if self.core_peripheral is None:
             return False
-        if self._exception_stack:
-            return False
 
         primask = False
         if UC_ARM_REG_PRIMASK is not None:
