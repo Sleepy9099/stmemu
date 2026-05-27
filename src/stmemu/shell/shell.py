@@ -103,6 +103,9 @@ class StmEmuShell(cmd.Cmd):
     def do_wp(self, arg: str) -> None:
         self.default("wp " + arg if arg else "wp")
 
+    def do_break(self, arg: str) -> None:
+        self.default("break " + arg if arg else "break")
+
     def do_snap(self, arg: str) -> None:
         self.default("snap " + arg if arg else "snap")
 
