@@ -33,6 +33,9 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
     _CR1_TCIE = 1 << 6
     _CR1_TXEIE = 1 << 7
 
+    _CR3_DMAR = 1 << 6
+    _CR3_DMAT = 1 << 7
+
     _RQR_RXFRQ = 1 << 3
 
     _ISR_RXFNE = 1 << 5
@@ -124,6 +127,7 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
         value &= ~(self._ISR_RXFNE | self._ISR_TC | self._ISR_TXFNF | self._ISR_TEACK | self._ISR_REACK)
 
         cr1 = self.read_register_value(self._CR1)
+        cr3 = self.read_register_value(self._CR3)
         ue = bool(cr1 & self._CR1_UE)
         te = bool(cr1 & self._CR1_TE)
         re = bool(cr1 & self._CR1_RE)
@@ -141,6 +145,18 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
             self.write_register_value(self._RDR, self._rx_fifo[0])
         else:
             self.write_register_value(self._RDR, 0)
+
+        self._emit_dma_requests(value, cr3)
+
+    def _emit_dma_requests(self, isr: int, cr3: int) -> None:
+        if self._context is None or self._context.bus is None:
+            return
+        base = self._context.base
+        name = self._context.name
+        if (cr3 & self._CR3_DMAR) and (isr & self._ISR_RXFNE):
+            self._context.bus.request_dma(base + self._RDR, "p2m", size=1, source=name)
+        if (cr3 & self._CR3_DMAT) and (isr & self._ISR_TXFNF):
+            self._context.bus.request_dma(base + self._TDR, "m2p", size=1, source=name)
 
     def _update_irq(self) -> None:
         if self.irq is None or self._context is None or self._context.interrupts is None:

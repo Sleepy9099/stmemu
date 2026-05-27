@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, Optional, Protocol
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Callable, Literal, Optional, Protocol
 
 from stmemu.svd.address_map import AddressMap
 from stmemu.svd.model import SvdPeripheral
@@ -12,6 +13,8 @@ log = get_logger(__name__)
 AccessType = Literal["r", "w", "rw"]
 AccessPolicy = Literal["permissive", "warn", "strict"]
 
+EventHandler = Callable[["PeripheralEvent"], None]
+
 
 class InterruptController(Protocol):
     def set_irq_pending(self, irq: int, pending: bool = True) -> None:
@@ -19,6 +22,28 @@ class InterruptController(Protocol):
 
     def set_system_pending(self, name: str, pending: bool = True) -> None:
         ...
+
+
+@dataclass(frozen=True)
+class PeripheralEvent:
+    """Lightweight event emitted by a peripheral on the bus.
+
+    Common event kinds:
+      dma_request   — peripheral has data ready for DMA
+      dma_complete  — DMA transfer finished
+      uart_rx_ready — USART received data
+      uart_tx_empty — USART transmit buffer available
+      timer_update  — timer update event
+      adc_eoc       — ADC end-of-conversion
+      gpio_edge     — GPIO pin edge detected
+    """
+    kind: str
+    source: str = ""
+    address: int = 0
+    direction: str = ""
+    size: int = 0
+    payload: object = None
+
 
 @dataclass
 class MmioWatchpoint:
@@ -91,6 +116,9 @@ class PeripheralBus:
         self._emulator: object | None = None
         self._serial_lines: dict[str, object] = {}
         self._dma_listeners: list[object] = []
+        self._event_subscribers: dict[str, list[EventHandler]] = defaultdict(list)
+        self._event_log: list[PeripheralEvent] = []
+        self.event_log_enabled: bool = False
 
     def register_peripheral(self, name: str, model: PeripheralModel) -> None:
         p = self.amap.find_peripheral_by_name(name)
@@ -156,17 +184,57 @@ class PeripheralBus:
         """Attach the emulator instance so peripherals (e.g. DMA) can access memory."""
         self._emulator = emu
 
+    def subscribe(self, event_kind: str, handler: EventHandler) -> None:
+        """Subscribe to events of a given kind."""
+        self._event_subscribers[event_kind].append(handler)
+
+    def unsubscribe(self, event_kind: str, handler: EventHandler) -> None:
+        """Remove a subscription."""
+        subs = self._event_subscribers.get(event_kind)
+        if subs:
+            try:
+                subs.remove(handler)
+            except ValueError:
+                pass
+
+    def emit(self, event: PeripheralEvent) -> None:
+        """Emit a peripheral event to all subscribers of its kind."""
+        if self.event_log_enabled:
+            self._event_log.append(event)
+        for handler in self._event_subscribers.get(event.kind, ()):
+            handler(event)
+
+    def drain_event_log(self) -> list[PeripheralEvent]:
+        """Return and clear the event log."""
+        events = list(self._event_log)
+        self._event_log.clear()
+        return events
+
     def add_dma_listener(self, dma_model: PeripheralModel) -> None:
-        """Register a DMA controller that can respond to peripheral DMA requests."""
+        """Register a DMA controller for peripheral DMA requests.
+
+        .. deprecated::
+            DMA controllers should migrate to ``bus.subscribe("dma_request", ...)``.
+            This method is kept for backward compatibility during the transition.
+        """
         self._dma_listeners.append(dma_model)
 
-    def request_dma(self, peripheral_addr: int, direction: str, size: int = 1) -> None:
-        """Signal a DMA-capable peripheral event (e.g. RXNE, TXE).
+    def request_dma(
+        self, peripheral_addr: int, direction: str, size: int = 1,
+        *, source: str = "",
+    ) -> None:
+        """Signal a DMA-capable peripheral event.
 
-        Called by peripherals when they have data ready for DMA transfer.
-        DMA controllers check if any enabled stream/channel is configured
-        for this peripheral address and direction.
+        Emits a ``dma_request`` event and also dispatches directly to
+        legacy DMA listeners for backward compatibility.
         """
+        self.emit(PeripheralEvent(
+            kind="dma_request",
+            source=source,
+            address=peripheral_addr,
+            direction=direction,
+            size=size,
+        ))
         for dma in self._dma_listeners:
             if hasattr(dma, "on_peripheral_request"):
                 dma.on_peripheral_request(peripheral_addr, direction, size)
