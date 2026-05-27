@@ -231,6 +231,10 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             irq = self._irqs.get(stream)
             if irq is not None:
                 self._context.interrupts.set_irq_pending(irq)
+        par = self.read_register_value(
+            self._STREAM_BASE + stream * self._STREAM_STRIDE + self._SxPAR,
+        )
+        self._emit_dma_event("dma_half", stream, cr, par, 0)
 
     def _emit_dma_event(
         self, kind: str, stream: int, cr: int, par: int, byte_count: int,

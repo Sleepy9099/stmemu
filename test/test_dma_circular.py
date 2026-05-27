@@ -189,6 +189,26 @@ class DmaCircularTests(unittest.TestCase):
         lisr = dma.read_register_value(dma._LISR)
         self.assertTrue(lisr & (1 << 4), "HTIF should be set at midpoint")
 
+    def test_circular_dma_half_event(self):
+        bus, dma, nvic, emu = _make_dma_bus()
+        bus.event_log_enabled = True
+        so = dma._STREAM_BASE
+        dma.write_register_value(so + dma._SxNDTR, 4)
+        dma.write_register_value(so + dma._SxPAR, 0x40004424)
+        dma.write_register_value(so + dma._SxM0AR, 0x100)
+        cr = dma._SxCR_EN | dma._SxCR_CIRC | dma._SxCR_MINC
+        dma.write(so + dma._SxCR, 4, cr)
+        bus.drain_event_log()
+
+        dma.on_peripheral_request(0x40004424, "p2m")
+        self.assertEqual(len([e for e in bus.drain_event_log() if e.kind == "dma_half"]), 0)
+
+        dma.on_peripheral_request(0x40004424, "p2m")
+        log = bus.drain_event_log()
+        half_events = [e for e in log if e.kind == "dma_half"]
+        self.assertEqual(len(half_events), 1)
+        self.assertEqual(half_events[0].source, "DMA1")
+
     def test_circular_tcie_irq(self):
         bus, dma, nvic, emu = _make_dma_bus()
         so = dma._STREAM_BASE
