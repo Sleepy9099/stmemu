@@ -3,68 +3,69 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from stmemu.peripherals.bus import PeripheralContext
+from stmemu.peripherals.bus import PeripheralContext, PeripheralEvent
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.svd.model import SvdPeripheral
 from stmemu.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+_STREAM_FLAG_BITS: dict[int, tuple[int, int, int]] = {
+    0: (0, 5, 4),
+    1: (0, 11, 10),
+    2: (0, 21, 20),
+    3: (0, 27, 26),
+    4: (1, 5, 4),
+    5: (1, 11, 10),
+    6: (1, 21, 20),
+    7: (1, 27, 26),
+}
+
 
 @dataclass
 class DmaPeripheral(GenericRegisterFilePeripheral):
-    """DMA controller with transfer-complete flag simulation and memory transfer.
+    """DMA controller with normal and circular transfer modes.
 
-    When a stream/channel is enabled, the model:
-    1. Performs the configured memory transfer (if an emulator is available)
-    2. Sets the transfer-complete flag in the status register
-    3. Clears the enable bit (hardware does this on completion)
-    4. Optionally pends the transfer-complete interrupt
+    Normal mode: bulk transfer on enable, then EN clears.
+    Circular mode: incremental per-request transfers that wrap the
+    memory pointer and reload NDTR at each cycle boundary.
     """
 
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
 
-    # Global status register offsets (STM32F4/F7/H7 DMA layout)
-    _LISR = 0x00  # Low interrupt status register
-    _HISR = 0x04  # High interrupt status register
-    _LIFCR = 0x08  # Low interrupt flag clear register
-    _HIFCR = 0x0C  # High interrupt flag clear register
+    _LISR = 0x00
+    _HISR = 0x04
+    _LIFCR = 0x08
+    _HIFCR = 0x0C
 
-    # Per-stream register stride (STM32F4/F7/H7)
     _STREAM_BASE = 0x10
     _STREAM_STRIDE = 0x18
 
-    # Offsets within each stream block
-    _SxCR = 0x00   # Stream config
-    _SxNDTR = 0x04  # Number of data items
-    _SxPAR = 0x08   # Peripheral address
-    _SxM0AR = 0x0C  # Memory 0 address
-    _SxM1AR = 0x10  # Memory 1 address
-    _SxFCR = 0x14   # FIFO control
+    _SxCR = 0x00
+    _SxNDTR = 0x04
+    _SxPAR = 0x08
+    _SxM0AR = 0x0C
+    _SxM1AR = 0x10
+    _SxFCR = 0x14
 
     _SxCR_EN = 1 << 0
     _SxCR_TCIE = 1 << 4
+    _SxCR_HTIE = 1 << 3
+    _SxCR_CIRC = 1 << 8
     _SxCR_DIR_SHIFT = 6
     _SxCR_DIR_MASK = 0x3
     _SxCR_MSIZE_SHIFT = 13
     _SxCR_PSIZE_SHIFT = 11
+    _SxCR_MINC = 1 << 10
 
-    _DIR_P2M = 0  # peripheral to memory
-    _DIR_M2P = 1  # memory to peripheral
-    _DIR_M2M = 2  # memory to memory
-
-    _STREAM_TC_BITS = {
-        0: (0, 5),
-        1: (0, 11),
-        2: (0, 21),
-        3: (0, 27),
-        4: (1, 5),
-        5: (1, 11),
-        6: (1, 21),
-        7: (1, 27),
-    }
+    _DIR_P2M = 0
+    _DIR_M2P = 1
+    _DIR_M2M = 2
 
     _irqs: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _stream_ndtr_reload: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _stream_mar_base: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _stream_pos: dict[int, int] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -91,11 +92,6 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             context.bus.add_dma_listener(self)
 
     def on_peripheral_request(self, periph_addr: int, direction: str, size: int = 1) -> None:
-        """Handle a DMA request from a peripheral.
-
-        Scans enabled streams to find one configured for this peripheral
-        address and direction, then executes the transfer.
-        """
         dir_map = {"p2m": self._DIR_P2M, "m2p": self._DIR_M2P}
         expected_dir = dir_map.get(direction.lower())
         if expected_dir is None:
@@ -108,7 +104,10 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             par = self.read_register_value(stream_offset + self._SxPAR)
             actual_dir = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
             if par == periph_addr and actual_dir == expected_dir:
-                self._execute_transfer(stream)
+                if cr & self._SxCR_CIRC:
+                    self._transfer_one_item(stream)
+                else:
+                    self._execute_transfer(stream)
                 break
 
     def write(self, offset: int, size: int, value: int) -> None:
@@ -127,7 +126,62 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
             cr_offset = stream_offset + self._SxCR
             if offset == cr_offset and (int(value) & self._SxCR_EN):
-                self._execute_transfer(stream)
+                self._on_stream_enable(stream)
+
+    def _on_stream_enable(self, stream: int) -> None:
+        stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
+        cr = self.read_register_value(stream_offset + self._SxCR)
+        ndtr = self.read_register_value(stream_offset + self._SxNDTR) & 0xFFFF
+        mar = self.read_register_value(stream_offset + self._SxM0AR)
+        self._stream_ndtr_reload[stream] = ndtr
+        self._stream_mar_base[stream] = mar
+        self._stream_pos[stream] = 0
+
+        if cr & self._SxCR_CIRC:
+            pass
+        else:
+            self._execute_transfer(stream)
+
+    def _transfer_one_item(self, stream: int) -> None:
+        stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
+        cr = self.read_register_value(stream_offset + self._SxCR)
+        par = self.read_register_value(stream_offset + self._SxPAR)
+        direction = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
+        item_size = 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)
+
+        reload = self._stream_ndtr_reload.get(stream, 0)
+        if reload == 0:
+            return
+        pos = self._stream_pos.get(stream, 0)
+        mar_base = self._stream_mar_base.get(stream, 0)
+
+        if cr & self._SxCR_MINC:
+            mar = mar_base + pos * item_size
+        else:
+            mar = mar_base
+
+        emu = self._get_emulator()
+        if emu is not None:
+            try:
+                self._do_transfer(emu, direction, par, mar, item_size)
+            except Exception:
+                log.debug("DMA stream %d item transfer failed", stream)
+
+        pos += 1
+        ndtr = reload - pos
+
+        half = reload // 2
+        if pos == half and half > 0:
+            self._set_htif(stream, cr)
+
+        if ndtr <= 0:
+            self._set_tcif(stream, cr)
+            pos = 0
+            ndtr = reload
+            self._emit_dma_event("dma_complete", stream, cr, par, reload * item_size)
+
+        self._stream_pos[stream] = pos
+        self.write_register_value(stream_offset + self._SxNDTR, ndtr)
 
     def _execute_transfer(self, stream: int) -> None:
         stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
@@ -146,30 +200,48 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             except Exception:
                 log.debug("DMA stream %d transfer failed", stream)
 
-        tc_info = self._STREAM_TC_BITS.get(stream)
-        if tc_info is not None:
-            reg_idx, bit = tc_info
-            isr_offset = self._LISR if reg_idx == 0 else self._HISR
-            isr = self.read_register_value(isr_offset)
-            self.write_register_value(isr_offset, isr | (1 << bit))
-
-        self.write_register_value(
-            stream_offset + self._SxCR, cr & ~self._SxCR_EN,
-        )
+        self._set_tcif(stream, cr)
+        self.write_register_value(stream_offset + self._SxCR, cr & ~self._SxCR_EN)
         self.write_register_value(stream_offset + self._SxNDTR, 0)
+        self._emit_dma_event("dma_complete", stream, cr, par,
+                             ndtr * max(1, 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)))
 
+    def _set_tcif(self, stream: int, cr: int) -> None:
+        info = _STREAM_FLAG_BITS.get(stream)
+        if info is None:
+            return
+        reg_idx, tc_bit, _ = info
+        isr_offset = self._LISR if reg_idx == 0 else self._HISR
+        isr = self.read_register_value(isr_offset)
+        self.write_register_value(isr_offset, isr | (1 << tc_bit))
         if (cr & self._SxCR_TCIE) and self._context and self._context.interrupts:
             irq = self._irqs.get(stream)
             if irq is not None:
                 self._context.interrupts.set_irq_pending(irq)
 
+    def _set_htif(self, stream: int, cr: int) -> None:
+        info = _STREAM_FLAG_BITS.get(stream)
+        if info is None:
+            return
+        reg_idx, _, ht_bit = info
+        isr_offset = self._LISR if reg_idx == 0 else self._HISR
+        isr = self.read_register_value(isr_offset)
+        self.write_register_value(isr_offset, isr | (1 << ht_bit))
+        if (cr & self._SxCR_HTIE) and self._context and self._context.interrupts:
+            irq = self._irqs.get(stream)
+            if irq is not None:
+                self._context.interrupts.set_irq_pending(irq)
+
+    def _emit_dma_event(
+        self, kind: str, stream: int, cr: int, par: int, byte_count: int,
+    ) -> None:
         if self._context and self._context.bus:
-            from stmemu.peripherals.bus import PeripheralEvent
+            direction = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
             self._context.bus.emit(PeripheralEvent(
-                kind="dma_complete",
+                kind=kind,
                 source=self._context.name,
                 address=par,
-                payload={"stream": stream, "direction": direction, "bytes": ndtr * max(1, 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3))},
+                payload={"stream": stream, "direction": direction, "bytes": byte_count},
             ))
 
     def _do_transfer(
@@ -213,6 +285,9 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
 
     def reset(self) -> None:
         super().reset()
+        self._stream_ndtr_reload.clear()
+        self._stream_mar_base.clear()
+        self._stream_pos.clear()
 
 
 def build_dma(peripheral: SvdPeripheral) -> DmaPeripheral:

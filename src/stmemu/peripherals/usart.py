@@ -59,12 +59,12 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
         self._update_irq()
 
     def read(self, offset: int, size: int) -> int:
-        if size == 4 and offset == self._RDR:
+        if offset == self._RDR:
             value = self._rx_fifo.popleft() if self._rx_fifo else 0
             self.write_register_value(self._RDR, value)
             self._refresh_status()
             self._update_irq()
-            return value
+            return value & ((1 << (size * 8)) - 1)
 
         if size == 4 and offset == self._ISR:
             self._refresh_status()
@@ -99,8 +99,11 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
             self._update_irq()
 
     def inject_rx_bytes(self, data: bytes) -> None:
+        cr3 = self.read_register_value(self._CR3)
         for byte in data:
             self._rx_fifo.append(int(byte) & 0xFF)
+            if cr3 & self._CR3_DMAR:
+                self._refresh_status()
         self._refresh_status()
         self._update_irq()
 
