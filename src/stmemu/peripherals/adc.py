@@ -31,6 +31,7 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
     _sample_queue: deque[int] = field(default_factory=deque, init=False, repr=False)
     _calibration_reads_remaining: int = field(default=0, init=False, repr=False)
     _conversion_count: int = field(default=0, init=False, repr=False)
+    _trigger_source: str = field(default="", init=False, repr=False)
 
     _CR = 0x08
     _ISR = 0x00
@@ -72,12 +73,15 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
 
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
+        if context.bus is not None:
+            context.bus.subscribe("timer_update", self._on_timer_update)
 
     def reset(self) -> None:
         super().reset()
         self._sample_queue.clear()
         self._calibration_reads_remaining = 0
         self._conversion_count = 0
+        self._trigger_source = ""
 
     def write(self, offset: int, size: int, value: int) -> None:
         if size == 4 and offset == self._ISR:
@@ -165,6 +169,23 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
         )
         self._context.interrupts.set_irq_pending(self.irq, pending)
 
+    def set_external_trigger(self, source: str) -> None:
+        """Configure a timer (by name) as the external trigger source."""
+        self._trigger_source = source.upper()
+
+    def clear_external_trigger(self) -> None:
+        self._trigger_source = ""
+
+    def _on_timer_update(self, event: PeripheralEvent) -> None:
+        if not self._trigger_source:
+            return
+        if event.source.upper() != self._trigger_source:
+            return
+        cr = self.read_register_value(self._CR)
+        if not (cr & self._CR_ADEN):
+            return
+        self._do_conversion()
+
     def inject_sample(self, value: int) -> None:
         """Queue a sample value for the next conversion."""
         self._sample_queue.append(int(value) & 0xFFFF)
@@ -182,6 +203,7 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
         base["sample_queue"] = list(self._sample_queue)
         base["conversion_count"] = self._conversion_count
         base["default_sample"] = self.default_sample
+        base["trigger_source"] = self._trigger_source
         return base
 
     def restore_state(self, state: object) -> None:
@@ -194,6 +216,7 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
             self._sample_queue = deque(int(v) & 0xFFFF for v in sq)
         self._conversion_count = int(state.get("conversion_count", 0))
         self.default_sample = int(state.get("default_sample", self.default_sample))
+        self._trigger_source = str(state.get("trigger_source", ""))
 
 
 def _first_irq(peripheral: SvdPeripheral) -> int | None:
