@@ -165,6 +165,7 @@ class UsartDmaCouplingTests(unittest.TestCase):
         self.assertGreater(len(dma_reqs), 0)
         self.assertEqual(dma_reqs[0].direction, "p2m")
         self.assertEqual(dma_reqs[0].address, 0x40004400 + 0x24)
+        self.assertEqual(dma_reqs[0].source, "USART1")
 
     def test_no_dma_request_without_dmar(self):
         bus, uart = self._make_bus_with_usart()

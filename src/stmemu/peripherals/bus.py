@@ -211,17 +211,26 @@ class PeripheralBus:
         return events
 
     def add_dma_listener(self, dma_model: PeripheralModel) -> None:
-        """Register a DMA controller that can respond to peripheral DMA requests."""
+        """Register a DMA controller for peripheral DMA requests.
+
+        .. deprecated::
+            DMA controllers should migrate to ``bus.subscribe("dma_request", ...)``.
+            This method is kept for backward compatibility during the transition.
+        """
         self._dma_listeners.append(dma_model)
 
-    def request_dma(self, peripheral_addr: int, direction: str, size: int = 1) -> None:
+    def request_dma(
+        self, peripheral_addr: int, direction: str, size: int = 1,
+        *, source: str = "",
+    ) -> None:
         """Signal a DMA-capable peripheral event.
 
         Emits a ``dma_request`` event and also dispatches directly to
-        registered DMA listeners for backward compatibility.
+        legacy DMA listeners for backward compatibility.
         """
         self.emit(PeripheralEvent(
             kind="dma_request",
+            source=source,
             address=peripheral_addr,
             direction=direction,
             size=size,
