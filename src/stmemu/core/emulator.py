@@ -1266,8 +1266,6 @@ class Emulator:
     def _deliver_pending_exception(self) -> bool:
         if self.core_peripheral is None:
             return False
-        if self._exception_stack:
-            return False
 
         primask = False
         if UC_ARM_REG_PRIMASK is not None:
@@ -1276,16 +1274,16 @@ class Emulator:
             except Exception:
                 primask = False
 
-        basepri_active = False
+        basepri_val = 0
         if UC_ARM_REG_BASEPRI is not None:
             try:
-                basepri_active = bool(int(self.uc.reg_read(UC_ARM_REG_BASEPRI)) & 0xFF)
+                basepri_val = int(self.uc.reg_read(UC_ARM_REG_BASEPRI)) & 0xFF
             except Exception:
-                basepri_active = False
+                basepri_val = 0
 
         exc_num = self.core_peripheral.next_pending_exception(
             primask=primask,
-            basepri=basepri_active,
+            basepri=basepri_val,
         )
         if exc_num is None:
             return False

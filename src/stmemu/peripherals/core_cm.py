@@ -24,7 +24,9 @@ class CortexMCorePeripheral(RegisterPeripheral):
     _NVIC_ISPR_BASE = 0xE200
     _NVIC_ICPR_BASE = 0xE280
     _NVIC_IABR_BASE = 0xE300
+    _NVIC_IPR_BASE = 0xE400
     _NVIC_WORDS = 8
+    _NVIC_IPR_WORDS = 60
     _EXC_NMI = 2
     _EXC_SVC = 11
     _EXC_PENDSV = 14
@@ -38,6 +40,7 @@ class CortexMCorePeripheral(RegisterPeripheral):
         self._irq_enabled: list[int] = [0] * self._NVIC_WORDS
         self._irq_pending: list[int] = [0] * self._NVIC_WORDS
         self._irq_active: list[int] = [0] * self._NVIC_WORDS
+        self._irq_priority: list[int] = [0] * 240
         self._system_pending: dict[str, bool] = {
             "SysTick": False,
             "PendSV": False,
@@ -76,6 +79,14 @@ class CortexMCorePeripheral(RegisterPeripheral):
         self._add_nvic_bank("NVIC.ISPR", self._NVIC_ISPR_BASE, self._read_pending_word, self._write_ispr_word)
         self._add_nvic_bank("NVIC.ICPR", self._NVIC_ICPR_BASE, self._read_pending_word, self._write_icpr_word)
         self._add_nvic_bank("NVIC.IABR", self._NVIC_IABR_BASE, self._read_active_word, self._ignore_write_word)
+        for i in range(self._NVIC_IPR_WORDS):
+            offset = self._NVIC_IPR_BASE + i * 4
+            self.add_register(RegisterSpec(
+                name=f"NVIC.IPR{i}",
+                offset=offset,
+                on_read=self._make_ipr_read(i),
+                on_write=self._make_ipr_write(i),
+            ))
 
     @property
     def vtor(self) -> int:
@@ -141,27 +152,73 @@ class CortexMCorePeripheral(RegisterPeripheral):
     def current_active_exception(self) -> int:
         return self._active_exceptions[-1] if self._active_exceptions else 0
 
-    def next_pending_exception(self, primask: bool = False, basepri: bool = False) -> int | None:
-        candidates: list[int] = []
+    def next_pending_exception(
+        self, primask: bool = False, basepri: int | bool = False,
+    ) -> int | None:
+        """Return the highest-priority pending exception that can preempt.
+
+        Considers:
+        - PRIMASK: blocks all configurable exceptions (not NMI)
+        - BASEPRI: blocks exceptions with priority >= basepri value
+        - Active exception priority: only higher-priority (lower number)
+          exceptions can preempt
+        """
+        basepri_val = 0
+        if isinstance(basepri, bool):
+            basepri_val = 0xFF if basepri else 0
+        else:
+            basepri_val = int(basepri) & 0xFF
+
+        current_priority = self._running_priority()
+
+        best_exc: int | None = None
+        best_priority = current_priority
 
         if self._system_pending["NMI"]:
-            candidates.append(self._EXC_NMI)
+            nmi_pri = self.exception_priority(self._EXC_NMI)
+            if nmi_pri < best_priority:
+                best_exc = self._EXC_NMI
+                best_priority = nmi_pri
 
-        # Without modeled priorities, treat BASEPRI as masking all configurable
-        # exceptions (PendSV, SysTick, external IRQs). NMI remains unmasked.
-        if not primask and not basepri:
-            if self._system_pending["PendSV"]:
-                candidates.append(self._EXC_PENDSV)
-            if self._system_pending["SysTick"]:
-                candidates.append(self._EXC_SYSTICK)
+        if not primask:
+            for exc_num, pending in (
+                (self._EXC_PENDSV, self._system_pending["PendSV"]),
+                (self._EXC_SYSTICK, self._system_pending["SysTick"]),
+            ):
+                if not pending:
+                    continue
+                pri = self.exception_priority(exc_num)
+                if basepri_val and pri >= basepri_val:
+                    continue
+                if pri < best_priority:
+                    best_exc = exc_num
+                    best_priority = pri
+
             for irq in self.pending_irqs():
-                state = self.irq_state(irq)
-                if state["enabled"]:
-                    candidates.append(16 + irq)
+                if not (self._irq_enabled[irq // 32] & (1 << (irq % 32))):
+                    continue
+                if self._irq_active[irq // 32] & (1 << (irq % 32)):
+                    continue
+                exc_num = 16 + irq
+                pri = self.exception_priority(exc_num)
+                if basepri_val and pri >= basepri_val:
+                    continue
+                if pri < best_priority:
+                    best_exc = exc_num
+                    best_priority = pri
 
-        if not candidates:
-            return None
-        return min(candidates)
+        return best_exc
+
+    def _running_priority(self) -> int:
+        """Return the priority of the currently executing exception, or 0x100 for Thread mode."""
+        if not self._active_exceptions:
+            return 0x100
+        best = 0x100
+        for exc in self._active_exceptions:
+            p = self.exception_priority(exc)
+            if p < best:
+                best = p
+        return best
 
     def enter_exception(self, exc_num: int) -> None:
         number = int(exc_num)
@@ -313,6 +370,51 @@ class CortexMCorePeripheral(RegisterPeripheral):
         del value
         return self._irq_active[word]
 
+    def _make_ipr_read(self, word: int):
+        def _read(current: int) -> int:
+            base_irq = word * 4
+            val = 0
+            for i in range(4):
+                irq = base_irq + i
+                if irq < len(self._irq_priority):
+                    val |= (self._irq_priority[irq] & 0xFF) << (i * 8)
+            return val
+        return _read
+
+    def _make_ipr_write(self, word: int):
+        def _write(current: int, next_value: int) -> int:
+            base_irq = word * 4
+            for i in range(4):
+                irq = base_irq + i
+                if irq < len(self._irq_priority):
+                    self._irq_priority[irq] = (next_value >> (i * 8)) & 0xFF
+            return next_value
+        return _write
+
+    def irq_priority(self, irq: int) -> int:
+        if 0 <= irq < len(self._irq_priority):
+            return self._irq_priority[irq]
+        return 0
+
+    def set_irq_priority(self, irq: int, priority: int) -> None:
+        if 0 <= irq < len(self._irq_priority):
+            self._irq_priority[irq] = priority & 0xFF
+
+    def exception_priority(self, exc_num: int) -> int:
+        if exc_num < 0:
+            return -1
+        if exc_num == self._EXC_NMI:
+            return -2
+        if exc_num == self._EXC_SVC:
+            return 0
+        if exc_num == self._EXC_PENDSV:
+            return 0xFF
+        if exc_num == self._EXC_SYSTICK:
+            return 0xFF
+        if exc_num >= 16:
+            return self.irq_priority(exc_num - 16)
+        return 0
+
     def _sync_irq_words(self, word: int) -> int:
         self.write_register_value(self._NVIC_ISER_BASE + (word * 4), self._irq_enabled[word])
         self.write_register_value(self._NVIC_ICER_BASE + (word * 4), self._irq_enabled[word])
@@ -391,6 +493,7 @@ class CortexMCorePeripheral(RegisterPeripheral):
                 "irq_enabled": [int(x) & 0xFFFFFFFF for x in self._irq_enabled],
                 "irq_pending": [int(x) & 0xFFFFFFFF for x in self._irq_pending],
                 "irq_active": [int(x) & 0xFFFFFFFF for x in self._irq_active],
+                "irq_priority": [int(x) & 0xFF for x in self._irq_priority],
                 "system_pending": {k: bool(v) for k, v in self._system_pending.items()},
                 "active_exceptions": [int(x) for x in self._active_exceptions],
             }
@@ -416,6 +519,11 @@ class CortexMCorePeripheral(RegisterPeripheral):
         if isinstance(irq_active, list):
             self._irq_active = [int(x) & 0xFFFFFFFF for x in irq_active[: self._NVIC_WORDS]]
             self._irq_active += [0] * max(0, self._NVIC_WORDS - len(self._irq_active))
+
+        irq_priority = state.get("irq_priority")
+        if isinstance(irq_priority, list):
+            for i, v in enumerate(irq_priority[:240]):
+                self._irq_priority[i] = int(v) & 0xFF
 
         system_pending = state.get("system_pending")
         if isinstance(system_pending, dict):
