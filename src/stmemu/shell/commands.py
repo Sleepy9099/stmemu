@@ -3588,7 +3588,10 @@ class Commands:
             except Exception as e:
                 return f"error loading board config: {e}"
             try:
-                messages = apply_board_config(config, self.bus, self.emu)
+                messages = apply_board_config(
+                    config, self.bus, self.emu,
+                    base_dir=path.parent,
+                )
             except Exception as e:
                 return f"error applying board config: {e}"
             return "\n".join(messages) if messages else "board config applied (empty)"

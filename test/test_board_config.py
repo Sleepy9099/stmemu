@@ -249,6 +249,181 @@ class BoardConfigApplyTests(unittest.TestCase):
         self.assertTrue(any("register" in m or "reg" in m for m in msgs))
 
 
+class BoardConfigRegisterTests(unittest.TestCase):
+    def test_peripheral_register_write(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        cfg = {
+            "registers": [
+                {"peripheral": "GPIOA", "register": "ODR", "value": "0x00FF"},
+            ],
+        }
+        msgs = apply_board_config(cfg, bus)
+        odr = gpio.read_register_value(0x14)
+        self.assertEqual(odr, 0xFF)
+        self.assertTrue(any("GPIOA.ODR" in m for m in msgs))
+
+    def test_cpu_register_write(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            _regs = {}
+            def write_reg(self, name, value):
+                self._regs[name] = value
+        emu = _FakeEmu()
+
+        cfg = {"registers": [{"reg": "r0", "value": "0x12345678"}]}
+        msgs = apply_board_config(cfg, bus, emu)
+        self.assertEqual(emu._regs["r0"], 0x12345678)
+
+    def test_unknown_peripheral(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        cfg = {"registers": [{"peripheral": "BOGUS", "register": "X", "value": "0"}]}
+        msgs = apply_board_config(cfg, bus)
+        self.assertTrue(any("not found" in m for m in msgs))
+
+
+class BoardConfigMemoryTests(unittest.TestCase):
+    def test_hex_memory_write(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            _mem = {}
+            def mem_write(self, addr, data):
+                self._mem[addr] = bytes(data)
+        emu = _FakeEmu()
+
+        cfg = {"memory": [{"address": "0x20001000", "hex": "DEADBEEF"}]}
+        msgs = apply_board_config(cfg, bus, emu)
+        self.assertEqual(emu._mem[0x20001000], b"\xDE\xAD\xBE\xEF")
+        self.assertTrue(any("4B" in m for m in msgs))
+
+    def test_missing_data(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            def mem_write(self, addr, data): pass
+        cfg = {"memory": [{"address": "0x20000000"}]}
+        msgs = apply_board_config(cfg, bus, _FakeEmu())
+        self.assertTrue(any("missing" in m for m in msgs))
+
+
+class BoardConfigBreakpointTests(unittest.TestCase):
+    def test_pc_breakpoints(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            _bps = []
+            def add_breakpoint(self, addr):
+                self._bps.append(addr)
+        emu = _FakeEmu()
+
+        cfg = {"breakpoints": {"pc": ["0x08001000", "0x08002000"]}}
+        msgs = apply_board_config(cfg, bus, emu)
+        self.assertEqual(len(emu._bps), 2)
+        self.assertIn(0x08001000, emu._bps)
+
+    def test_event_breakpoints(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            _evts = []
+            def add_event_breakpoint(self, kind, source=None):
+                self._evts.append((kind, source))
+                return len(self._evts)
+        emu = _FakeEmu()
+
+        cfg = {"breakpoints": {"events": [
+            {"kind": "timer_update", "source": "TIM2"},
+            {"kind": "adc_eoc"},
+        ]}}
+        msgs = apply_board_config(cfg, bus, emu)
+        self.assertEqual(len(emu._evts), 2)
+        self.assertEqual(emu._evts[0], ("timer_update", "TIM2"))
+        self.assertEqual(emu._evts[1][1], None)
+
+    def test_watchpoints(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            _wps = []
+            def add_watchpoint(self, start, end, access="rw", name=""):
+                self._wps.append((start, end, access))
+                return len(self._wps)
+        emu = _FakeEmu()
+
+        cfg = {"breakpoints": {"watchpoints": [
+            {"start": "0x20000100", "end": "0x20000200", "access": "w"},
+        ]}}
+        msgs = apply_board_config(cfg, bus, emu)
+        self.assertEqual(len(emu._wps), 1)
+        self.assertEqual(emu._wps[0][2], "w")
+
+
+class BoardConfigEmulatorTests(unittest.TestCase):
+    def test_emulator_settings(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            tick_scale = 1
+            stuck_loop_threshold = 5000
+            interrupt_stuck_threshold = 50000000
+            trace_enabled = False
+            coverage_enabled = False
+        emu = _FakeEmu()
+
+        cfg = {"emulator": {
+            "tick_scale": 10,
+            "stuck_threshold": 1000,
+            "trace": True,
+            "coverage": True,
+        }}
+        msgs = apply_board_config(cfg, bus, emu)
+        self.assertEqual(emu.tick_scale, 10)
+        self.assertEqual(emu.stuck_loop_threshold, 1000)
+        self.assertTrue(emu.trace_enabled)
+        self.assertTrue(emu.coverage_enabled)
+
+    def test_timed_events_stored(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+
+        class _FakeEmu:
+            pass
+        emu = _FakeEmu()
+
+        cfg = {"timed_events": [
+            {"at": 10000, "action": "gpio_inject", "port": "GPIOA", "pin": 0, "level": "high"},
+            {"at": 50000, "action": "uart_inject", "peripheral": "USART1", "hex": "AABB"},
+        ]}
+        msgs = apply_board_config(cfg, bus, emu)
+        self.assertEqual(len(emu._scenario_timed_events), 2)
+        self.assertTrue(any("2 registered" in m for m in msgs))
+
+
+class BoardConfigNestedTests(unittest.TestCase):
+    def test_board_subsection(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        cfg = {
+            "board": {
+                "gpio_levels": {"GPIOA": {"0": "high"}},
+            },
+        }
+        msgs = apply_board_config(cfg, bus)
+        idr = gpio.read(0x10, 4)
+        self.assertTrue(idr & 1)
+
+    def test_mixed_top_level_and_board(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        cfg = {
+            "board": {
+                "gpio_levels": {"GPIOA": {"0": "high"}},
+            },
+            "adc": {"ADC1": {"default_sample": 999}},
+        }
+        msgs = apply_board_config(cfg, bus)
+        self.assertTrue(gpio.read(0x10, 4) & 1)
+        self.assertEqual(adc.default_sample, 999)
+
+
 class BoardConfigShellTests(unittest.TestCase):
     def setUp(self):
         from stmemu.shell.commands import Commands
