@@ -13,6 +13,9 @@ class CortexMCorePeripheral(RegisterPeripheral):
 
     _SCB_VTOR = 0xED08
     _SCB_ICSR = 0xED04
+    _SCB_SHPR1 = 0xED18
+    _SCB_SHPR2 = 0xED1C
+    _SCB_SHPR3 = 0xED20
     _SCB_DEMCR = 0xEDFC
     _DWT_CTRL = 0x1000
     _DWT_CYCCNT = 0x1004
@@ -41,6 +44,7 @@ class CortexMCorePeripheral(RegisterPeripheral):
         self._irq_pending: list[int] = [0] * self._NVIC_WORDS
         self._irq_active: list[int] = [0] * self._NVIC_WORDS
         self._irq_priority: list[int] = [0] * 240
+        self._sys_priority: list[int] = [0] * 16
         self._system_pending: dict[str, bool] = {
             "SysTick": False,
             "PendSV": False,
@@ -50,6 +54,18 @@ class CortexMCorePeripheral(RegisterPeripheral):
         self.add_register(RegisterSpec(name="SCB.ICSR", offset=self._SCB_ICSR, on_read=self._on_read_icsr, on_write=self._on_write_icsr))
         self.add_register(RegisterSpec(name="SCB.VTOR", offset=self._SCB_VTOR, reset_value=vtor))
         self.add_register(RegisterSpec(name="SCB.DEMCR", offset=self._SCB_DEMCR))
+        self.add_register(RegisterSpec(
+            name="SCB.SHPR1", offset=self._SCB_SHPR1,
+            on_read=self._on_read_shpr1, on_write=self._on_write_shpr1,
+        ))
+        self.add_register(RegisterSpec(
+            name="SCB.SHPR2", offset=self._SCB_SHPR2,
+            on_read=self._on_read_shpr2, on_write=self._on_write_shpr2,
+        ))
+        self.add_register(RegisterSpec(
+            name="SCB.SHPR3", offset=self._SCB_SHPR3,
+            on_read=self._on_read_shpr3, on_write=self._on_write_shpr3,
+        ))
         self.add_register(RegisterSpec(name="DWT.CTRL", offset=self._DWT_CTRL))
         self.add_register(
             RegisterSpec(
@@ -401,19 +417,73 @@ class CortexMCorePeripheral(RegisterPeripheral):
             self._irq_priority[irq] = priority & 0xFF
 
     def exception_priority(self, exc_num: int) -> int:
+        """Return the effective priority for an exception number.
+
+        Fixed priorities: Reset=-3, NMI=-2, HardFault=-1.
+        Configurable: exceptions 4-15 via SHPR, IRQs 0+ via NVIC_IPR.
+        """
         if exc_num < 0:
             return -1
+        if exc_num == 1:
+            return -3
         if exc_num == self._EXC_NMI:
             return -2
-        if exc_num == self._EXC_SVC:
-            return 0
-        if exc_num == self._EXC_PENDSV:
-            return 0xFF
-        if exc_num == self._EXC_SYSTICK:
-            return 0xFF
+        if exc_num == 3:
+            return -1
+        if 4 <= exc_num <= 15:
+            return self._sys_priority[exc_num]
         if exc_num >= 16:
             return self.irq_priority(exc_num - 16)
         return 0
+
+    def set_system_priority(self, exc_num: int, priority: int) -> None:
+        if 4 <= exc_num <= 15:
+            self._sys_priority[exc_num] = priority & 0xFF
+
+    def _on_read_shpr1(self, current: int) -> int:
+        return (
+            (self._sys_priority[4])
+            | (self._sys_priority[5] << 8)
+            | (self._sys_priority[6] << 16)
+            | (self._sys_priority[7] << 24)
+        )
+
+    def _on_write_shpr1(self, current: int, next_value: int) -> int:
+        self._sys_priority[4] = next_value & 0xFF
+        self._sys_priority[5] = (next_value >> 8) & 0xFF
+        self._sys_priority[6] = (next_value >> 16) & 0xFF
+        self._sys_priority[7] = (next_value >> 24) & 0xFF
+        return next_value
+
+    def _on_read_shpr2(self, current: int) -> int:
+        return (
+            (self._sys_priority[8])
+            | (self._sys_priority[9] << 8)
+            | (self._sys_priority[10] << 16)
+            | (self._sys_priority[11] << 24)
+        )
+
+    def _on_write_shpr2(self, current: int, next_value: int) -> int:
+        self._sys_priority[8] = next_value & 0xFF
+        self._sys_priority[9] = (next_value >> 8) & 0xFF
+        self._sys_priority[10] = (next_value >> 16) & 0xFF
+        self._sys_priority[11] = (next_value >> 24) & 0xFF
+        return next_value
+
+    def _on_read_shpr3(self, current: int) -> int:
+        return (
+            (self._sys_priority[12])
+            | (self._sys_priority[13] << 8)
+            | (self._sys_priority[14] << 16)
+            | (self._sys_priority[15] << 24)
+        )
+
+    def _on_write_shpr3(self, current: int, next_value: int) -> int:
+        self._sys_priority[12] = next_value & 0xFF
+        self._sys_priority[13] = (next_value >> 8) & 0xFF
+        self._sys_priority[14] = (next_value >> 16) & 0xFF
+        self._sys_priority[15] = (next_value >> 24) & 0xFF
+        return next_value
 
     def _sync_irq_words(self, word: int) -> int:
         self.write_register_value(self._NVIC_ISER_BASE + (word * 4), self._irq_enabled[word])
@@ -494,6 +564,7 @@ class CortexMCorePeripheral(RegisterPeripheral):
                 "irq_pending": [int(x) & 0xFFFFFFFF for x in self._irq_pending],
                 "irq_active": [int(x) & 0xFFFFFFFF for x in self._irq_active],
                 "irq_priority": [int(x) & 0xFF for x in self._irq_priority],
+                "sys_priority": [int(x) & 0xFF for x in self._sys_priority],
                 "system_pending": {k: bool(v) for k, v in self._system_pending.items()},
                 "active_exceptions": [int(x) for x in self._active_exceptions],
             }
@@ -524,6 +595,11 @@ class CortexMCorePeripheral(RegisterPeripheral):
         if isinstance(irq_priority, list):
             for i, v in enumerate(irq_priority[:240]):
                 self._irq_priority[i] = int(v) & 0xFF
+
+        sys_priority = state.get("sys_priority")
+        if isinstance(sys_priority, list):
+            for i, v in enumerate(sys_priority[:16]):
+                self._sys_priority[i] = int(v) & 0xFF
 
         system_pending = state.get("system_pending")
         if isinstance(system_pending, dict):
