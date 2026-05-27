@@ -3571,6 +3571,42 @@ class Commands:
         self._fuzz_engine.reset()
         return "fuzzer state reset"
 
+    # ── RTOS awareness commands ────────────────────────────────────
+
+    def cmd_rtos(self, argv: list[str]) -> str:
+        usage = "usage: rtos status | rtos trace on|off"
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub == "status":
+            s = self.emu.rtos_status()
+            lines = [
+                f"trace: {'on' if s['trace_enabled'] else 'off'}",
+                f"context switches: {s['switch_count']}",
+                f"PSP: 0x{s['psp']:08X}  MSP: 0x{s['msp']:08X}  CONTROL: 0x{s['control']:08X}",
+                f"in handler: {'yes' if s['in_handler'] else 'no'} (depth={s['exception_depth']})",
+                f"instructions: {s['instruction_count']}",
+            ]
+            if s['active_exceptions']:
+                names = []
+                for exc in s['active_exceptions']:
+                    if hasattr(self.emu, 'core_peripheral') and self.emu.core_peripheral:
+                        names.append(self.emu.core_peripheral.exception_name(exc))
+                    else:
+                        names.append(str(exc))
+                lines.append(f"active: {', '.join(names)}")
+            return "\n".join(lines)
+
+        if sub == "trace":
+            if len(argv) != 2:
+                return "usage: rtos trace on|off"
+            on = argv[1].lower() in ("on", "true", "1")
+            self.emu.rtos_trace_enabled = on
+            return f"rtos trace {'on' if on else 'off'}"
+
+        return usage
+
     # ── Board config commands ─────────────────────────────────────
 
     def cmd_board(self, argv: list[str]) -> str:

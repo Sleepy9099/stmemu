@@ -153,6 +153,9 @@ class Emulator:
         self._event_bp_next_id: int = 1
         self._instruction_count: int = 0
         self._timed_events: list[dict] = []
+        self.rtos_trace_enabled: bool = False
+        self._rtos_switch_count: int = 0
+        self._rtos_last_psp: int = 0
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
 
@@ -596,6 +599,90 @@ class Emulator:
 
         else:
             log.warning("timed@%d: unknown action '%s'", evt["at"], action)
+
+    # --- RTOS awareness ---
+
+    def _read_psp(self) -> int:
+        if UC_ARM_REG_PSP is None:
+            return 0
+        try:
+            return int(self.uc.reg_read(UC_ARM_REG_PSP)) & 0xFFFFFFFF
+        except Exception:
+            return 0
+
+    def _read_msp(self) -> int:
+        if UC_ARM_REG_MSP is None:
+            return 0
+        try:
+            return int(self.uc.reg_read(UC_ARM_REG_MSP)) & 0xFFFFFFFF
+        except Exception:
+            return 0
+
+    def _read_control(self) -> int:
+        if UC_ARM_REG_CONTROL is None:
+            return 0
+        try:
+            return int(self.uc.reg_read(UC_ARM_REG_CONTROL)) & 0xFFFFFFFF
+        except Exception:
+            return 0
+
+    def _emit_rtos_exception_event(self, exc_num: int, phase: str) -> None:
+        if not self.rtos_trace_enabled:
+            return
+        exc_name = "unknown"
+        if self.core_peripheral is not None:
+            exc_name = self.core_peripheral.exception_name(exc_num)
+        from stmemu.peripherals.bus import PeripheralEvent
+        self.bus.emit(PeripheralEvent(
+            kind="rtos_exception",
+            source=exc_name,
+            payload={
+                "exception": exc_name,
+                "exc_num": exc_num,
+                "phase": phase,
+                "pc": self.pc & 0xFFFFFFFF,
+                "msp": self._read_msp(),
+                "psp": self._read_psp(),
+                "control": self._read_control(),
+                "active_depth": len(self._exception_stack),
+                "instruction": self._instruction_count,
+            },
+        ))
+
+    def _emit_rtos_context_switch(
+        self, exc_num: int, old_psp: int, new_psp: int,
+    ) -> None:
+        if not self.rtos_trace_enabled:
+            return
+        self._rtos_switch_count += 1
+        from stmemu.peripherals.bus import PeripheralEvent
+        self.bus.emit(PeripheralEvent(
+            kind="rtos_context_switch",
+            source="PendSV",
+            payload={
+                "switch_count": self._rtos_switch_count,
+                "old_psp": old_psp,
+                "new_psp": new_psp,
+                "msp": self._read_msp(),
+                "control": self._read_control(),
+                "pc": self.pc & 0xFFFFFFFF,
+                "instruction": self._instruction_count,
+            },
+        ))
+
+    def rtos_status(self) -> dict[str, object]:
+        """Return current RTOS-relevant state."""
+        return {
+            "trace_enabled": self.rtos_trace_enabled,
+            "switch_count": self._rtos_switch_count,
+            "psp": self._read_psp(),
+            "msp": self._read_msp(),
+            "control": self._read_control(),
+            "active_exceptions": list(self._exception_stack),
+            "exception_depth": len(self._exception_stack),
+            "instruction_count": self._instruction_count,
+            "in_handler": bool(self._exception_stack),
+        }
 
     @staticmethod
     def _reg_alias_to_unicorn(name: str):
@@ -1465,6 +1552,11 @@ class Emulator:
         if self.core_peripheral is not None:
             self.core_peripheral.exit_exception(exc_num)
             log.info("EXC return %s", self.core_peripheral.exception_name(exc_num))
+        self._emit_rtos_exception_event(exc_num, "exit")
+        if exc_num == 14:
+            new_psp = self._read_psp()
+            if new_psp != self._rtos_last_psp and self._rtos_last_psp != 0:
+                self._emit_rtos_context_switch(exc_num, self._rtos_last_psp, new_psp)
 
     def _exception_vector_address(self, exc_num: int) -> int:
         base = self.flash_base
@@ -1528,6 +1620,9 @@ class Emulator:
             )
         else:
             log.info("EXC enter %d -> handler=0x%08X", exc_num, handler_addr | 1)
+        self._emit_rtos_exception_event(exc_num, "enter")
+        if exc_num == 14:
+            self._rtos_last_psp = self._read_psp()
         return True
 
     def _push_exception_frame(self, return_to_psp: bool) -> None:

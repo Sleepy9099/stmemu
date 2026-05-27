@@ -177,3 +177,6 @@ class StmEmuShell(cmd.Cmd):
 
     def do_timed(self, arg: str) -> None:
         self.default("timed " + arg if arg else "timed")
+
+    def do_rtos(self, arg: str) -> None:
+        self.default("rtos " + arg if arg else "rtos")
