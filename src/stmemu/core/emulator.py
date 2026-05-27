@@ -466,7 +466,11 @@ class Emulator:
             "hits": 0,
         }
         self._event_breakpoints.append(bp)
-        self.bus.subscribe(kind, self._on_event_for_breakpoint)
+        already_subscribed = any(
+            b["kind"] == kind for b in self._event_breakpoints if b["id"] != bp_id
+        )
+        if not already_subscribed:
+            self.bus.subscribe(kind, self._on_event_for_breakpoint)
         return bp_id
 
     def remove_event_breakpoint(self, bp_id: int) -> bool:
