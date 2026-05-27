@@ -73,6 +73,19 @@ def run_app(
     emu.boot_from_vector_table(flash_base=firmware.vector_base)
 
     sh = StmEmuShell(emu=emu, bus=bus)
+
+    # Apply board/scenario config if provided
+    board_cfg_path = getattr(args, 'board', None)
+    if board_cfg_path is not None:
+        from stmemu.board_config import load_board_config, apply_board_config
+        board_cfg = load_board_config(Path(board_cfg_path))
+        messages = apply_board_config(
+            board_cfg, bus, emu,
+            shell=sh, base_dir=Path(board_cfg_path).parent,
+        )
+        for msg in messages:
+            log.info("board: %s", msg)
+
     # Run optional startup script from --cfg (supports ';' and newlines; '#' line comments)
     if getattr(args, 'cfg', None):
         import os

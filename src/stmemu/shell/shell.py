@@ -171,3 +171,6 @@ class StmEmuShell(cmd.Cmd):
 
     def do_device(self, arg: str) -> None:
         self.default("device " + arg if arg else "device")
+
+    def do_board(self, arg: str) -> None:
+        self.default("board " + arg if arg else "board")

@@ -32,6 +32,7 @@ def main() -> None:
     p.add_argument("--shell", action="store_true", help="Start interactive shell after loading")
     p.add_argument("--cmd", type=str, default="", help='Semicolon-separated shell commands to run, e.g. "regs; step 10; run 1000"')
     p.add_argument("--cfg", help="Path to a semicolon/newline-separated startup script to run before --cmd")
+    p.add_argument("--board", type=Path, default=None, help="Board topology config (YAML/JSON) for device attachments")
     p.add_argument(
         "--tick-scale",
         type=lambda s: int(s, 0),
