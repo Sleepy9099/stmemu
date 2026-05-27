@@ -9,6 +9,7 @@ from stmemu.peripherals.bus import PeripheralBus, PeripheralModel
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.peripherals.dma import build_dma
 from stmemu.peripherals.flash import build_flash
+from stmemu.peripherals.exti import ExtiPeripheral, _DEFAULT_EXTI_IRQS
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.peripherals.gpio import build_gpio
 from stmemu.peripherals.rcc import build_rcc
@@ -41,6 +42,7 @@ _PERIPHERAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^BDMA\d*$", re.IGNORECASE), "dma"),
     (re.compile(r"^OTG\d?_[A-Z]+_GLOBAL$", re.IGNORECASE), "otg_global"),
     (re.compile(r"^USB_OTG_[A-Z]+$", re.IGNORECASE), "otg_global"),
+    (re.compile(r"^EXTI$", re.IGNORECASE), "exti"),
 ]
 
 
@@ -105,6 +107,23 @@ def create_default_registry() -> PeripheralFactoryRegistry:
     registry.register("__pattern__i2c", build_i2c)
     registry.register("__pattern__dma", build_dma)
     registry.register("__pattern__otg_global", build_otg_global)
+
+    def build_exti(peripheral: SvdPeripheral) -> PeripheralModel:
+        irq_map = dict(_DEFAULT_EXTI_IRQS)
+        for intr in peripheral.interrupts:
+            name = intr.name.upper()
+            if "EXTI15_10" in name:
+                irq_map[10] = intr.value
+            elif "EXTI9_5" in name:
+                irq_map[5] = intr.value
+            else:
+                for i in range(5):
+                    if f"EXTI{i}" in name and f"EXTI{i}_" not in name:
+                        irq_map[i] = intr.value
+        return ExtiPeripheral(irq_map=irq_map)
+
+    registry.register("EXTI", build_exti)
+    registry.register("__pattern__exti", build_exti)
 
     return registry
 
