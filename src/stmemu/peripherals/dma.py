@@ -163,6 +163,15 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             if irq is not None:
                 self._context.interrupts.set_irq_pending(irq)
 
+        if self._context and self._context.bus:
+            from stmemu.peripherals.bus import PeripheralEvent
+            self._context.bus.emit(PeripheralEvent(
+                kind="dma_complete",
+                source=self._context.name,
+                address=par,
+                payload={"stream": stream, "direction": direction, "bytes": ndtr * max(1, 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3))},
+            ))
+
     def _do_transfer(
         self, emu: object, direction: int, par: int, mar: int, byte_count: int,
     ) -> None:
