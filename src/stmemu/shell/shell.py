@@ -174,3 +174,6 @@ class StmEmuShell(cmd.Cmd):
 
     def do_board(self, arg: str) -> None:
         self.default("board " + arg if arg else "board")
+
+    def do_timed(self, arg: str) -> None:
+        self.default("timed " + arg if arg else "timed")

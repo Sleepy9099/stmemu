@@ -151,6 +151,8 @@ class Emulator:
         self.last_event_break: dict | None = None
         self._event_breakpoints: list[dict] = []
         self._event_bp_next_id: int = 1
+        self._instruction_count: int = 0
+        self._timed_events: list[dict] = []
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
 
@@ -512,6 +514,88 @@ class Emulator:
             except Exception:
                 pass
             return
+
+    # --- Timed events ---
+
+    @property
+    def instruction_count(self) -> int:
+        return self._instruction_count
+
+    def add_timed_event(self, at: int, action: str, **params) -> dict:
+        """Schedule an action at a specific instruction count."""
+        evt = {"at": int(at), "action": str(action), "fired": False}
+        evt.update(params)
+        self._timed_events.append(evt)
+        self._timed_events.sort(key=lambda e: e["at"])
+        return evt
+
+    def list_timed_events(self) -> list[dict]:
+        return [dict(e) for e in self._timed_events]
+
+    def clear_timed_events(self) -> int:
+        count = len(self._timed_events)
+        self._timed_events.clear()
+        return count
+
+    def _check_timed_events(self) -> None:
+        if not self._timed_events:
+            return
+        ic = self._instruction_count
+        while self._timed_events and self._timed_events[0]["at"] <= ic:
+            evt = self._timed_events[0]
+            if evt["fired"]:
+                self._timed_events.pop(0)
+                continue
+            evt["fired"] = True
+            self._timed_events.pop(0)
+            self._execute_timed_action(evt)
+
+    def _execute_timed_action(self, evt: dict) -> None:
+        action = evt.get("action", "")
+
+        if action == "gpio_inject":
+            port = str(evt.get("port", "")).upper()
+            pin = int(evt.get("pin", 0))
+            level = str(evt.get("level", "high")).lower()
+            model = self.bus.model_for_name(port)
+            if model is not None and hasattr(model, "set_input_level"):
+                model.set_input_level(pin, level in ("high", "1", "true"))
+                log.debug("timed@%d: gpio_inject %s pin %d %s", evt["at"], port, pin, level)
+
+        elif action == "uart_inject":
+            periph = str(evt.get("peripheral", "")).upper()
+            model = self.bus.model_for_name(periph)
+            if model is not None and hasattr(model, "inject_rx_bytes"):
+                hex_data = evt.get("hex", "")
+                data = bytes.fromhex(str(hex_data)) if hex_data else b""
+                if data:
+                    model.inject_rx_bytes(data)
+                    log.debug("timed@%d: uart_inject %s %dB", evt["at"], periph, len(data))
+
+        elif action == "adc_sample":
+            periph = str(evt.get("peripheral", "")).upper()
+            model = self.bus.model_for_name(periph)
+            if model is not None and hasattr(model, "inject_sample"):
+                value = int(evt.get("value", 0))
+                model.inject_sample(value)
+                log.debug("timed@%d: adc_sample %s %d", evt["at"], periph, value)
+
+        elif action == "event_emit":
+            from stmemu.peripherals.bus import PeripheralEvent
+            kind = str(evt.get("kind", "custom"))
+            source = str(evt.get("source", "timed"))
+            self.bus.emit(PeripheralEvent(
+                kind=kind, source=source, payload=evt.get("payload"),
+            ))
+            log.debug("timed@%d: event_emit %s source=%s", evt["at"], kind, source)
+
+        elif action == "snapshot":
+            name = str(evt.get("name", f"timed_{evt['at']}"))
+            self.save_snapshot(name)
+            log.debug("timed@%d: snapshot '%s'", evt["at"], name)
+
+        else:
+            log.warning("timed@%d: unknown action '%s'", evt["at"], action)
 
     @staticmethod
     def _reg_alias_to_unicorn(name: str):
@@ -1322,7 +1406,9 @@ class Emulator:
                 if not self._special_step_consumed:
                     raise
             executed += 1
+            self._instruction_count += 1
             self.bus.tick(self._effective_tick_scale())
+            self._check_timed_events()
 
             if (
                 self.last_mmio_break is not None
