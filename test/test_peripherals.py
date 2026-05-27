@@ -86,6 +86,11 @@ class GpioTests(unittest.TestCase):
 
     def test_idr_reflects_odr(self) -> None:
         gpio = self._make_gpio()
+        # Set pins 1,3,5,7 to output mode
+        moder = 0
+        for pin in (1, 3, 5, 7):
+            moder |= MODE_OUTPUT << (pin * 2)
+        gpio.write(0x00, 4, moder)
         gpio.write(0x14, 4, 0x00AA)  # Write ODR
         idr = gpio.read(0x10, 4)
         self.assertEqual(idr, 0x00AA)

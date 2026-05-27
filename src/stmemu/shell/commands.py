@@ -2525,9 +2525,10 @@ class Commands:
 
     def cmd_gpio(self, argv: list[str]) -> str:
         usage = (
-            "usage: gpio list | gpio read <name> | "
+            "usage: gpio list | gpio read <name> | gpio show <name> | "
             "gpio set <name> <pin> | gpio clear <name> <pin> | "
-            "gpio toggle <name> <pin>"
+            "gpio toggle <name> <pin> | "
+            "gpio inject <name> <pin> high|low"
         )
         if not argv:
             return usage
@@ -2594,6 +2595,27 @@ class Commands:
             else:
                 model.write(model._BSRR, 4, 1 << pin)
             return f"{argv[1].upper()} pin {pin} toggled (ODR=0x{model.read_register_value(model._ODR):04X})"
+
+        if sub == "inject":
+            if len(argv) != 4:
+                return "usage: gpio inject <name> <pin> high|low"
+            model = self._resolve_gpio_model(argv[1])
+            pin = _int(argv[2])
+            if not (0 <= pin <= 15):
+                return "pin must be 0-15"
+            level = argv[3].lower()
+            if level not in ("high", "low", "1", "0"):
+                return "level must be high or low"
+            high = level in ("high", "1")
+            model.set_input_level(pin, high)
+            idr = model.read(model._IDR, 4)
+            return f"{argv[1].upper()} pin {pin} input={'H' if high else 'L'} (IDR=0x{idr:04X})"
+
+        if sub == "show":
+            if len(argv) != 2:
+                return "usage: gpio show <name>"
+            model = self._resolve_gpio_model(argv[1])
+            return f"{argv[1].upper()} pinmux:\n{model.port_summary()}"
 
         return usage
 

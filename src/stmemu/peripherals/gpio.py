@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from stmemu.peripherals.bus import PeripheralContext
+from stmemu.peripherals.bus import PeripheralContext, PeripheralEvent
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
 from stmemu.svd.model import SvdPeripheral
 from stmemu.utils.logger import get_logger
@@ -24,6 +24,7 @@ class GpioPeripheral(GenericRegisterFilePeripheral):
     """GPIO peripheral with BSRR->ODR->IDR linkage and pinmux tracking."""
 
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
+    _input_levels: int = field(default=0, init=False, repr=False)
 
     _MODER = 0x00
     _OTYPER = 0x04
@@ -66,7 +67,16 @@ class GpioPeripheral(GenericRegisterFilePeripheral):
 
     def read(self, offset: int, size: int) -> int:
         if size == 4 and offset == self._IDR:
-            return self.read_register_value(self._ODR) & 0xFFFF
+            moder = self.read_register_value(self._MODER)
+            odr = self.read_register_value(self._ODR) & 0xFFFF
+            result = 0
+            for pin in range(16):
+                mode = (moder >> (pin * 2)) & 0x3
+                if mode == MODE_OUTPUT or mode == MODE_AF:
+                    result |= odr & (1 << pin)
+                else:
+                    result |= self._input_levels & (1 << pin)
+            return result
         return super().read(offset, size)
 
     def write(self, offset: int, size: int, value: int) -> None:
@@ -78,6 +88,50 @@ class GpioPeripheral(GenericRegisterFilePeripheral):
             self.write_register_value(self._ODR, odr & 0xFFFF)
             return
         super().write(offset, size, value)
+
+    def set_input_level(self, pin: int, high: bool) -> None:
+        """Inject an external level on a pin and emit a gpio_edge event."""
+        if pin < 0 or pin > 15:
+            return
+        mask = 1 << pin
+        old = (self._input_levels >> pin) & 1
+        new = 1 if high else 0
+        if old == new:
+            return
+        if high:
+            self._input_levels |= mask
+        else:
+            self._input_levels &= ~mask
+        self._emit_edge(pin, old, new)
+
+    def set_input_mask(self, mask: int, value: int) -> None:
+        """Set multiple input pins at once. Emits edge events for changed pins."""
+        mask &= 0xFFFF
+        value &= 0xFFFF
+        old_levels = self._input_levels
+        self._input_levels = (self._input_levels & ~mask) | (value & mask)
+        changed = (old_levels ^ self._input_levels) & mask
+        for pin in range(16):
+            if changed & (1 << pin):
+                old_bit = (old_levels >> pin) & 1
+                new_bit = (self._input_levels >> pin) & 1
+                self._emit_edge(pin, old_bit, new_bit)
+
+    def _emit_edge(self, pin: int, old: int, new: int) -> None:
+        if self._context is None or self._context.bus is None:
+            return
+        self._context.bus.emit(PeripheralEvent(
+            kind="gpio_edge",
+            source=self._context.name,
+            address=pin,
+            payload={
+                "pin": pin,
+                "old": old,
+                "new": new,
+                "rising": old == 0 and new == 1,
+                "falling": old == 1 and new == 0,
+            },
+        ))
 
     def pin_mode(self, pin: int) -> int:
         if pin < 0 or pin > 15:
@@ -136,6 +190,23 @@ class GpioPeripheral(GenericRegisterFilePeripheral):
             if mode != MODE_ANALOG:
                 lines.append(self.pin_summary(pin))
         return "\n".join(lines) if lines else "(all analog/reset)"
+
+
+    def reset(self) -> None:
+        super().reset()
+        self._input_levels = 0
+
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base["input_levels"] = self._input_levels
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if isinstance(state, dict):
+            self._input_levels = int(state.get("input_levels", 0))
 
 
 def build_gpio(peripheral: SvdPeripheral) -> GpioPeripheral:
