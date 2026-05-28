@@ -67,6 +67,15 @@ _DMA_REGS = (
 
 
 class PeripheralFactoryTests(unittest.TestCase):
+    def test_pattern_builders_create_specialized_uart_models(self) -> None:
+        from stmemu.peripherals.usart import Stm32UsartPeripheral
+
+        registry = create_default_registry()
+        for name in ("USART1", "UART7", "LPUART1"):
+            with self.subTest(name=name):
+                model = registry.build(_make_peripheral(name))
+                self.assertIsInstance(model, Stm32UsartPeripheral)
+
     def test_pwr_ready_fields_are_forced_after_reads(self) -> None:
         pwr = _make_peripheral(
             "PWR",

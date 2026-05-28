@@ -31,7 +31,7 @@ _PERIPHERAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^RCC$", re.IGNORECASE), "rcc"),
     (re.compile(r"^PWR$", re.IGNORECASE), "pwr"),
     (re.compile(r"^ADC\d*$", re.IGNORECASE), "adc"),
-    (re.compile(r"^L?P?USART\d*$", re.IGNORECASE), "usart"),
+    (re.compile(r"^(LPUART|L?P?USART)\d*$", re.IGNORECASE), "usart"),
     (re.compile(r"^UART\d*$", re.IGNORECASE), "usart"),
     (re.compile(r"^TIM\d+$", re.IGNORECASE), "timer"),
     (re.compile(r"^GPIO[A-Z]$", re.IGNORECASE), "gpio"),
@@ -69,7 +69,7 @@ class PeripheralFactoryRegistry:
         # Pattern-based fallback
         for pattern, kind in _PERIPHERAL_PATTERNS:
             if pattern.match(peripheral.name):
-                builder = self._builders.get(f"__pattern__{kind}")
+                builder = self._builders.get(f"__pattern__{kind}".upper())
                 if builder is not None:
                     return builder(peripheral)
                 break

@@ -37,7 +37,7 @@ class Pixhawk6CBootloaderSmokeTests(unittest.TestCase):
 
         return Emulator
 
-    def test_pixhawk6c_bootloader_reaches_idle_thread_with_h743_svd(self) -> None:
+    def test_pixhawk6c_bootloader_responds_to_uart_sync(self) -> None:
         svd_path = Path(os.environ.get("STMEMU_STM32H743_SVD", _DEFAULT_H743_SVD))
         if not svd_path.exists():
             self.skipTest(f"STM32H743 SVD not found: {svd_path}")
@@ -57,12 +57,27 @@ class Pixhawk6CBootloaderSmokeTests(unittest.TestCase):
             firmware_entry_point=firmware.entry_point,
             core_peripheral=core,
         )
+        symbols = load_symbols(image_path)
+        bootloader = symbols.lookup_name("_Z10bootloaderj")
+        self.assertIsNotNone(bootloader)
 
         emu.boot_from_vector_table()
-        emu.run(250000)
+        emu.tick_scale = 1000
+        emu.add_breakpoint(bootloader.address)
+        emu.run(300000)
 
-        symbols = load_symbols(image_path)
-        self.assertEqual(symbols.format_addr(emu.pc), "0x080039DC <__idle_thread>")
+        self.assertEqual(emu.pc & ~1, bootloader.address)
+        self.assertIsNone(emu.last_fault_report)
+
+        emu.remove_breakpoint(bootloader.address)
+        uart7 = bus.model_for_name("UART7")
+        self.assertIsNotNone(uart7)
+        self.assertEqual(uart7.status_summary(), "rx=0 tx=0 isr=0x006000C0 cr1=0x0000012D")
+
+        uart7.inject_rx_bytes(bytes.fromhex("2120"))
+        emu.run(10000)
+
+        self.assertEqual(uart7.drain_tx_bytes(), bytes.fromhex("1210"))
         self.assertIsNone(emu.last_fault_report)
 
 

@@ -3,7 +3,7 @@ target:
   sram_size: 0x80000
 
 emulator:
-  tick_scale: 1
+  tick_scale: 1000
   stuck_threshold: 5000
   interrupt_stuck_threshold: 50000000
   bus_policy: permissive
