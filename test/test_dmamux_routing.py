@@ -231,6 +231,48 @@ class BoardConfigRoutingTests(unittest.TestCase):
         self.assertEqual(_ndtr(dma, 0), 0)
         self.assertEqual(emu.mem_read(0x200, 1), bytes([0xA5]))
 
+    def test_routing_overlay_applies_after_prior_topology(self):
+        # Layering: a board config, then a routing-only overlay config. The
+        # overlay must take effect — routing is not device topology, so it is
+        # not subject to the double-apply guard.
+        from stmemu.board_config import apply_board_config
+        bus, src, dma, emu = _setup()
+        apply_board_config({"board": {"gpio_levels": {}}}, bus, source="full")
+        msgs = apply_board_config(
+            {"board": {"dma": {"DMA1": {"streams": {0: {"request": "SPI1_RX"}}}}}},
+            bus, source="overlay",
+        )
+        self.assertFalse(any("skipped" in m for m in msgs), "overlay must not be skipped")
+        _arm(dma, 0, mar=0x200)
+        # The mapping is genuinely active: a wrong request is blocked (not just
+        # served by the permissive fallback), and the mapped one transfers.
+        dma.on_peripheral_request(_SRC_BASE + _DR, "p2m", 1, request="USART3_RX")
+        self.assertEqual(_ndtr(dma, 0), 1, "wrong request blocked -> mapping applied")
+        dma.on_peripheral_request(_SRC_BASE + _DR, "p2m", 1, request="SPI1_RX")
+        self.assertEqual(_ndtr(dma, 0), 0)
+
+    def test_routing_applies_even_when_topology_skipped(self):
+        # A second config that re-declares device topology is skipped as a
+        # double-apply, yet its routing overlay still applies.
+        from stmemu.board_config import apply_board_config
+        bus, src, dma, emu = _setup()
+        apply_board_config({"board": {"gpio_levels": {}}}, bus, source="A")
+        msgs = apply_board_config(
+            {"board": {
+                "gpio_levels": {},
+                "dma": {"DMA1": {"streams": {0: {"request": "SPI1_RX"}}}},
+            }},
+            bus, source="B",
+        )
+        self.assertTrue(any("skipped" in m for m in msgs), "device topology should skip")
+        _arm(dma, 0, mar=0x200)
+        # Mapping applied despite the topology skip: wrong request blocked...
+        dma.on_peripheral_request(_SRC_BASE + _DR, "p2m", 1, request="USART3_RX")
+        self.assertEqual(_ndtr(dma, 0), 1, "wrong request blocked -> mapping applied")
+        # ...mapped request transfers.
+        dma.on_peripheral_request(_SRC_BASE + _DR, "p2m", 1, request="SPI1_RX")
+        self.assertEqual(_ndtr(dma, 0), 0, "routing overlay applies despite skip")
+
 
 # ── Real USART RX DMA through the routing layer ──────────────────
 

@@ -233,10 +233,13 @@ def apply_board_config(
     for w in warnings:
         messages.append(f"warning: {w}")
 
-    # Track applied configs and prevent double-apply of board topology
+    # Track applied configs and prevent double-apply of board *device*
+    # topology. DMA/DMAMUX request routing is deliberately excluded here: it is
+    # an idempotent overlay (mapping stream request lines, not creating
+    # devices), so a later routing-only config must still take effect.
     has_board_topology = any(
         k in config or k in config.get("board", {})
-        for k in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc", "dma", "dmamux")
+        for k in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc")
     )
     applied = _bus_applied_configs(bus)
     skip_topology = False
@@ -270,9 +273,14 @@ def apply_board_config(
         board = config.get("board", {})
         if isinstance(board, dict) and board:
             messages.extend(_apply_board_topology(board, bus, base_dir=base_dir))
-        for key in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc", "dma", "dmamux"):
+        for key in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc"):
             if key in config and key not in (board if isinstance(board, dict) else {}):
                 messages.extend(_apply_board_topology({key: config[key]}, bus, base_dir=base_dir))
+
+    # 2b. DMA/DMAMUX request routing — applied on every config (even when the
+    # device topology above is skipped as a double-apply), because mapping a
+    # stream request is idempotent overlay state, not device creation.
+    messages.extend(_apply_dma_routing(config, bus))
 
     # 3. Register pre-sets
     for reg_cfg in config.get("registers", []):
@@ -352,10 +360,26 @@ def _apply_board_topology(
         msgs.append(_set_gpio_levels(bus, port_name, pins))
     for adc_name, adc_cfg in board.get("adc", {}).items():
         msgs.append(_configure_adc(bus, adc_name, adc_cfg))
-    for dma_name, dma_cfg in board.get("dma", {}).items():
-        msgs.append(_configure_dma_streams(bus, dma_name, dma_cfg))
-    for mux_name, mux_cfg in board.get("dmamux", {}).items():
-        msgs.append(_configure_dmamux(bus, mux_name, mux_cfg))
+    return msgs
+
+
+def _apply_dma_routing(config: dict[str, Any], bus: object) -> list[str]:
+    """Apply DMA/DMAMUX request-line routing from a config (idempotent overlay).
+
+    Reads ``dma`` / ``dmamux`` from both the top level and the ``board`` block.
+    """
+    msgs: list[str] = []
+    board = config.get("board", {})
+    sources = [board, config] if isinstance(board, dict) else [config]
+    for src in sources:
+        dma_cfg = src.get("dma")
+        if isinstance(dma_cfg, dict):
+            for dma_name, cfg in dma_cfg.items():
+                msgs.append(_configure_dma_streams(bus, dma_name, cfg))
+        mux_cfg = src.get("dmamux")
+        if isinstance(mux_cfg, dict):
+            for mux_name, cfg in mux_cfg.items():
+                msgs.append(_configure_dmamux(bus, mux_name, cfg))
     return msgs
 
 
