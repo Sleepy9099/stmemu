@@ -66,29 +66,31 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
             self._update_irq()
             return value & ((1 << (size * 8)) - 1)
 
-        if size == 4 and offset == self._ISR:
+        if self._access_targets(offset, size, self._ISR):
             self._refresh_status()
 
         return super().read(offset, size)
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size == 4 and offset == self._TDR:
-            self._tx_fifo.append(int(value) & 0xFF)
-            self.write_register_value(self._TDR, int(value) & 0xFF)
+        if self._access_targets(offset, size, self._TDR):
+            byte = int(value) & 0xFF
+            self._tx_fifo.append(byte)
+            self.write_register_value(self._TDR, byte)
             self._refresh_status()
             self._update_irq()
             return
 
-        if size == 4 and offset == self._RQR:
-            if int(value) & self._RQR_RXFRQ:
+        if self._access_targets(offset, size, self._RQR):
+            aligned = self._aligned_write_value(offset, size, self._RQR, value)
+            if aligned & self._RQR_RXFRQ:
                 self._rx_fifo.clear()
-            self.write_register_value(offset, int(value))
+            self.write_register_value(self._RQR, aligned)
             self._refresh_status()
             self._update_irq()
             return
 
-        if size == 4 and offset == self._ICR:
-            self.write_register_value(offset, int(value))
+        if self._access_targets(offset, size, self._ICR):
+            self.write_register_value(self._ICR, self._aligned_write_value(offset, size, self._ICR, value))
             self._refresh_status()
             self._update_irq()
             return

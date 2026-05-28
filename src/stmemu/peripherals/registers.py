@@ -88,6 +88,41 @@ class RegisterPeripheral(PeripheralModel):
                 return spec
         return None
 
+    def _access_targets(self, offset: int, size: int, reg_offset: Optional[int]) -> bool:
+        """True if a ``size``-byte access at ``offset`` lands entirely within the
+        32-bit register word at ``reg_offset``.
+
+        Peripheral side-effect overlays use this instead of ``size == 4 and
+        offset == reg`` so that byte/halfword accesses (e.g. DMA byte transfers
+        to a data register, or firmware ``STRB``/``STRH``) still trigger the
+        model logic rather than silently falling through to the raw register
+        store.
+        """
+        return (
+            reg_offset is not None
+            and reg_offset <= offset
+            and offset + size <= reg_offset + 4
+        )
+
+    def _aligned_write_value(self, offset: int, size: int, reg_offset: int, value: int) -> int:
+        """Position a sub-word written ``value`` at its absolute bit offset within
+        the 32-bit register, zero-filling the bytes that were not written.
+
+        Suitable for command and write-1-clear registers whose handler consumes
+        the full word: a halfword write to the upper half of GPIO BSRR, say,
+        lands in bits [31:16] (the reset bits) exactly as on hardware.
+        """
+        shift = (offset - reg_offset) * 8
+        return (int(value) & mask_for_size(size)) << shift
+
+    def _written_byte_mask(self, offset: int, size: int, reg_offset: int) -> int:
+        """Bit mask of the bytes actually touched by a ``size``-byte access at
+        ``offset`` within the register at ``reg_offset`` (the rest are untouched).
+        """
+        shift = (offset - reg_offset) * 8
+        return mask_for_size(size) << shift
+
+
     def _read_spec(self, spec: RegisterSpec, offset: int, size: int) -> int:
         current = self._values.get(spec.offset, spec.reset_value) & spec.value_mask
         if spec.on_read is not None:

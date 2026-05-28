@@ -2470,6 +2470,36 @@ class Commands:
     def cmd_skip(self, argv):
         return self.cmd_atpc(["skip", *argv])
 
+    def cmd_cpu(self, argv: list[str]) -> str:
+        usage = (
+            "usage: cpu unsupported-fp-nop [count|reset] | "
+            "cpu unsupported-fp-nop mode [permissive|strict]"
+        )
+        if not argv:
+            return usage
+        if argv[0] in ("unsupported-fp-nop", "unsupported-fp", "fp"):
+            rest = argv[1:]
+            if not rest or rest[0] == "count":
+                count = getattr(self.emu, "unsupported_fp_count", 0)
+                mode = getattr(self.emu, "unsupported_fp_mode", "permissive")
+                last = getattr(self.emu, "last_unsupported_fp_pc", None)
+                last_s = f"0x{last:08X}" if last is not None else "none"
+                return f"unsupported-fp-nop count: {count} (mode: {mode}, last pc: {last_s})"
+            if rest[0] == "reset":
+                self.emu.unsupported_fp_count = 0
+                self.emu.last_unsupported_fp_pc = None
+                return "unsupported-fp-nop count reset"
+            if rest[0] == "mode":
+                if len(rest) < 2:
+                    cur = getattr(self.emu, "unsupported_fp_mode", "permissive")
+                    return f"unsupported-fp-nop mode: {cur}"
+                mode = rest[1].lower()
+                if mode not in ("permissive", "strict"):
+                    return "mode must be 'permissive' or 'strict'"
+                self.emu.unsupported_fp_mode = mode
+                return f"unsupported-fp-nop mode set to {mode}"
+        return usage
+
     def _parse_reg_spec(self, s: str) -> tuple[str, str]:
         # "USART3.ISR" -> ("USART3", "ISR")
         if "." not in s:
@@ -3838,7 +3868,7 @@ class Commands:
 
     def _board_show(self) -> str:
         from stmemu.board_config import config_applied_summary
-        applied = config_applied_summary()
+        applied = config_applied_summary(self.bus)
         lines_dict = self.bus.serial_lines()
         timed = self.emu.list_timed_events() if hasattr(self.emu, "list_timed_events") else []
         evt_bps = self.emu.list_event_breakpoints() if hasattr(self.emu, "list_event_breakpoints") else []

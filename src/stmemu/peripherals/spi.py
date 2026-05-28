@@ -58,9 +58,20 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
 
     # H7 CFG1 fields. On the H7 layout the DMA enable bits live in CFG1
     # rather than CR2; the bits are TXDMAEN=15, RXDMAEN=14 per RM0433.
+    # The frame size is CFG1.DSIZE[4:0] = (data bits - 1).
     _H7_CFG1: int | None = None
     _H7_CFG1_TXDMAEN = 1 << 15
     _H7_CFG1_RXDMAEN = 1 << 14
+    _H7_CFG1_DSIZE = 0x1F
+
+    # H7 IFCR: write-1-clear of the latched SR flags. EOTC (bit 3) clears EOT.
+    _H7_IFCR: int | None = None
+    _H7_IFCR_EOTC = 1 << 3
+
+    # Legacy frame-size selectors:
+    #   F1/F4 CR1.DFF (bit 11): 0 = 8-bit, 1 = 16-bit.
+    #   F0/F3/F7/L4 CR2.DS[3:0] (bits 11:8): (data bits - 1).
+    _CR1_DFF = 1 << 11
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -80,6 +91,8 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
                 self._RXDR = reg.offset
             elif rname == "CFG1":
                 self._H7_CFG1 = reg.offset
+            elif rname == "IFCR":
+                self._H7_IFCR = reg.offset
         # When the SVD provides split TX/RX (H7), suppress the legacy
         # combined DR so writes to that offset don't accidentally clock
         # the bus — on H7 0x0C is the CFG2 register.
@@ -100,12 +113,31 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
             return offset == self._TXDR
         return offset == self._DR
 
+    def _frame_bytes(self) -> int:
+        """Number of bytes clocked per SPI frame, from the configured data size.
+
+        Honours H7 ``CFG1.DSIZE``, legacy ``CR2.DS`` (F0/F3/F7/L4) and
+        ``CR1.DFF`` (F1/F4). Defaults to 1 (8-bit) so the common case is
+        unchanged.
+        """
+        if self._H7_CFG1 is not None:
+            bits = (self.read_register_value(self._H7_CFG1) & self._H7_CFG1_DSIZE) + 1
+            return max(1, min(4, (bits + 7) // 8))
+        ds = (self.read_register_value(self._CR2) >> 8) & 0xF
+        if ds >= 0x7:  # DS field configured (>= 8-bit); 0xF = 16-bit
+            return 2 if ds >= 0x8 else 1
+        if self.read_register_value(self._CR1) & self._CR1_DFF:
+            return 2
+        return 1
+
     def read(self, offset: int, size: int) -> int:
         if self._is_data_read(offset):
+            # Each RX FIFO entry is a whole received frame (reassembled at
+            # exchange time), so a 16-bit frame read returns both bytes.
             value = self._rx_fifo.popleft() if self._rx_fifo else 0
             self._refresh_status()
             # If RX DMA is enabled and the FIFO still has data, signal
-            # another drain request so DMA keeps consuming bytes.
+            # another drain request so DMA keeps consuming frames.
             if self._rx_fifo:
                 self._emit_dma_request_rx()
             return value
@@ -114,16 +146,16 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         return super().read(offset, size)
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size in (1, 2, 4) and self._is_data_write(offset):
-            byte = int(value) & 0xFF
-            self._tx_fifo.append(byte)
-            miso = self._exchange_with_selected(byte)
-            self._rx_fifo.append(miso)
-            self._refresh_status()
-            # A byte just landed in the RX FIFO — drain via RX DMA, then
-            # ask DMA for the next TX byte if TX DMA is enabled.
-            self._emit_dma_request_rx()
-            self._emit_dma_request_tx()
+        if self._is_data_write(offset):
+            self._transfer_frame(int(value))
+            return
+        if self._H7_IFCR is not None and self._access_targets(offset, size, self._H7_IFCR):
+            # Write-1-clear of latched SR flags. EOTC clears EOT; IFCR itself
+            # reads back as zero, so don't persist the written value.
+            clear = self._aligned_write_value(offset, size, self._H7_IFCR, value)
+            if clear & self._H7_IFCR_EOTC:
+                sr = self.read_register_value(self._SR)
+                self.write_register_value(self._SR, sr & ~self._H7_SR_EOT)
             return
         super().write(offset, size, value)
         if offset == self._CR1:
@@ -132,9 +164,12 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
             # self-clearing so firmware polling loops can progress.
             if self._TXDR is not None or self._RXDR is not None:
                 cr1 = self.read_register_value(self._CR1)
+                started = bool(cr1 & self._H7_CR1_CSTART)
                 cleared = cr1 & ~(self._H7_CR1_CSTART | self._H7_CR1_CSUSP)
                 if cleared != cr1:
                     self.write_register_value(self._CR1, cleared)
+                if started:
+                    self._mark_transfer_complete()
             self._refresh_status()
             self._kick_dma_on_enable()
         elif offset == self._CR2 or (
@@ -142,6 +177,32 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         ):
             self._refresh_status()
             self._kick_dma_on_enable()
+
+    def _transfer_frame(self, value: int) -> None:
+        """Clock one SPI frame out (MSB-first) and capture the MISO frame."""
+        nbytes = self._frame_bytes()
+        frame = int(value) & ((1 << (nbytes * 8)) - 1)
+        rx = 0
+        for i in range(nbytes):
+            shift = (nbytes - 1 - i) * 8  # MSB first on the wire
+            tx_byte = (frame >> shift) & 0xFF
+            self._tx_fifo.append(tx_byte)
+            miso = self._exchange_with_selected(tx_byte)
+            rx = (rx << 8) | (miso & 0xFF)
+        self._rx_fifo.append(rx)
+        self._refresh_status()
+        self._mark_transfer_complete()
+        # A frame just landed in the RX FIFO — drain via RX DMA, then ask
+        # DMA for the next TX frame if TX DMA is enabled.
+        self._emit_dma_request_rx()
+        self._emit_dma_request_tx()
+
+    def _mark_transfer_complete(self) -> None:
+        """Latch H7 EOT (end of transfer). No-op on the legacy layout."""
+        if self._TXDR is None and self._RXDR is None:
+            return
+        sr = self.read_register_value(self._SR)
+        self.write_register_value(self._SR, sr | self._H7_SR_EOT)
 
     def _exchange_with_selected(self, byte: int) -> int:
         """Route MOSI to whichever attached slave currently has CS asserted.
@@ -191,11 +252,14 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
     def _refresh_status(self) -> None:
         sr = self.read_register_value(self._SR)
         if self._TXDR is not None or self._RXDR is not None:
-            # H7-style SR: TXP/RXP/EOT/TXC sit at the bottom; force
-            # TXP+TXC=1 (host can keep writing) and toggle RXP based on
-            # whether MISO bytes are queued.
-            sr &= ~(self._H7_SR_RXP | self._H7_SR_TXP | self._H7_SR_EOT | self._H7_SR_TXC)
-            sr |= self._H7_SR_TXP | self._H7_SR_TXC | self._H7_SR_EOT
+            # H7-style SR: force TXP+TXC=1 (host can always write and TX is
+            # idle since we complete instantly) and toggle RXP on queued MISO
+            # frames. EOT is deliberately NOT forced here — it is a latched
+            # end-of-transfer flag set by _mark_transfer_complete and cleared
+            # by writing EOTC to IFCR. Forcing it made firmware that clears
+            # EOT see it immediately re-assert, stalling its polling loop.
+            sr &= ~(self._H7_SR_RXP | self._H7_SR_TXP | self._H7_SR_TXC)
+            sr |= self._H7_SR_TXP | self._H7_SR_TXC
             if self._rx_fifo:
                 sr |= self._H7_SR_RXP
         else:

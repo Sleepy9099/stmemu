@@ -177,15 +177,32 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     return warnings
 
 
-_applied_configs: list[dict[str, Any]] = []
+def _bus_applied_configs(bus: object) -> list[dict[str, Any]]:
+    """Per-session applied-config history, stored on the bus instance.
+
+    Tracking applied configs on the bus (rather than a module global) scopes
+    the double-apply guard to a single emulator session: a fresh bus starts
+    with empty history, so configs applied by a previous session in the same
+    process no longer suppress board topology in a new one.
+    """
+    configs = getattr(bus, "_applied_configs", None)
+    if configs is None:
+        configs = []
+        try:
+            setattr(bus, "_applied_configs", configs)
+        except Exception:
+            # Bus doesn't allow attribute assignment; fall back to a transient
+            # list (guard degrades to "never previously applied" for this bus).
+            pass
+    return configs
 
 
-def config_applied_count() -> int:
-    return len(_applied_configs)
+def config_applied_count(bus: object) -> int:
+    return len(_bus_applied_configs(bus))
 
 
-def config_applied_summary() -> list[dict[str, Any]]:
-    return list(_applied_configs)
+def config_applied_summary(bus: object) -> list[dict[str, Any]]:
+    return list(_bus_applied_configs(bus))
 
 
 def apply_board_config(
@@ -220,15 +237,16 @@ def apply_board_config(
         k in config or k in config.get("board", {})
         for k in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc")
     )
+    applied = _bus_applied_configs(bus)
     skip_topology = False
-    if has_board_topology and _applied_configs:
-        prev_sources = [c.get("_source", "?") for c in _applied_configs if c.get("_has_board")]
+    if has_board_topology and applied:
+        prev_sources = [c.get("_source", "?") for c in applied if c.get("_has_board")]
         if prev_sources:
             messages.append(
                 f"board topology skipped: already applied from {prev_sources[0]}"
             )
             skip_topology = True
-    _applied_configs.append({
+    applied.append({
         "_source": source,
         "_has_board": has_board_topology and not skip_topology,
         "_sections": [k for k in config if k != "target"],
@@ -355,19 +373,24 @@ def _apply_register(cfg: dict[str, Any], bus: object, emu: object | None) -> str
         if model is None:
             return f"register: {periph} not found"
         val = _parse_int(cfg.get("value", 0))
-        # Find register offset by name
+        # Find register offset (and width) by name. Honor the register's
+        # declared size so an 8/16-bit register isn't written as 32 bits,
+        # which would spill into adjacent registers or be rejected.
         offset = None
+        width = 4
         if hasattr(model, "peripheral"):
             for reg in model.peripheral.registers:
                 if reg.name.upper() == str(register).upper():
                     offset = reg.offset
+                    byte_width = max(1, int(getattr(reg, "size_bits", 32) or 32) // 8)
+                    width = byte_width if byte_width in (1, 2, 4) else 4
                     break
         if offset is None:
             try:
                 offset = _parse_int(register)
             except ValueError:
                 return f"register: {periph}.{register} not found"
-        model.write(offset, 4, val)
+        model.write(offset, width, val)
         return f"register: {periph}.{register} = 0x{val:08X}"
 
     return "register: missing 'reg' or 'peripheral'+'register'"

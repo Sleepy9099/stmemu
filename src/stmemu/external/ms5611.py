@@ -51,7 +51,7 @@ _DEFAULT_PROM: tuple[int, ...] = (
     0x6FBC,  # 4: C4 - temperature coefficient of pressure offset
     0x802A,  # 5: C5 - reference temperature
     0x6F90,  # 6: C6 - temperature coefficient of the temperature
-    0x000F,  # 7: CRC (low nibble) -- firmware sometimes ignores
+    0x0005,  # 7: CRC4 (low nibble) over words 0..7 — see _crc4 / __post_init__
 )
 
 
@@ -79,6 +79,38 @@ class Ms5611I2cDevice(I2cDevice):
     _d2_jitter: int = field(default=0, init=False, repr=False)
     _commands: int = field(default=0, init=False, repr=False)
     _reads: int = field(default=0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Guarantee PROM word 7 carries a valid CRC4 over the calibration data
+        # so firmware that validates the PROM (e.g. ArduPilot's MS56XX driver)
+        # accepts the sensor. Any caller-supplied coefficients are made
+        # consistent here rather than trusting a hand-written nibble.
+        if len(self.prom) >= 8:
+            words = list(self.prom)
+            words[7] = (words[7] & 0xFF00) | self._crc4(words)
+            self.prom = tuple(words)
+
+    @staticmethod
+    def _crc4(prom: list[int]) -> int:
+        """MS5611 PROM CRC4 (datasheet AN520).
+
+        Operates on the 8 16-bit words, byte by byte, with the CRC nibble
+        (low byte of word 7) zeroed; returns the 4-bit remainder.
+        """
+        words = list(prom[:8]) + [0] * (8 - len(prom))
+        words[7] = words[7] & 0xFF00  # CRC byte is replaced by 0
+        n_rem = 0
+        for cnt in range(16):
+            if cnt & 1:
+                n_rem ^= words[cnt >> 1] & 0x00FF
+            else:
+                n_rem ^= (words[cnt >> 1] >> 8) & 0x00FF
+            for _ in range(8):
+                if n_rem & 0x8000:
+                    n_rem = ((n_rem << 1) ^ 0x3000) & 0xFFFF
+                else:
+                    n_rem = (n_rem << 1) & 0xFFFF
+        return (n_rem >> 12) & 0x0F
 
     def start(self, read: bool) -> bool:
         if read:
@@ -134,7 +166,12 @@ class Ms5611I2cDevice(I2cDevice):
         return 0xFF
 
     def stop(self) -> None:
-        self._read_phase = ""
+        # A STOP ends the current transaction but must NOT discard the latched
+        # command: ArduPilot issues ADC_READ / PROM_READ in one write
+        # transaction (with its own STOP) and clocks the result out in a
+        # separate read transaction. Clearing _read_phase here dropped the
+        # value, so reads after the STOP returned 0xFF. The phase persists
+        # until the next command (or read) replaces it.
         self._read_buf = b""
         self._read_idx = 0
 

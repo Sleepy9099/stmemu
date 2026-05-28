@@ -288,6 +288,13 @@ class UsartDmaCircularTests(unittest.TestCase):
         data = emu.mem_read(0x200, 7)
         self.assertEqual(data, b"$GPGGA,")
 
+    def test_usart_tdr_byte_write_queues_tx(self):
+        # DMA-driven UART TX issues byte writes to TDR; the byte must reach the
+        # TX FIFO rather than falling through to the raw register store.
+        bus, uart, dma, nvic, emu = _make_usart_dma_bus()
+        uart.write(uart._TDR, 1, 0x41)
+        self.assertEqual(uart.drain_tx_bytes(), b"\x41")
+
     def test_usart_rx_circular_wraps(self):
         bus, uart, dma, nvic, emu = _make_usart_dma_bus()
 

@@ -19,6 +19,8 @@ class CortexMCorePeripheral(RegisterPeripheral):
     _SCB_DEMCR = 0xEDFC
     _DWT_CTRL = 0x1000
     _DWT_CYCCNT = 0x1004
+    _DEMCR_TRCENA = 1 << 24
+    _DWT_CTRL_CYCCNTENA = 1 << 0
     _SYST_CSR = 0xE010
     _SYST_RVR = 0xE014
     _SYST_CVR = 0xE018
@@ -71,7 +73,6 @@ class CortexMCorePeripheral(RegisterPeripheral):
             RegisterSpec(
                 name="DWT.CYCCNT",
                 offset=self._DWT_CYCCNT,
-                on_read=self._on_read_cyccnt,
             )
         )
         self.add_register(RegisterSpec(name="SysTick.CTRL", offset=self._SYST_CSR))
@@ -86,7 +87,6 @@ class CortexMCorePeripheral(RegisterPeripheral):
             RegisterSpec(
                 name="SysTick.VAL",
                 offset=self._SYST_CVR,
-                on_read=self._on_read_systick_val,
                 on_write=self._on_write_systick_val,
             )
         )
@@ -271,7 +271,15 @@ class CortexMCorePeripheral(RegisterPeripheral):
         return names.get(number, f"Exception{number}")
 
     def tick(self, cycles: int) -> None:
-        self.write_register_value(self._DWT_CYCCNT, self.read_register_value(self._DWT_CYCCNT) + cycles)
+        # The DWT cycle counter only runs when tracing is enabled
+        # (DEMCR.TRCENA) and the counter itself is enabled (DWT_CTRL.CYCCNTENA),
+        # matching real Cortex-M hardware. Firmware that uses CYCCNT (ChibiOS,
+        # ArduPilot, ...) sets both before relying on it.
+        demcr = self.read_register_value(self._SCB_DEMCR)
+        dwt_ctrl = self.read_register_value(self._DWT_CTRL)
+        if (demcr & self._DEMCR_TRCENA) and (dwt_ctrl & self._DWT_CTRL_CYCCNTENA):
+            cyccnt = self.read_register_value(self._DWT_CYCCNT)
+            self.write_register_value(self._DWT_CYCCNT, (cyccnt + cycles) & 0xFFFFFFFF)
 
         ctrl = self.read_register_value(self._SYST_CSR)
         if not (ctrl & self._SYST_CSR_ENABLE):
@@ -282,17 +290,21 @@ class CortexMCorePeripheral(RegisterPeripheral):
             load = 0x00FFFFFF
 
         value = self.read_register_value(self._SYST_CVR) & 0x00FFFFFF
-        wrapped = cycles > 0 and value < cycles
-        value = (value - cycles) % (load + 1)
+        period = load + 1
+        # The counter decrements each cycle and fires when it reaches 0. From a
+        # non-zero value that takes `value` cycles (so landing exactly on 0
+        # counts); when already resting at 0 it must count a full period before
+        # the next reach-zero. The old `value < cycles` test was off by one in
+        # both directions (missed the exact-zero case, and spuriously fired
+        # while sitting at 0).
+        cycles_to_zero = value if value > 0 else period
+        wrapped = cycles > 0 and cycles >= cycles_to_zero
+        value = (value - cycles) % period
         if wrapped:
             self.write_register_value(self._SYST_CSR, ctrl | self._SYST_CSR_COUNTFLAG)
             if ctrl & self._SYST_CSR_TICKINT:
                 self.set_system_pending("SysTick", True)
         self.write_register_value(self._SYST_CVR, value)
-
-    def _on_read_cyccnt(self, current: int) -> int:
-        self.tick(10)
-        return self.read_register_value(self._DWT_CYCCNT)
 
     def _on_read_icsr(self, current: int) -> int:
         return self._build_icsr_value()
@@ -310,10 +322,6 @@ class CortexMCorePeripheral(RegisterPeripheral):
         if next_value & (1 << 31):
             self.set_system_pending("NMI", True)
         return self._build_icsr_value()
-
-    def _on_read_systick_val(self, current: int) -> int:
-        self.tick(1)
-        return self.read_register_value(self._SYST_CVR)
 
     def _on_write_systick_load(self, current: int, next_value: int) -> int:
         return next_value & 0x00FFFFFF

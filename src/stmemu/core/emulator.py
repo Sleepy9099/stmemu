@@ -162,6 +162,13 @@ class Emulator:
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
 
+        # Unsupported FP/VFP instructions are emulated as NOPs so firmware can
+        # boot, but that can mask real FP side effects. Track how often it
+        # happens and let callers switch to "strict" (fault instead of NOP).
+        self.unsupported_fp_mode: str = "permissive"  # or "strict"
+        self.unsupported_fp_count: int = 0
+        self.last_unsupported_fp_pc: int | None = None
+
         self._map_memory()
         self._install_hooks()
         self._pc_hist = {}
@@ -1486,9 +1493,21 @@ class Emulator:
 
         # ---- 32-bit Thumb VFP/FP coprocessor instructions (EDxx/EExx prefix).
         # Unicorn MCLASS builds often reject these even when firmware relies on
-        # them heavily. We currently treat unsupported FP ops as NOPs so control
-        # flow can progress to peripheral/runtime integration work.
+        # them heavily. In "permissive" mode (default) we treat unsupported FP
+        # ops as NOPs so control flow can progress; the occurrence is counted
+        # and emitted as an `unsupported_fp_instruction` event so it is visible
+        # rather than silent. In "strict" mode we let it fault instead.
         if (hw1 & 0xFF00) in (0xED00, 0xEE00):
+            self.unsupported_fp_count += 1
+            self.last_unsupported_fp_pc = pc
+            self._emit_unsupported_fp(pc, hw1, hw2)
+            if self.unsupported_fp_mode == "strict":
+                self.record_fault(
+                    "unsupported_fp_instruction",
+                    detail=f"hw1=0x{hw1:04X} hw2=0x{hw2:04X}",
+                    pc_override=pc,
+                )
+                return False
             uc.reg_write(UC_ARM_REG_PC, (addr + 4) | 1)
             return True
 
@@ -1580,6 +1599,25 @@ class Emulator:
         # Unknown invalid instruction: dump context
         self._log_invalid_window(pc)
         return False
+
+    def _emit_unsupported_fp(self, pc: int, hw1: int, hw2: int) -> None:
+        """Surface an unsupported-FP NOP as a traceable event."""
+        try:
+            from stmemu.peripherals.bus import PeripheralEvent
+            self.bus.emit(PeripheralEvent(
+                kind="unsupported_fp_instruction",
+                source="cpu",
+                address=pc,
+                payload={
+                    "pc": pc,
+                    "hw1": hw1,
+                    "hw2": hw2,
+                    "mode": self.unsupported_fp_mode,
+                    "count": self.unsupported_fp_count,
+                },
+            ))
+        except Exception:
+            log.debug("failed to emit unsupported_fp_instruction event")
 
     def _log_invalid_window(self, pc: int) -> None:
         try:
@@ -1818,12 +1856,21 @@ class Emulator:
         # Semihosting: intercept BKPT 0xAB (opcode 0xBEAB)
         if size == 2 and self.semihosting.enabled:
             try:
-                opcode = int.from_bytes(bytes(uc.mem_read(pc, 2)), "little")
+                opcode = int.from_bytes(bytes(uc.mem_read(pc & ~1, 2)), "little")
                 if opcode == BKPT_SEMIHOST:
                     r0 = uc.reg_read(UC_ARM_REG_R0)
                     r1 = uc.reg_read(UC_ARM_REG_R1)
                     result = self.semihosting.handle(r0, r1, uc.mem_read, uc.mem_write, uc)
                     uc.reg_write(UC_ARM_REG_R0, result & 0xFFFFFFFF)
+                    # The BKPT instruction itself would raise UC_ERR_EXCEPTION and
+                    # leave PC unchanged, so we must step over it ourselves: advance
+                    # past the 2-byte BKPT and stop this single-step cycle cleanly.
+                    self._special_step_consumed = True
+                    uc.reg_write(UC_ARM_REG_PC, ((pc & ~1) + 2) | 1)
+                    try:
+                        uc.emu_stop()
+                    except Exception:
+                        pass
                     return
             except Exception:
                 pass

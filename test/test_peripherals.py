@@ -136,6 +136,33 @@ class GpioTests(unittest.TestCase):
         odr = gpio.read(0x14, 4)
         self.assertEqual(odr & 1, 0)
 
+    def test_bsrr_halfword_set(self) -> None:
+        # Halfword (STRH) write to BSRR low half must still set ODR bits.
+        gpio = self._make_gpio()
+        gpio.write(0x18, 2, 0x0003)
+        self.assertEqual(gpio.read(0x14, 4) & 0x0003, 0x0003)
+
+    def test_bsrr_high_halfword_reset(self) -> None:
+        # The classic reset idiom: STRH to BSRR+2 targets the reset bits [31:16].
+        gpio = self._make_gpio()
+        gpio.write(0x14, 4, 0xFFFF)   # all ODR bits set
+        gpio.write(0x1A, 2, 0x0005)   # reset bits 0 and 2 via BSRR high half
+        odr = gpio.read(0x14, 4)
+        self.assertEqual(odr & 0x0005, 0)
+        self.assertEqual(odr & 0x0002, 0x0002)  # bit 1 untouched
+
+    def test_idr_byte_read_synthesizes_input(self) -> None:
+        # Byte (LDRB) read of IDR must still reflect the synthesized pin levels.
+        gpio = self._make_gpio()
+        moder = 0
+        for pin in (1, 3, 5, 7):
+            moder |= MODE_OUTPUT << (pin * 2)
+        gpio.write(0x00, 4, moder)
+        gpio.write(0x14, 4, 0x00AA)   # ODR
+        self.assertEqual(gpio.read(0x10, 1), 0xAA)        # low byte
+        self.assertEqual(gpio.read(0x11, 1), 0x00)        # next byte
+        self.assertEqual(gpio.read(0x10, 2), 0x00AA)      # halfword
+
 
 class FlashTests(unittest.TestCase):
 
@@ -203,6 +230,22 @@ class SpiTests(unittest.TestCase):
         spi.inject_rx(b"\xAB\xCD")
         self.assertEqual(spi.read(0x0C, 4), 0xAB)
         self.assertEqual(spi.read(0x0C, 4), 0xCD)
+
+    def test_16bit_frame_sends_both_bytes(self) -> None:
+        # With CR1.DFF set the frame is 16-bit: a DR write must clock out both
+        # bytes (MSB first) instead of dropping the high byte.
+        spi = self._make_spi()
+        spi.write(0x00, 4, spi._CR1_DFF)
+
+        class _Echo:
+            cs_active = True
+            def exchange(self, b: int) -> int:
+                return b  # loopback
+
+        spi.attach_device(_Echo())
+        spi.write(0x0C, 4, 0xABCD)
+        self.assertEqual(spi.drain_tx(), bytes([0xAB, 0xCD]))
+        self.assertEqual(spi.read(0x0C, 4), 0xABCD)  # full frame reassembled
 
     def test_reset_clears_fifos(self) -> None:
         spi = self._make_spi()
@@ -311,6 +354,12 @@ class I2cTests(unittest.TestCase):
         i2c.write(0x28, 4, 0xAB)
         self.assertEqual(i2c.drain_tx(), bytes([0xAB]))
 
+    def test_write_txdr_byte_captures_data(self) -> None:
+        # DMA-driven I2C TX issues byte writes to TXDR; they must not be dropped.
+        i2c = self._make_i2c()
+        i2c.write(0x28, 1, 0xAB)
+        self.assertEqual(i2c.drain_tx(), bytes([0xAB]))
+
 
 class DmaTests(unittest.TestCase):
 
@@ -345,6 +394,14 @@ class DmaTests(unittest.TestCase):
         dma.write(0x08, 4, 1 << 5)  # Clear TCIF0 via LIFCR
         lisr = dma.read(0x00, 4)
         self.assertFalse(lisr & (1 << 5))
+
+    def test_lifcr_halfword_clears_lisr(self) -> None:
+        # A sub-word write to LIFCR must still clear the targeted flag.
+        dma = self._make_dma()
+        dma.write(0x10, 4, 0x01)  # Enable stream 0 -> sets TCIF0 (bit 5)
+        self.assertTrue(dma.read(0x00, 4) & (1 << 5))
+        dma.write(0x08, 2, 1 << 5)  # halfword clear of low LIFCR half
+        self.assertFalse(dma.read(0x00, 4) & (1 << 5))
 
 
 # ── RCC register definitions ──────────────────────────────────────
@@ -549,6 +606,44 @@ class SysTickValTests(unittest.TestCase):
         core.write(0xE018, 4, 500)     # VAL — any write should clear to 0
         val = core.read_register_value(0xE018)
         self.assertEqual(val, 0, "writing SYST_CVR should clear it to 0")
+
+    def test_countflag_set_when_counter_lands_exactly_on_zero(self):
+        # Reaching 0 exactly (value == cycles) must fire COUNTFLAG; the old
+        # `value < cycles` test missed this boundary.
+        core = self._make_core()
+        core.write_register_value(0xE010, 0x01)  # ENABLE
+        core.write_register_value(0xE014, 10)     # LOAD = 10
+        core.write_register_value(0xE018, 5)      # CVR = 5
+        core.tick(5)                               # counts down exactly to 0
+        ctrl = core.read_register_value(0xE010)
+        self.assertTrue(ctrl & (1 << 16), "COUNTFLAG must set when counter reaches 0")
+        self.assertEqual(core.read_register_value(0xE018) & 0xFFFFFF, 0)
+
+    def test_systick_reach_zero_boundaries(self):
+        # Pin the exact reach-zero edge cases (LOAD=10, period=11).
+        def _ctrl_after(cvr, ticks):
+            core = self._make_core()
+            core.write_register_value(0xE010, 0x01)   # ENABLE
+            core.write_register_value(0xE014, 10)      # LOAD = 10
+            core.write_register_value(0xE018, cvr)     # CVR
+            core.tick(ticks)
+            return core.read_register_value(0xE010) & (1 << 16)
+
+        self.assertTrue(_ctrl_after(1, 1), "CVR=1, tick(1) reaches 0 -> COUNTFLAG")
+        self.assertFalse(_ctrl_after(0, 1), "CVR=0, tick(1) just reloads -> no COUNTFLAG")
+        self.assertTrue(_ctrl_after(0, 11), "CVR=0, tick(period) -> COUNTFLAG")
+
+    def test_no_spurious_countflag_when_resting_at_zero(self):
+        # Sitting at 0 then advancing less than a full period must NOT fire;
+        # the counter just reloads and counts down again.
+        core = self._make_core()
+        core.write_register_value(0xE010, 0x01)  # ENABLE
+        core.write_register_value(0xE014, 10)     # LOAD = 10
+        core.write_register_value(0xE018, 0)      # CVR = 0
+        core.tick(1)
+        ctrl = core.read_register_value(0xE010)
+        self.assertFalse(ctrl & (1 << 16), "leaving 0 must not set COUNTFLAG")
+        self.assertEqual(core.read_register_value(0xE018) & 0xFFFFFF, 10)
 
     def test_write_val_clears_countflag(self):
         core = self._make_core()

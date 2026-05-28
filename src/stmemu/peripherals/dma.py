@@ -55,6 +55,10 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
     _SxCR_PINC = 1 << 9
     _SxCR_DIR_SHIFT = 6
     _SxCR_DIR_MASK = 0x3
+    # MSIZE (SxCR[14:13]) only sets the memory bus access width, which is not
+    # observable against byte-addressed RAM, so the transfer logic acts on
+    # PSIZE alone. The constant is kept to document the field (and is exercised
+    # by tests asserting that a mismatched MSIZE does not corrupt the transfer).
     _SxCR_MSIZE_SHIFT = 13
     _SxCR_PSIZE_SHIFT = 11
     _SxCR_MINC = 1 << 10
@@ -138,13 +142,15 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
                 break
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size == 4 and offset == self._LIFCR:
+        if self._access_targets(offset, size, self._LIFCR):
+            clear_mask = self._aligned_write_value(offset, size, self._LIFCR, value)
             current = self.read_register_value(self._LISR)
-            self.write_register_value(self._LISR, current & ~int(value))
+            self.write_register_value(self._LISR, current & ~clear_mask)
             return
-        if size == 4 and offset == self._HIFCR:
+        if self._access_targets(offset, size, self._HIFCR):
+            clear_mask = self._aligned_write_value(offset, size, self._HIFCR, value)
             current = self.read_register_value(self._HISR)
-            self.write_register_value(self._HISR, current & ~int(value))
+            self.write_register_value(self._HISR, current & ~clear_mask)
             return
 
         super().write(offset, size, value)
@@ -152,8 +158,10 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         for stream in range(8):
             stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
             cr_offset = stream_offset + self._SxCR
-            if offset == cr_offset and (int(value) & self._SxCR_EN):
-                self._on_stream_enable(stream)
+            if self._access_targets(offset, size, cr_offset):
+                aligned = self._aligned_write_value(offset, size, cr_offset, value)
+                if aligned & self._SxCR_EN:
+                    self._on_stream_enable(stream)
 
     def _on_stream_enable(self, stream: int) -> None:
         stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
@@ -224,7 +232,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         cr = self.read_register_value(stream_offset + self._SxCR)
         par = self.read_register_value(stream_offset + self._SxPAR)
         direction = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
-        item_size = 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)
+        psize = 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)
 
         reload = self._stream_ndtr_reload.get(stream, 0)
         if reload == 0:
@@ -232,15 +240,20 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         pos = self._stream_pos.get(stream, 0)
         mar_base = self._stream_mar_base.get(stream, 0)
 
+        # NDTR counts peripheral data items of PSIZE bytes each. Memory is
+        # always laid out contiguously (the hardware packs/unpacks when MSIZE
+        # differs from PSIZE), so item ``pos`` lands at a PSIZE-strided offset.
         if cr & self._SxCR_MINC:
-            mar = mar_base + pos * item_size
+            mar = mar_base + pos * psize
         else:
             mar = mar_base
 
         emu = self._get_emulator()
         if emu is not None:
             try:
-                self._do_transfer(emu, direction, par, mar, item_size, cr=cr)
+                self._do_transfer(
+                    emu, direction, par, mar, n_items=1, psize=psize, cr=cr,
+                )
             except Exception:
                 log.debug("DMA stream %d item transfer failed", stream)
 
@@ -250,7 +263,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
 
         half = reload // 2
         if pos == half and half > 0:
-            self._set_htif(stream, cr, half * item_size)
+            self._set_htif(stream, cr, half * psize)
 
         if ndtr <= 0:
             self._set_tcif(stream, cr)
@@ -264,7 +277,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
                 self.write_register_value(
                     stream_offset + self._SxCR, cr & ~self._SxCR_EN,
                 )
-            self._emit_dma_event("dma_complete", stream, cr, par, reload * item_size)
+            self._emit_dma_event("dma_complete", stream, cr, par, reload * psize)
 
         self._stream_pos[stream] = pos
         self.write_register_value(stream_offset + self._SxNDTR, ndtr)
@@ -276,21 +289,21 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         par = self.read_register_value(stream_offset + self._SxPAR)
         mar = self.read_register_value(stream_offset + self._SxM0AR)
         direction = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
+        psize = 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)
 
         emu = self._get_emulator()
         if emu is not None and ndtr > 0:
-            item_size = 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)
-            byte_count = ndtr * item_size
             try:
-                self._do_transfer(emu, direction, par, mar, byte_count, cr=cr)
+                self._do_transfer(
+                    emu, direction, par, mar, n_items=ndtr, psize=psize, cr=cr,
+                )
             except Exception:
                 log.debug("DMA stream %d transfer failed", stream)
 
         self._set_tcif(stream, cr)
         self.write_register_value(stream_offset + self._SxCR, cr & ~self._SxCR_EN)
         self.write_register_value(stream_offset + self._SxNDTR, 0)
-        self._emit_dma_event("dma_complete", stream, cr, par,
-                             ndtr * max(1, 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)))
+        self._emit_dma_event("dma_complete", stream, cr, par, ndtr * psize)
 
     def _set_tcif(self, stream: int, cr: int) -> None:
         info = _STREAM_FLAG_BITS.get(stream)
@@ -335,40 +348,58 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             ))
 
     def _do_transfer(
-        self, emu: object, direction: int, par: int, mar: int, byte_count: int,
-        cr: int = 0,
+        self, emu: object, direction: int, par: int, mar: int, *,
+        n_items: int, psize: int, cr: int = 0,
     ) -> None:
+        """Move ``n_items`` data items between ``par`` and ``mar``.
+
+        The peripheral side is accessed in PSIZE-wide transactions (so a 16-bit
+        data register is read/written as one halfword, not two bytes) and the
+        peripheral pointer advances by PSIZE when PINC is set. The memory side
+        is byte-contiguous when MINC is set, which matches the hardware packing
+        behaviour when MSIZE differs from PSIZE (MSIZE only changes the memory
+        bus access width, which is not observable against a byte-addressed RAM).
+        """
         pinc = bool(cr & self._SxCR_PINC)
+        minc = bool(cr & self._SxCR_MINC)
         if direction == self._DIR_P2M:
-            data = self._bus_read_bytes(par, byte_count, pinc=pinc)
-            emu.mem_write(mar, data)
+            buf = bytearray()
+            for k in range(n_items):
+                addr = par + (k * psize if pinc else 0)
+                buf += self._bus_read_item(addr, psize)
+            if minc:
+                emu.mem_write(mar, bytes(buf))
+            else:
+                # No memory increment: every item lands at the same address.
+                for k in range(n_items):
+                    emu.mem_write(mar, bytes(buf[k * psize:(k + 1) * psize]))
         elif direction == self._DIR_M2P:
-            data = bytes(emu.mem_read(mar, byte_count))
-            self._bus_write_bytes(par, data, pinc=pinc)
+            for k in range(n_items):
+                src = mar + (k * psize if minc else 0)
+                chunk = bytes(emu.mem_read(src, psize))
+                value = int.from_bytes(chunk.ljust(psize, b"\x00"), "little")
+                addr = par + (k * psize if pinc else 0)
+                self._bus_write_item(addr, psize, value)
         elif direction == self._DIR_M2M:
-            data = bytes(emu.mem_read(par, byte_count))
-            emu.mem_write(mar, data)
+            total = n_items * psize
+            emu.mem_write(mar, bytes(emu.mem_read(par, total)))
 
-    def _bus_read_bytes(self, addr: int, count: int, pinc: bool = True) -> bytes:
+    def _bus_read_item(self, addr: int, size: int) -> bytes:
         if not self._context:
-            return b"\x00" * count
-        result = bytearray()
-        for i in range(count):
-            try:
-                val = self._context.bus.read(addr + (i if pinc else 0), 1)
-                result.append(val & 0xFF)
-            except Exception:
-                result.append(0)
-        return bytes(result)
+            return b"\x00" * size
+        try:
+            val = self._context.bus.read(addr, size)
+        except Exception:
+            val = 0
+        return (int(val) & ((1 << (size * 8)) - 1)).to_bytes(size, "little")
 
-    def _bus_write_bytes(self, addr: int, data: bytes, pinc: bool = True) -> None:
+    def _bus_write_item(self, addr: int, size: int, value: int) -> None:
         if not self._context:
             return
-        for i, b in enumerate(data):
-            try:
-                self._context.bus.write(addr + (i if pinc else 0), 1, b)
-            except Exception:
-                pass
+        try:
+            self._context.bus.write(addr, size, int(value) & ((1 << (size * 8)) - 1))
+        except Exception:
+            pass
 
     def _get_emulator(self) -> object | None:
         if not self._context:

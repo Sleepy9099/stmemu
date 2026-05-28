@@ -118,6 +118,18 @@ class TimerUpdateTests(unittest.TestCase):
         tim.write(tim._SR, 4, ~tim._SR_UIF & 0xFFFFFFFF)
         self.assertFalse(tim.read_register_value(tim._SR) & tim._SR_UIF)
 
+    def test_sr_halfword_clear_is_write_zero(self):
+        # A halfword (STRH) write to SR must keep rc_w0 semantics: writing 0
+        # clears a flag, writing 1 keeps it — it must NOT behave like a plain
+        # read/write register and spuriously set the other bits.
+        bus, tim, nvic = _make_bus_timer()
+        tim.write_register_value(tim._SR, tim._SR_UIF | tim._SR_CC1IF)
+        tim.write(tim._SR, 2, ~tim._SR_UIF & 0xFFFF)
+        sr = tim.read_register_value(tim._SR)
+        self.assertFalse(sr & tim._SR_UIF)   # UIF cleared (wrote 0)
+        self.assertTrue(sr & tim._SR_CC1IF)  # CC1IF kept (wrote 1)
+        self.assertEqual(sr & ~tim._SR_CC1IF, 0)  # nothing else got set
+
     def test_egr_ug_sets_uif_and_clears_cnt(self):
         bus, tim, nvic = _make_bus_timer()
         tim.write_register_value(tim._CNT, 50)
