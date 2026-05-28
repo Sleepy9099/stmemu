@@ -418,6 +418,30 @@ class H7SpiDmaTests(unittest.TestCase):
         rx = emu.mem_read(rx_addr, 2)
         self.assertEqual(rx[1], 0x47, "ICM-42688 WHOAMI through H7 DMA")
 
+    def test_h7_full_duplex_dma_with_request_mapping(self):
+        # Same full-duplex flow, but with the streams explicitly mapped to the
+        # SPI1_RX / SPI1_TX request lines — DMAMUX routing must not break it.
+        bus, spi, dma, _nvic, emu = _make_h7_setup()
+        imu = Icm42688Device(name="icm")
+        imu.cs_select()
+        spi.attach_device(imu)
+
+        tx_addr, rx_addr = 0x100, 0x200
+        emu.mem_write(tx_addr, bytes([0x80 | 0x75, 0x00]))
+        rxdr_addr = 0x40013000 + 0x30
+        txdr_addr = 0x40013000 + 0x20
+        rx_cr = _setup_dma_stream(dma, 0, rxdr_addr, rx_addr, 2, "p2m")
+        tx_cr = _setup_dma_stream(dma, 1, txdr_addr, tx_addr, 2, "m2p")
+        dma.write(0x10 + 0 * 0x18 + dma._SxCR, 4, rx_cr)
+        dma.write(0x10 + 1 * 0x18 + dma._SxCR, 4, tx_cr)
+        dma.set_stream_request(0, "SPI1_RX")
+        dma.set_stream_request(1, "SPI1_TX")
+
+        spi.write(0x08, 4, spi._H7_CFG1_TXDMAEN | spi._H7_CFG1_RXDMAEN)
+        spi.write(0x00, 4, spi._H7_CR1_SPE | spi._H7_CR1_CSTART)
+
+        self.assertEqual(emu.mem_read(rx_addr, 2)[1], 0x47, "WHOAMI via mapped DMA")
+
     def test_h7_16bit_frame_dma_roundtrip(self):
         # 16-bit SPI frames driven entirely by DMA: CFG1.DSIZE selects 16-bit,
         # the DMA streams use PSIZE=16-bit, so each DMA item is one whole frame

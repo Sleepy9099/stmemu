@@ -118,6 +118,7 @@ def load_board_config(path: Path) -> dict[str, Any]:
 _KNOWN_TOP_KEYS = {
     "target", "emulator", "board", "bus_policy",
     "uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc",
+    "dma", "dmamux",
     "registers", "memory", "breakpoints", "timed_events",
     "startup_commands",
 }
@@ -232,7 +233,10 @@ def apply_board_config(
     for w in warnings:
         messages.append(f"warning: {w}")
 
-    # Track applied configs and prevent double-apply of board topology
+    # Track applied configs and prevent double-apply of board *device*
+    # topology. DMA/DMAMUX request routing is deliberately excluded here: it is
+    # an idempotent overlay (mapping stream request lines, not creating
+    # devices), so a later routing-only config must still take effect.
     has_board_topology = any(
         k in config or k in config.get("board", {})
         for k in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc")
@@ -272,6 +276,11 @@ def apply_board_config(
         for key in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc"):
             if key in config and key not in (board if isinstance(board, dict) else {}):
                 messages.extend(_apply_board_topology({key: config[key]}, bus, base_dir=base_dir))
+
+    # 2b. DMA/DMAMUX request routing — applied on every config (even when the
+    # device topology above is skipped as a double-apply), because mapping a
+    # stream request is idempotent overlay state, not device creation.
+    messages.extend(_apply_dma_routing(config, bus))
 
     # 3. Register pre-sets
     for reg_cfg in config.get("registers", []):
@@ -351,6 +360,26 @@ def _apply_board_topology(
         msgs.append(_set_gpio_levels(bus, port_name, pins))
     for adc_name, adc_cfg in board.get("adc", {}).items():
         msgs.append(_configure_adc(bus, adc_name, adc_cfg))
+    return msgs
+
+
+def _apply_dma_routing(config: dict[str, Any], bus: object) -> list[str]:
+    """Apply DMA/DMAMUX request-line routing from a config (idempotent overlay).
+
+    Reads ``dma`` / ``dmamux`` from both the top level and the ``board`` block.
+    """
+    msgs: list[str] = []
+    board = config.get("board", {})
+    sources = [board, config] if isinstance(board, dict) else [config]
+    for src in sources:
+        dma_cfg = src.get("dma")
+        if isinstance(dma_cfg, dict):
+            for dma_name, cfg in dma_cfg.items():
+                msgs.append(_configure_dma_streams(bus, dma_name, cfg))
+        mux_cfg = src.get("dmamux")
+        if isinstance(mux_cfg, dict):
+            for mux_name, cfg in mux_cfg.items():
+                msgs.append(_configure_dmamux(bus, mux_name, cfg))
     return msgs
 
 
@@ -711,3 +740,73 @@ def _configure_adc(bus: object, adc_name: str, cfg: dict[str, Any]) -> str:
         parts.append(f"samples={len(samples)}")
 
     return " ".join(parts)
+
+
+def _apply_stream_requests(bus: object, dma_name: str, streams: dict) -> tuple[int, str | None]:
+    """Map ``{stream: {request: NAME}}`` onto a DMA controller's streams.
+
+    Returns (count_mapped, error_message_or_None).
+    """
+    model = bus.model_for_name(str(dma_name).upper())
+    if model is None or not hasattr(model, "set_stream_request"):
+        return 0, f"unknown/unsupported DMA controller: {dma_name}"
+    n = 0
+    for skey, scfg in (streams or {}).items():
+        try:
+            stream = int(skey)
+        except (TypeError, ValueError):
+            continue
+        request = scfg.get("request") if isinstance(scfg, dict) else scfg
+        if request:
+            model.set_stream_request(stream, str(request).upper())
+            n += 1
+    return n, None
+
+
+def _configure_dma_streams(bus: object, dma_name: str, cfg: dict[str, Any]) -> str:
+    streams = cfg.get("streams", cfg) if isinstance(cfg, dict) else {}
+    n, err = _apply_stream_requests(bus, dma_name, streams)
+    if err:
+        return f"dma {dma_name}: {err}"
+    return f"dma {dma_name}: {n} stream request(s) mapped"
+
+
+# DMAMUX channel -> (DMA controller, stream) convention. On STM32 H7 DMAMUX1
+# channels 0..7 drive DMA1 streams 0..7 and channels 8..15 drive DMA2 streams
+# 0..7. V0 uses this symbolic mapping; exact numeric request IDs are out of
+# scope.
+def _dmamux_channel_target(mux_name: str, channel: int) -> tuple[str, int]:
+    mux = str(mux_name).upper()
+    if mux in ("DMAMUX1", "DMAMUX"):
+        if channel < 8:
+            return "DMA1", channel
+        return "DMA2", channel - 8
+    if mux == "DMAMUX2":
+        return "BDMA", channel
+    # Unknown mux: assume a single DMA1 with 1:1 channel->stream.
+    return "DMA1", channel
+
+
+def _configure_dmamux(bus: object, mux_name: str, cfg: dict[str, Any]) -> str:
+    channels = cfg.get("channels", {}) if isinstance(cfg, dict) else {}
+    mapped = 0
+    misses: list[str] = []
+    for ckey, ccfg in channels.items():
+        try:
+            channel = int(ckey)
+        except (TypeError, ValueError):
+            continue
+        request = ccfg.get("request") if isinstance(ccfg, dict) else ccfg
+        if not request:
+            continue
+        dma_name, stream = _dmamux_channel_target(mux_name, channel)
+        model = bus.model_for_name(dma_name)
+        if model is None or not hasattr(model, "set_stream_request"):
+            misses.append(f"ch{channel}->{dma_name}")
+            continue
+        model.set_stream_request(stream, str(request).upper())
+        mapped += 1
+    msg = f"dmamux {mux_name}: {mapped} channel request(s) mapped"
+    if misses:
+        msg += f" (unmapped: {', '.join(misses)})"
+    return msg
