@@ -139,6 +139,24 @@ class RequestRoutingTests(unittest.TestCase):
         self.assertEqual(_ndtr(dma, 0), 1, "mismatched request must not transfer")
         self.assertEqual(emu.mem_read(0x200, 1), bytes([0x00]))
 
+    def test_mapped_stream_ignores_unnamed_request(self):
+        # A mapped stream is DMAMUX-routed: an unnamed request (no request
+        # line) must not drive it, even though PAR+direction match.
+        bus, src, dma, emu = _setup()
+        _arm(dma, 0, mar=0x200)
+        dma.set_stream_request(0, "SPI1_RX")
+        dma.on_peripheral_request(_SRC_BASE + _DR, "p2m", 1, request=None)
+        self.assertEqual(_ndtr(dma, 0), 1)
+        self.assertEqual(emu.mem_read(0x200, 1), b"\x00")
+
+    def test_mapped_stream_accepts_its_request(self):
+        bus, src, dma, emu = _setup()
+        _arm(dma, 0, mar=0x200)
+        dma.set_stream_request(0, "SPI1_RX")
+        dma.on_peripheral_request(_SRC_BASE + _DR, "p2m", 1, request="SPI1_RX")
+        self.assertEqual(_ndtr(dma, 0), 0)
+        self.assertEqual(emu.mem_read(0x200, 1), bytes([0xA5]))
+
     def test_fallback_par_direction_without_mapping(self):
         # No request mapping -> permissive PAR+direction routing still works,
         # even when the request carries a name.

@@ -148,12 +148,12 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             actual_dir = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
             if par != periph_addr or actual_dir != expected_dir:
                 continue
-            # DMAMUX request routing: when this stream is mapped to a specific
-            # request line, only the matching request drives it. Streams with
-            # no mapping fall back to PAR+direction (keeps simple configs and
-            # existing behaviour working).
+            # DMAMUX request routing: once a stream is mapped to a request
+            # line, only that exact request drives it — an unnamed or
+            # mismatched request must not. Streams with no mapping keep the
+            # permissive PAR+direction fallback (simple configs / legacy).
             mapped = self._stream_request.get(stream)
-            if mapped is not None and want is not None and mapped != want:
+            if mapped is not None and (want is None or mapped != want):
                 continue
             if self._stream_busy.get(stream):
                 continue
