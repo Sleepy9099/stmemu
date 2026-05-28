@@ -205,10 +205,10 @@ class UbloxGpsDevice(ExternalDevice):
         return min(self.sats, len(self._constellation))
 
     def tick(self, cycles: int) -> None:
-        self._cycle_counter += cycles
-        self._total_ticks += cycles
-        if self.rate_cycles > 0 and self._cycle_counter >= self.rate_cycles:
-            self._cycle_counter = 0
+        self._cycle_counter += int(cycles)
+        self._total_ticks += int(cycles)
+        while self.rate_cycles > 0 and self._cycle_counter >= self.rate_cycles:
+            self._cycle_counter -= self.rate_cycles
             self._time_seconds = (self._time_seconds + 1) % 86400
             self._fix_epoch += 1
             if self.mode in ("nmea", "both"):

@@ -132,6 +132,18 @@ class AutonomousGpsTests(unittest.TestCase):
         self.assertEqual(line._total_rx_bytes, 0)
         self.assertEqual(line._total_tx_bytes, 0)
 
+    def test_large_tick_emits_multiple(self):
+        bus, uart, gps, line, nvic = self._make_setup(rate_cycles=100)
+        bus.tick(250)
+        self.assertEqual(gps._fix_epoch, 2, "tick(250) with rate=100 should emit twice")
+        self.assertEqual(gps._cycle_counter, 50, "remainder should be preserved")
+
+    def test_exact_multiple_tick(self):
+        bus, uart, gps, line, nvic = self._make_setup(rate_cycles=100)
+        bus.tick(300)
+        self.assertEqual(gps._fix_epoch, 3)
+        self.assertEqual(gps._cycle_counter, 0)
+
 
 # ── GPS → USART → DMA circular path ─────────────────────────────
 
