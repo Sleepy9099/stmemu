@@ -213,6 +213,75 @@ class SpiTests(unittest.TestCase):
         sr = spi.read(0x08, 4)
         self.assertFalse(sr & (1 << 0))  # RXNE = 0
 
+    def test_snapshot_includes_attached_device_state(self) -> None:
+        from stmemu.external.fram import FramFm25v02a
+
+        spi_a = self._make_spi()
+        fram_a = FramFm25v02a()
+        fram_a._mem[0:4] = b"\xAA\xBB\xCC\xDD"
+        fram_a._wel = True
+        fram_a._writes_total = 7
+        spi_a.attach_device(fram_a)
+
+        snap = spi_a.snapshot_state()
+        self.assertIn("attached_devices", snap)
+        self.assertEqual(len(snap["attached_devices"]), 1)
+        entry = snap["attached_devices"][0]
+        self.assertEqual(entry["type"], "FramFm25v02a")
+        self.assertEqual(entry["name"], "fm25v02a")
+        self.assertIsNotNone(entry["state"])
+        self.assertEqual(entry["state"]["mem"][:4], b"\xAA\xBB\xCC\xDD")
+        self.assertTrue(entry["state"]["wel"])
+        self.assertEqual(entry["state"]["writes_total"], 7)
+
+    def test_restore_round_trip_through_spi(self) -> None:
+        from stmemu.external.fram import FramFm25v02a
+
+        spi_a = self._make_spi()
+        fram_a = FramFm25v02a()
+        fram_a._mem[0x100:0x104] = b"\x01\x02\x03\x04"
+        fram_a._wel = True
+        fram_a._writes_total = 42
+        spi_a.attach_device(fram_a)
+
+        snap = spi_a.snapshot_state()
+
+        spi_b = self._make_spi()
+        fram_b = FramFm25v02a()
+        spi_b.attach_device(fram_b)
+        spi_b.restore_state(snap)
+
+        self.assertEqual(bytes(fram_b._mem[0x100:0x104]), b"\x01\x02\x03\x04")
+        self.assertTrue(fram_b._wel)
+        self.assertEqual(fram_b._writes_total, 42)
+
+    def test_restore_matches_devices_by_name_not_order(self) -> None:
+        from stmemu.external.fram import FramFm25v02a
+
+        spi_a = self._make_spi()
+        f1 = FramFm25v02a()
+        f1.name = "fram_param"
+        f1._writes_total = 11
+        f2 = FramFm25v02a()
+        f2.name = "fram_logs"
+        f2._writes_total = 22
+        spi_a.attach_device(f1)
+        spi_a.attach_device(f2)
+        snap = spi_a.snapshot_state()
+
+        # Attach in reversed order — restore should still match by name.
+        spi_b = self._make_spi()
+        f2b = FramFm25v02a()
+        f2b.name = "fram_logs"
+        f1b = FramFm25v02a()
+        f1b.name = "fram_param"
+        spi_b.attach_device(f2b)
+        spi_b.attach_device(f1b)
+        spi_b.restore_state(snap)
+
+        self.assertEqual(f1b._writes_total, 11)
+        self.assertEqual(f2b._writes_total, 22)
+
 
 class I2cTests(unittest.TestCase):
 

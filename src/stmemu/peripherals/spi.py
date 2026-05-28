@@ -203,6 +203,19 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
             base = {}
         base["tx_fifo"] = bytes(self._tx_fifo)
         base["rx_fifo"] = list(self._rx_fifo)
+        attached = []
+        for i, dev in enumerate(self._devices):
+            entry = {
+                "name": getattr(dev, "name", f"dev{i}"),
+                "type": type(dev).__name__,
+            }
+            if hasattr(dev, "snapshot_state"):
+                try:
+                    entry["state"] = dev.snapshot_state()
+                except Exception:
+                    entry["state"] = None
+            attached.append(entry)
+        base["attached_devices"] = attached
         return base
 
     def restore_state(self, state: object) -> None:
@@ -215,6 +228,39 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         rx = state.get("rx_fifo")
         if isinstance(rx, list):
             self._rx_fifo = deque(int(b) & 0xFF for b in rx)
+        attached = state.get("attached_devices")
+        if isinstance(attached, list):
+            # Build lookup by name first, then fall back to type, then index.
+            by_name: dict[str, object] = {}
+            by_type: dict[str, list[object]] = {}
+            for dev in self._devices:
+                name = getattr(dev, "name", None)
+                if name:
+                    by_name.setdefault(name, dev)
+                by_type.setdefault(type(dev).__name__, []).append(dev)
+            type_cursor: dict[str, int] = {}
+            for i, entry in enumerate(attached):
+                if not isinstance(entry, dict):
+                    continue
+                dev_state = entry.get("state")
+                if dev_state is None:
+                    continue
+                name = entry.get("name", "")
+                type_name = entry.get("type", "")
+                target = by_name.get(name)
+                if target is None:
+                    candidates = by_type.get(type_name, [])
+                    cursor = type_cursor.get(type_name, 0)
+                    if cursor < len(candidates):
+                        target = candidates[cursor]
+                        type_cursor[type_name] = cursor + 1
+                if target is None and i < len(self._devices):
+                    target = self._devices[i]
+                if target is not None and hasattr(target, "restore_state"):
+                    try:
+                        target.restore_state(dev_state)
+                    except Exception:
+                        pass
         self._refresh_status()
 
 

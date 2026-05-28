@@ -218,7 +218,7 @@ def apply_board_config(
     # Track applied configs and prevent double-apply of board topology
     has_board_topology = any(
         k in config or k in config.get("board", {})
-        for k in ("uart_devices", "i2c_devices", "gpio_levels", "adc")
+        for k in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc")
     )
     skip_topology = False
     if has_board_topology and _applied_configs:
