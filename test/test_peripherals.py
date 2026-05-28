@@ -619,6 +619,20 @@ class SysTickValTests(unittest.TestCase):
         self.assertTrue(ctrl & (1 << 16), "COUNTFLAG must set when counter reaches 0")
         self.assertEqual(core.read_register_value(0xE018) & 0xFFFFFF, 0)
 
+    def test_systick_reach_zero_boundaries(self):
+        # Pin the exact reach-zero edge cases (LOAD=10, period=11).
+        def _ctrl_after(cvr, ticks):
+            core = self._make_core()
+            core.write_register_value(0xE010, 0x01)   # ENABLE
+            core.write_register_value(0xE014, 10)      # LOAD = 10
+            core.write_register_value(0xE018, cvr)     # CVR
+            core.tick(ticks)
+            return core.read_register_value(0xE010) & (1 << 16)
+
+        self.assertTrue(_ctrl_after(1, 1), "CVR=1, tick(1) reaches 0 -> COUNTFLAG")
+        self.assertFalse(_ctrl_after(0, 1), "CVR=0, tick(1) just reloads -> no COUNTFLAG")
+        self.assertTrue(_ctrl_after(0, 11), "CVR=0, tick(period) -> COUNTFLAG")
+
     def test_no_spurious_countflag_when_resting_at_zero(self):
         # Sitting at 0 then advancing less than a full period must NOT fire;
         # the counter just reloads and counts down again.

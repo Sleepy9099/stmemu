@@ -418,6 +418,48 @@ class H7SpiDmaTests(unittest.TestCase):
         rx = emu.mem_read(rx_addr, 2)
         self.assertEqual(rx[1], 0x47, "ICM-42688 WHOAMI through H7 DMA")
 
+    def test_h7_16bit_frame_dma_roundtrip(self):
+        # 16-bit SPI frames driven entirely by DMA: CFG1.DSIZE selects 16-bit,
+        # the DMA streams use PSIZE=16-bit, so each DMA item is one whole frame
+        # (a halfword), not a byte. An echo slave mirrors TX -> RX.
+        bus, spi, dma, _nvic, emu = _make_h7_setup()
+
+        class _Echo:
+            cs_active = True
+            def exchange(self, b):
+                return b
+
+        spi.attach_device(_Echo())
+
+        tx_addr, rx_addr = 0x100, 0x200
+        emu.mem_write(tx_addr, bytes([0x34, 0x12, 0x78, 0x56]))  # 0x1234, 0x5678
+        rxdr = 0x40013000 + 0x30
+        txdr = 0x40013000 + 0x20
+        psize16 = 1  # 1 << 1 = 2 bytes
+
+        def _cr16(stream, par, mar, ndtr, direction):
+            so = dma._STREAM_BASE + stream * dma._STREAM_STRIDE
+            dma.write_register_value(so + dma._SxNDTR, ndtr)
+            dma.write_register_value(so + dma._SxPAR, par)
+            dma.write_register_value(so + dma._SxM0AR, mar)
+            return (
+                dma._SxCR_EN | dma._SxCR_MINC
+                | (direction << dma._SxCR_DIR_SHIFT)
+                | (psize16 << dma._SxCR_PSIZE_SHIFT)
+                | (psize16 << dma._SxCR_MSIZE_SHIFT)
+            )
+
+        rx_cr = _cr16(0, rxdr, rx_addr, 2, dma._DIR_P2M)
+        tx_cr = _cr16(1, txdr, tx_addr, 2, dma._DIR_M2P)
+        dma.write(0x10 + 0 * 0x18 + dma._SxCR, 4, rx_cr)
+        dma.write(0x10 + 1 * 0x18 + dma._SxCR, 4, tx_cr)
+
+        spi.write(0x08, 4, 15 | spi._H7_CFG1_TXDMAEN | spi._H7_CFG1_RXDMAEN)  # DSIZE=15
+        spi.write(0x00, 4, spi._H7_CR1_SPE | spi._H7_CR1_CSTART)
+
+        # Echo slave returns each frame unchanged, so RX memory mirrors TX.
+        self.assertEqual(emu.mem_read(rx_addr, 4), bytes([0x34, 0x12, 0x78, 0x56]))
+
     def test_h7_16bit_frame_sends_both_bytes(self):
         # CFG1.DSIZE = 15 selects 16-bit frames; a TXDR write must clock out
         # both bytes (MSB first) and RXDR must return the reassembled frame.

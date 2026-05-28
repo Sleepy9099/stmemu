@@ -14,13 +14,22 @@ from stmemu.peripherals.core_cm import CortexMCorePeripheral
 
 
 # PPB-relative offsets (see CortexMCorePeripheral)
+DWT_CTRL = 0x1000
 DWT_CYCCNT = 0x1004
+DEMCR = 0xEDFC
 SYST_CSR = 0xE010
 SYST_RVR = 0xE014
 SYST_CVR = 0xE018
 
 CSR_ENABLE = 1 << 0
 CSR_TICKINT = 1 << 1
+DEMCR_TRCENA = 1 << 24
+DWT_CTRL_CYCCNTENA = 1 << 0
+
+
+def _enable_cyccnt(core) -> None:
+    core.write(DEMCR, 4, DEMCR_TRCENA)
+    core.write(DWT_CTRL, 4, DWT_CTRL_CYCCNTENA)
 
 
 def _core() -> CortexMCorePeripheral:
@@ -30,6 +39,7 @@ def _core() -> CortexMCorePeripheral:
 class CoreTimingTests(unittest.TestCase):
     def test_cyccnt_read_has_no_side_effect(self) -> None:
         core = _core()
+        _enable_cyccnt(core)
         first = core.read(DWT_CYCCNT, 4)
         # Reading repeatedly must not advance the cycle counter.
         self.assertEqual(core.read(DWT_CYCCNT, 4), first)
@@ -38,6 +48,19 @@ class CoreTimingTests(unittest.TestCase):
         core.tick(5)
         self.assertEqual(core.read(DWT_CYCCNT, 4), first + 5)
         self.assertEqual(core.read(DWT_CYCCNT, 4), first + 5)
+
+    def test_cyccnt_does_not_run_until_enabled(self) -> None:
+        # CYCCNT must stay at 0 until DEMCR.TRCENA and DWT_CTRL.CYCCNTENA are
+        # both set, matching hardware.
+        core = _core()
+        core.tick(10)
+        self.assertEqual(core.read(DWT_CYCCNT, 4), 0, "counter must be gated off")
+        core.write(DEMCR, 4, DEMCR_TRCENA)  # TRCENA only
+        core.tick(10)
+        self.assertEqual(core.read(DWT_CYCCNT, 4), 0, "CYCCNTENA still off")
+        core.write(DWT_CTRL, 4, DWT_CTRL_CYCCNTENA)  # now both set
+        core.tick(7)
+        self.assertEqual(core.read(DWT_CYCCNT, 4), 7)
 
     def test_systick_val_read_has_no_side_effect(self) -> None:
         core = _core()

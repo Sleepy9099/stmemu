@@ -19,6 +19,8 @@ class CortexMCorePeripheral(RegisterPeripheral):
     _SCB_DEMCR = 0xEDFC
     _DWT_CTRL = 0x1000
     _DWT_CYCCNT = 0x1004
+    _DEMCR_TRCENA = 1 << 24
+    _DWT_CTRL_CYCCNTENA = 1 << 0
     _SYST_CSR = 0xE010
     _SYST_RVR = 0xE014
     _SYST_CVR = 0xE018
@@ -269,7 +271,15 @@ class CortexMCorePeripheral(RegisterPeripheral):
         return names.get(number, f"Exception{number}")
 
     def tick(self, cycles: int) -> None:
-        self.write_register_value(self._DWT_CYCCNT, self.read_register_value(self._DWT_CYCCNT) + cycles)
+        # The DWT cycle counter only runs when tracing is enabled
+        # (DEMCR.TRCENA) and the counter itself is enabled (DWT_CTRL.CYCCNTENA),
+        # matching real Cortex-M hardware. Firmware that uses CYCCNT (ChibiOS,
+        # ArduPilot, ...) sets both before relying on it.
+        demcr = self.read_register_value(self._SCB_DEMCR)
+        dwt_ctrl = self.read_register_value(self._DWT_CTRL)
+        if (demcr & self._DEMCR_TRCENA) and (dwt_ctrl & self._DWT_CTRL_CYCCNTENA):
+            cyccnt = self.read_register_value(self._DWT_CYCCNT)
+            self.write_register_value(self._DWT_CYCCNT, (cyccnt + cycles) & 0xFFFFFFFF)
 
         ctrl = self.read_register_value(self._SYST_CSR)
         if not (ctrl & self._SYST_CSR_ENABLE):
