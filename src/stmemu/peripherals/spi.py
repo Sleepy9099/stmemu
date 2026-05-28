@@ -22,20 +22,35 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
     _tx_fifo: bytearray = field(default_factory=bytearray, init=False, repr=False)
     _rx_fifo: deque[int] = field(default_factory=deque, init=False, repr=False)
+    _devices: list[object] = field(default_factory=list, init=False, repr=False)
 
-    # Standard SPI register offsets
+    # Standard SPI register offsets (legacy F1/F4/F7 layout).
     _CR1 = 0x00
     _CR2 = 0x04
     _SR = 0x08
-    _DR = 0x0C
+    _DR = 0x0C        # legacy combined data register
+    _TXDR: int | None = None  # H7 split TX data register
+    _RXDR: int | None = None  # H7 split RX data register
 
-    # SR flags
+    # SR flags (legacy layout). H7 uses different bit positions but firmware
+    # for ChibiOS HAL drivers usually consults TXE/RXNE/EOT semantically.
     _SR_RXNE = 1 << 0   # Receive buffer not empty
     _SR_TXE = 1 << 1    # Transmit buffer empty
     _SR_BSY = 1 << 7    # Busy flag
 
-    # CR1 flags
+    # H7 SR flags (datasheet bit positions):
+    _H7_SR_RXP = 1 << 0   # RX packet available
+    _H7_SR_TXP = 1 << 1   # TX packet space available
+    _H7_SR_EOT = 1 << 3   # End of transfer
+    _H7_SR_TXC = 1 << 12  # TX complete
+
+    # CR1 flags (legacy)
     _CR1_SPE = 1 << 6   # SPI enable
+
+    # H7 CR1 flags
+    _H7_CR1_SPE = 1 << 0      # SPI enable
+    _H7_CR1_CSTART = 1 << 9   # Master transfer start (self-clearing on EOT)
+    _H7_CR1_CSUSP = 1 << 10   # Master transfer suspend (self-clearing on EOT)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -49,13 +64,32 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
                 self._SR = reg.offset
             elif rname == "DR":
                 self._DR = reg.offset
+            elif rname == "TXDR":
+                self._TXDR = reg.offset
+            elif rname == "RXDR":
+                self._RXDR = reg.offset
+        # When the SVD provides split TX/RX (H7), suppress the legacy
+        # combined DR so writes to that offset don't accidentally clock
+        # the bus — on H7 0x0C is the CFG2 register.
+        if self._TXDR is not None or self._RXDR is not None:
+            self._DR = -1
         self._refresh_status()
 
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
 
+    def _is_data_read(self, offset: int) -> bool:
+        if self._RXDR is not None:
+            return offset == self._RXDR
+        return offset == self._DR
+
+    def _is_data_write(self, offset: int) -> bool:
+        if self._TXDR is not None:
+            return offset == self._TXDR
+        return offset == self._DR
+
     def read(self, offset: int, size: int) -> int:
-        if offset == self._DR:
+        if self._is_data_read(offset):
             value = self._rx_fifo.popleft() if self._rx_fifo else 0
             self._refresh_status()
             return value
@@ -64,24 +98,86 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         return super().read(offset, size)
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size in (1, 2, 4) and offset == self._DR:
-            # Capture transmitted byte; loopback into RX for reads
+        if size in (1, 2, 4) and self._is_data_write(offset):
             byte = int(value) & 0xFF
             self._tx_fifo.append(byte)
-            self._rx_fifo.append(0xFF)  # default MISO = 0xFF (no slave)
+            miso = self._exchange_with_selected(byte)
+            self._rx_fifo.append(miso)
             self._refresh_status()
             return
         super().write(offset, size, value)
         if offset == self._CR1:
+            # H7 CSTART / CSUSP auto-clear when the hardware completes the
+            # transfer. Without real timing we treat them as immediately
+            # self-clearing so firmware polling loops can progress.
+            if self._TXDR is not None or self._RXDR is not None:
+                cr1 = self.read_register_value(self._CR1)
+                cleared = cr1 & ~(self._H7_CR1_CSTART | self._H7_CR1_CSUSP)
+                if cleared != cr1:
+                    self.write_register_value(self._CR1, cleared)
             self._refresh_status()
+
+    def _exchange_with_selected(self, byte: int) -> int:
+        """Route MOSI to whichever attached slave currently has CS asserted.
+
+        Multiple devices can share one SPI peripheral (e.g. SPI1 with an
+        IMU and two BMI088 chips). Each device tracks its own ``cs_active``;
+        the first one whose CS is low gets the byte. If no slave's CS is
+        asserted but the bus has exactly one attached device, route to it
+        anyway -- a single-slave bus with no CS detection (FRAM auto-CS
+        before the first GPIO falling edge is seen) shouldn't go silent.
+        """
+        for dev in self._devices:
+            if getattr(dev, "cs_active", False) and hasattr(dev, "exchange"):
+                return int(dev.exchange(byte)) & 0xFF
+        if len(self._devices) == 1:
+            dev = self._devices[0]
+            if hasattr(dev, "exchange"):
+                return int(dev.exchange(byte)) & 0xFF
+        return 0xFF
+
+    def attach_device(self, device: object) -> None:
+        """Wire an SPI slave so MOSI bytes go through device.exchange().
+
+        Multiple devices may be attached to one SPI bus; each is dispatched
+        based on its ``cs_active`` flag at exchange time.
+        """
+        if device not in self._devices:
+            self._devices.append(device)
+
+    def detach_device(self, device: object | None = None) -> None:
+        if device is None:
+            self._devices.clear()
+        else:
+            try:
+                self._devices.remove(device)
+            except ValueError:
+                pass
+
+    @property
+    def attached_device(self) -> object | None:
+        return self._devices[0] if self._devices else None
+
+    @property
+    def attached_devices(self) -> tuple[object, ...]:
+        return tuple(self._devices)
 
     def _refresh_status(self) -> None:
         sr = self.read_register_value(self._SR)
-        sr &= ~(self._SR_TXE | self._SR_RXNE | self._SR_BSY)
-        sr |= self._SR_TXE  # always ready to transmit
-        if self._rx_fifo:
-            sr |= self._SR_RXNE
-        # BSY stays 0 (transfers complete instantly)
+        if self._TXDR is not None or self._RXDR is not None:
+            # H7-style SR: TXP/RXP/EOT/TXC sit at the bottom; force
+            # TXP+TXC=1 (host can keep writing) and toggle RXP based on
+            # whether MISO bytes are queued.
+            sr &= ~(self._H7_SR_RXP | self._H7_SR_TXP | self._H7_SR_EOT | self._H7_SR_TXC)
+            sr |= self._H7_SR_TXP | self._H7_SR_TXC | self._H7_SR_EOT
+            if self._rx_fifo:
+                sr |= self._H7_SR_RXP
+        else:
+            sr &= ~(self._SR_TXE | self._SR_RXNE | self._SR_BSY)
+            sr |= self._SR_TXE  # always ready to transmit
+            if self._rx_fifo:
+                sr |= self._SR_RXNE
+            # BSY stays 0 (transfers complete instantly)
         self.write_register_value(self._SR, sr)
 
     def drain_tx(self) -> bytes:
@@ -98,6 +194,7 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         super().reset()
         self._tx_fifo.clear()
         self._rx_fifo.clear()
+        # Devices stay attached across reset (board topology persists).
         self._refresh_status()
 
     def snapshot_state(self) -> object | None:
@@ -106,6 +203,19 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
             base = {}
         base["tx_fifo"] = bytes(self._tx_fifo)
         base["rx_fifo"] = list(self._rx_fifo)
+        attached = []
+        for i, dev in enumerate(self._devices):
+            entry = {
+                "name": getattr(dev, "name", f"dev{i}"),
+                "type": type(dev).__name__,
+            }
+            if hasattr(dev, "snapshot_state"):
+                try:
+                    entry["state"] = dev.snapshot_state()
+                except Exception:
+                    entry["state"] = None
+            attached.append(entry)
+        base["attached_devices"] = attached
         return base
 
     def restore_state(self, state: object) -> None:
@@ -118,6 +228,39 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         rx = state.get("rx_fifo")
         if isinstance(rx, list):
             self._rx_fifo = deque(int(b) & 0xFF for b in rx)
+        attached = state.get("attached_devices")
+        if isinstance(attached, list):
+            # Build lookup by name first, then fall back to type, then index.
+            by_name: dict[str, object] = {}
+            by_type: dict[str, list[object]] = {}
+            for dev in self._devices:
+                name = getattr(dev, "name", None)
+                if name:
+                    by_name.setdefault(name, dev)
+                by_type.setdefault(type(dev).__name__, []).append(dev)
+            type_cursor: dict[str, int] = {}
+            for i, entry in enumerate(attached):
+                if not isinstance(entry, dict):
+                    continue
+                dev_state = entry.get("state")
+                if dev_state is None:
+                    continue
+                name = entry.get("name", "")
+                type_name = entry.get("type", "")
+                target = by_name.get(name)
+                if target is None:
+                    candidates = by_type.get(type_name, [])
+                    cursor = type_cursor.get(type_name, 0)
+                    if cursor < len(candidates):
+                        target = candidates[cursor]
+                        type_cursor[type_name] = cursor + 1
+                if target is None and i < len(self._devices):
+                    target = self._devices[i]
+                if target is not None and hasattr(target, "restore_state"):
+                    try:
+                        target.restore_state(dev_state)
+                    except Exception:
+                        pass
         self._refresh_status()
 
 

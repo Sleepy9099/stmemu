@@ -552,6 +552,19 @@ class BoardConfigDoubleApplyTests(unittest.TestCase):
         apply_board_config({"bus_policy": "permissive"}, bus, source="test")
         self.assertEqual(config_applied_count(), initial + 1)
 
+    def test_spi_devices_triggers_double_apply(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        cfg1 = {"spi_devices": [{"peripheral": "SPI1", "type": "fram_fm25v02a"}]}
+        cfg2 = {"spi_devices": [{"peripheral": "SPI1", "type": "fram_fm25v02a"}]}
+        # SPI1 isn't on the bus, so attach attempts return error strings; the
+        # important thing here is the double-apply guard fires regardless.
+        apply_board_config(cfg1, bus, source="first")
+        msgs = apply_board_config(cfg2, bus, source="second")
+        self.assertTrue(
+            any("skipped" in m for m in msgs),
+            "spi_devices should trigger topology double-apply guard",
+        )
+
     def tearDown(self):
         _applied_configs.clear()
 

@@ -1032,6 +1032,50 @@ class Emulator:
         del self._snapshots[key]
         return True
 
+    def export_snapshot(self, name: str, path) -> int:
+        """Persist a snapshot to disk via pickle. Returns bytes written."""
+        from pathlib import Path
+        import pickle
+        snap = self._snapshots.get(str(name))
+        if snap is None:
+            raise KeyError(f"unknown snapshot: {name}")
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = pickle.dumps(snap, protocol=pickle.HIGHEST_PROTOCOL)
+        p.write_bytes(data)
+        return len(data)
+
+    def import_snapshot(self, path, name: str | None = None) -> EmulatorSnapshot:
+        """Load a snapshot from disk into the in-memory dict.
+
+        The snapshot's saved name is used unless overridden. The snapshot is
+        not loaded into the emulator -- call ``load_snapshot`` next if you
+        want to apply it.
+        """
+        from pathlib import Path
+        import pickle
+        p = Path(path)
+        data = p.read_bytes()
+        snap = pickle.loads(data)
+        if not isinstance(snap, EmulatorSnapshot):
+            raise ValueError(f"file is not an EmulatorSnapshot: {path}")
+        key = str(name) if name else snap.name
+        if name and name != snap.name:
+            snap = EmulatorSnapshot(
+                name=key,
+                regs=snap.regs,
+                memory=snap.memory,
+                model_state=snap.model_state,
+                exception_stack=snap.exception_stack,
+                exception_return_stack=snap.exception_return_stack,
+                pc_hist=snap.pc_hist,
+                coverage=snap.coverage,
+                fault_report=snap.fault_report,
+                mutable_ranges=snap.mutable_ranges,
+            )
+        self._snapshots[key] = snap
+        return snap
+
     def load_snapshot(self, name: str) -> EmulatorSnapshot:
         key = str(name)
         snap = self._snapshots.get(key)
@@ -1039,7 +1083,24 @@ class Emulator:
             raise KeyError(f"unknown snapshot: {key}")
 
         for chunk in snap.memory:
-            self.uc.mem_write(int(chunk.start), bytes(chunk.data))
+            start = int(chunk.start)
+            length = len(chunk.data)
+            if length == 0:
+                continue
+            # Imported snapshots may include RAM pages that were lazily
+            # mapped during the original run (e.g. AXI/D2/D3 SRAM on H7).
+            # Map any missing pages before restoring data so the
+            # mem_write doesn't trip UC_ERR_WRITE_UNMAPPED.
+            page_start = start & ~0xFFF
+            page_end = (start + length + 0xFFF) & ~0xFFF
+            for page in range(page_start, page_end, 0x1000):
+                try:
+                    self.uc.mem_map(page, 0x1000, UC_PROT_ALL)
+                    self._dynamic_ram_pages.add(int(page))
+                except Exception:
+                    # Already mapped (overlap with flash/SRAM/peripheral)
+                    pass
+            self.uc.mem_write(start, bytes(chunk.data))
 
         self.bus.restore_models_state(snap.model_state)
         self._write_snapshot_regs(snap.regs)

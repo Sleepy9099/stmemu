@@ -81,13 +81,39 @@ class GpioPeripheral(GenericRegisterFilePeripheral):
 
     def write(self, offset: int, size: int, value: int) -> None:
         if size == 4 and offset == self._BSRR:
-            odr = self.read_register_value(self._ODR)
+            odr_before = self.read_register_value(self._ODR) & 0xFFFF
             set_bits = int(value) & 0xFFFF
             reset_bits = (int(value) >> 16) & 0xFFFF
-            odr = (odr | set_bits) & ~reset_bits
-            self.write_register_value(self._ODR, odr & 0xFFFF)
+            odr_after = (odr_before | set_bits) & ~reset_bits & 0xFFFF
+            self.write_register_value(self._ODR, odr_after)
+            self._emit_odr_edges(odr_before, odr_after)
+            return
+        if size == 4 and offset == self._ODR:
+            odr_before = self.read_register_value(self._ODR) & 0xFFFF
+            odr_after = int(value) & 0xFFFF
+            super().write(offset, size, value)
+            self._emit_odr_edges(odr_before, odr_after)
             return
         super().write(offset, size, value)
+
+    def _emit_odr_edges(self, before: int, after: int) -> None:
+        """Emit a gpio_edge event for every output pin that changed level."""
+        if self._context is None or self._context.bus is None:
+            return
+        moder = self.read_register_value(self._MODER)
+        changed = (before ^ after) & 0xFFFF
+        if not changed:
+            return
+        for pin in range(16):
+            mask = 1 << pin
+            if not (changed & mask):
+                continue
+            mode = (moder >> (pin * 2)) & 0x3
+            if mode != MODE_OUTPUT and mode != MODE_AF:
+                continue
+            old = 1 if (before & mask) else 0
+            new = 1 if (after & mask) else 0
+            self._emit_edge(pin, old, new)
 
     def set_input_level(self, pin: int, high: bool) -> None:
         """Inject an external level on a pin and emit a gpio_edge event."""

@@ -1,0 +1,78 @@
+target:
+  svd: cmsis-svd-stm32/stm32h7/STM32H743.svd
+  base: 0x08000000
+  # AXI SRAM (D1) on H7. ArduCopter MSP=0x24000600.
+  sram_base: 0x24000000
+  sram_size: 0x80000
+
+emulator:
+  # tick_scale trades emulated time per instruction. Values >1 make the
+  # firmware see clock progress faster, so chThdSleepMilliseconds() and
+  # similar boot delays elapse in fewer emulated instructions. Too high
+  # (~1000) and TIM2 ticks every instruction, starving user threads.
+  tick_scale: 10
+  stuck_threshold: 200000
+  interrupt_stuck_threshold: 500000000
+  bus_policy: permissive
+
+board:
+  # ── On-board IMU stack (SPI1, distinct CS pins) ────────────────
+  #
+  # The three IMUs share the SPI1 bus and are selected by GPIO chip-selects
+  # the firmware drives. SpiPeripheral dispatches each MOSI byte to the
+  # device whose cs_active flag is currently set.
+  spi_devices:
+    - peripheral: SPI1
+      type: icm42688
+      name: imu_icm42688
+      cs_port: GPIOC
+      cs_pin: 13
+    - peripheral: SPI1
+      type: bmi088_a
+      name: imu_bmi088_a
+      cs_port: GPIOC
+      cs_pin: 15
+    - peripheral: SPI1
+      type: bmi088_g
+      name: imu_bmi088_g
+      cs_port: GPIOC
+      cs_pin: 14
+
+    # FM25V02A FRAM on SPI2. Only slave on this bus, so dispatch routes
+    # all SPI2 bytes to it whether or not a GPIO falling edge has been
+    # observed yet.
+    - peripheral: SPI2
+      type: fm25v02a
+      name: storage_fram
+      image_file: arducopter_fram.bin
+
+  # ── On-board I2C ──────────────────────────────────────────────
+  #
+  # ArduPilot "I2C bus 0" maps to STM32 I2C4 on Pixhawk-class H7 boards
+  # (PD12 SCL / PD13 SDA). MS5611 baro is strapped at either 0x76 or 0x77
+  # depending on the CSB pin; this board has it at both for redundancy.
+  i2c_devices:
+    - peripheral: I2C4
+      devices:
+        - type: ms5611
+          name: baro_ms5611_76
+          address: 0x76
+        - type: ms5611
+          name: baro_ms5611_77
+          address: 0x77
+
+  # ── External UART (GPS on UART5) ──────────────────────────────
+  uart_devices:
+    - peripheral: UART5
+      device: ublox
+      name: gps_ublox
+      mode: ubx
+      lat: 37.7749
+      lon: -122.4194
+      alt: 30.0
+
+  gpio_levels:
+    GPIOA:
+      0: low
+    GPIOB:
+      0: low
