@@ -422,6 +422,87 @@ class H7SpiDmaTests(unittest.TestCase):
 # ── Snapshot of in-progress transfer + device state ─────────────
 
 
+class SpiDmaOrderingTests(unittest.TestCase):
+    """Firmware-order independence for SPI DMA setup."""
+
+    def test_spi_enabled_before_streams_armed(self):
+        # Reverse of the common ChibiOS order: firmware enables SPI with
+        # DMAEN first, then programs and enables the DMA streams. The
+        # initial TX kick from CR1/CR2 fired into the void, so the stream
+        # arm has to re-pull the request.
+        bus, spi, dma, _nvic, emu = _make_legacy_setup()
+        imu = Icm42688Device(name="icm")
+        imu.cs_select()
+        spi.attach_device(imu)
+
+        # SPI: DMA bits and SPE FIRST.
+        spi.write(0x04, 4, spi._CR2_TXDMAEN | spi._CR2_RXDMAEN)
+        spi.write(0x00, 4, spi._CR1_SPE)
+
+        # Then the streams.
+        tx_addr = 0x100
+        rx_addr = 0x200
+        emu.mem_write(tx_addr, bytes([0x80 | 0x75, 0x00]))
+        dr_addr = 0x40013000 + 0x0C
+        rx_cr = _setup_dma_stream(dma, 0, dr_addr, rx_addr, 2, "p2m", tcie=True)
+        tx_cr = _setup_dma_stream(dma, 3, dr_addr, tx_addr, 2, "m2p")
+        dma.write(0x10 + 0 * 0x18 + dma._SxCR, 4, rx_cr)
+        dma.write(0x10 + 3 * 0x18 + dma._SxCR, 4, tx_cr)
+
+        # No further SPI writes after this — the transfer must self-start
+        # from the stream-arm kick.
+        rx = emu.mem_read(rx_addr, 2)
+        self.assertEqual(rx[1], 0x47, "WHOAMI arrives when streams are armed last")
+
+    def test_stream_arm_kick_only_when_spi_enabled(self):
+        # If SPI is NOT enabled, arming the stream must not trigger a
+        # transfer (would otherwise clock garbage into an unselected slave).
+        bus, spi, dma, _nvic, emu = _make_legacy_setup()
+        imu = Icm42688Device(name="icm")
+        imu.cs_select()
+        spi.attach_device(imu)
+
+        tx_addr = 0x100
+        rx_addr = 0x200
+        emu.mem_write(tx_addr, bytes([0xAA, 0xBB]))
+        dr_addr = 0x40013000 + 0x0C
+        rx_cr = _setup_dma_stream(dma, 0, dr_addr, rx_addr, 2, "p2m")
+        tx_cr = _setup_dma_stream(dma, 3, dr_addr, tx_addr, 2, "m2p")
+        dma.write(0x10 + 0 * 0x18 + dma._SxCR, 4, rx_cr)
+        dma.write(0x10 + 3 * 0x18 + dma._SxCR, 4, tx_cr)
+        # SPI is silent — no CR1.SPE, no CR2 DMAEN.
+
+        rx = emu.mem_read(rx_addr, 2)
+        self.assertEqual(rx, b"\x00\x00", "no transfer when SPI is disabled")
+        self.assertEqual(imu._bytes_exchanged, 0)
+
+
+class DmaHalfEventBytesTests(unittest.TestCase):
+    def test_dma_half_reports_half_buffer_bytes(self):
+        bus, spi, dma, _nvic, emu = _make_legacy_setup()
+        bus.event_log_enabled = True
+
+        dr_addr = 0x40013000 + 0x0C
+        # 8-byte circular RX buffer; HTIF should fire at byte 4.
+        rx_cr = _setup_dma_stream(dma, 0, dr_addr, 0x300, 8, "p2m")
+        rx_cr |= dma._SxCR_CIRC
+        dma.write(0x10 + 0 * 0x18 + dma._SxCR, 4, rx_cr)
+
+        # SPI in DMA mode so inject_rx emits per-byte requests.
+        spi.write(0x04, 4, spi._CR2_RXDMAEN)
+        spi.write(0x00, 4, spi._CR1_SPE)
+        bus.drain_event_log()
+
+        spi.inject_rx(bytes(range(4)))
+
+        log = bus.drain_event_log()
+        half = [e for e in log if e.kind == "dma_half"]
+        self.assertEqual(len(half), 1)
+        # Half mark of an 8-item byte-sized buffer = 4 bytes transferred.
+        self.assertEqual(half[0].payload["bytes"], 4)
+        self.assertEqual(half[0].payload["stream"], 0)
+
+
 class SpiDmaSnapshotTests(unittest.TestCase):
     def test_snapshot_preserves_dma_progress_and_device_state(self):
         bus, spi, dma, _nvic, emu = _make_legacy_setup()

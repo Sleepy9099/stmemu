@@ -268,18 +268,31 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         empty. We emulate that by emitting one M2P request here; the DMA
         stream will keep pulling bytes via the per-exchange chain.
         """
-        if self._context is None:
+        if not self._spi_dma_active():
             return
-        # Only emit if SPE is set, so a bare CR2 write with SPI disabled
-        # doesn't move data prematurely.
+        self._emit_dma_request_tx()
+
+    def _spi_dma_active(self) -> bool:
+        if self._context is None:
+            return False
         cr1 = self.read_register_value(self._CR1)
         if self._TXDR is not None or self._RXDR is not None:
-            if not (cr1 & self._H7_CR1_SPE):
-                return
-        else:
-            if not (cr1 & self._CR1_SPE):
-                return
-        self._emit_dma_request_tx()
+            return bool(cr1 & self._H7_CR1_SPE)
+        return bool(cr1 & self._CR1_SPE)
+
+    def on_dma_armed(self, offset: int, direction: str) -> None:
+        """Called by DMA when a stream targeting this peripheral arms.
+
+        Handles the firmware order ``configure SPI + DMAEN -> arm streams``:
+        the initial TX request emitted at CR1/CR2/CFG1 write time would
+        otherwise have been dropped because no stream was enabled yet.
+        """
+        if not self._spi_dma_active():
+            return
+        if direction == "m2p" and self._is_data_write(offset):
+            self._emit_dma_request_tx()
+        elif direction == "p2m" and self._is_data_read(offset):
+            self._emit_dma_request_rx()
 
     def drain_tx(self) -> bytes:
         data = bytes(self._tx_fifo)
@@ -289,9 +302,11 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
     def inject_rx(self, data: bytes) -> None:
         for b in data:
             self._rx_fifo.append(int(b) & 0xFF)
-        self._refresh_status()
-        if data:
+            self._refresh_status()
             self._emit_dma_request_rx()
+        # Final refresh covers the empty-input case.
+        if not data:
+            self._refresh_status()
 
     def reset(self) -> None:
         super().reset()

@@ -167,6 +167,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         self._stream_pos[stream] = 0
 
         if cr & self._SxCR_CIRC:
+            self._notify_peripheral_armed(par, direction)
             return
         # Peripheral DMA (P2M/M2P with PAR inside a mounted peripheral)
         # waits for the peripheral to assert dma_request; no bulk-on-enable.
@@ -174,8 +175,34 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         # bulk-completion path so legacy tests (and pure memcpy DMA) still
         # auto-complete.
         if self._is_peripheral_driven(par, direction):
+            self._notify_peripheral_armed(par, direction)
             return
         self._execute_transfer(stream)
+
+    def _notify_peripheral_armed(self, par: int, direction: int) -> None:
+        """Tell the peripheral at ``par`` that a stream is now ready.
+
+        Lets a peripheral whose DMA request fired before the stream was
+        enabled (firmware order: configure SPI + DMAEN, then arm streams)
+        re-emit so the transfer actually starts.
+        """
+        if not self._context or not getattr(self._context, "bus", None):
+            return
+        bus = self._context.bus
+        mount_for = getattr(bus, "_mount_for_addr", None)
+        if mount_for is None:
+            return
+        mounted = mount_for(par)
+        if mounted is None or mounted.model is self:
+            return
+        hook = getattr(mounted.model, "on_dma_armed", None)
+        if hook is None:
+            return
+        dir_str = "m2p" if direction == self._DIR_M2P else "p2m"
+        try:
+            hook(par - mounted.base, dir_str)
+        except Exception:
+            log.debug("on_dma_armed hook failed")
 
     def _is_peripheral_driven(self, par: int, direction: int) -> bool:
         if direction == self._DIR_M2M:
@@ -223,7 +250,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
 
         half = reload // 2
         if pos == half and half > 0:
-            self._set_htif(stream, cr)
+            self._set_htif(stream, cr, half * item_size)
 
         if ndtr <= 0:
             self._set_tcif(stream, cr)
@@ -278,7 +305,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             if irq is not None:
                 self._context.interrupts.set_irq_pending(irq)
 
-    def _set_htif(self, stream: int, cr: int) -> None:
+    def _set_htif(self, stream: int, cr: int, byte_count: int = 0) -> None:
         info = _STREAM_FLAG_BITS.get(stream)
         if info is None:
             return
@@ -293,7 +320,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         par = self.read_register_value(
             self._STREAM_BASE + stream * self._STREAM_STRIDE + self._SxPAR,
         )
-        self._emit_dma_event("dma_half", stream, cr, par, 0)
+        self._emit_dma_event("dma_half", stream, cr, par, byte_count)
 
     def _emit_dma_event(
         self, kind: str, stream: int, cr: int, par: int, byte_count: int,
