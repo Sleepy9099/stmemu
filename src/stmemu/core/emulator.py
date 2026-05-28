@@ -691,8 +691,9 @@ class Emulator:
 
     def enable_event_trace(self, max_events: int = 10000) -> None:
         self._event_trace_max = max_events
+        if not self.event_trace_enabled:
+            self.bus.subscribe("*", self._on_trace_event)
         self.event_trace_enabled = True
-        self.bus.subscribe("*", self._on_trace_event)
 
     def disable_event_trace(self) -> None:
         self.event_trace_enabled = False
@@ -708,6 +709,12 @@ class Emulator:
             "source": getattr(event, "source", ""),
             "address": getattr(event, "address", 0),
         }
+        direction = getattr(event, "direction", "")
+        if direction:
+            entry["direction"] = direction
+        size = getattr(event, "size", 0)
+        if size:
+            entry["size"] = size
         payload = getattr(event, "payload", None)
         if payload is not None:
             entry["payload"] = payload

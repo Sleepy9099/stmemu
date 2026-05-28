@@ -71,8 +71,9 @@ class _TraceEmu:
 
     def enable_event_trace(self, max_events=10000):
         self._event_trace_max = max_events
+        if not self.event_trace_enabled:
+            self.bus.subscribe("*", self._on_trace_event)
         self.event_trace_enabled = True
-        self.bus.subscribe("*", self._on_trace_event)
 
     def disable_event_trace(self):
         self.event_trace_enabled = False
@@ -88,6 +89,12 @@ class _TraceEmu:
             "source": getattr(event, "source", ""),
             "address": getattr(event, "address", 0),
         }
+        direction = getattr(event, "direction", "")
+        if direction:
+            entry["direction"] = direction
+        size = getattr(event, "size", 0)
+        if size:
+            entry["size"] = size
         payload = getattr(event, "payload", None)
         if payload is not None:
             entry["payload"] = payload
@@ -228,6 +235,32 @@ class EventTraceTests(unittest.TestCase):
         kinds = {e["kind"] for e in emu._event_trace}
         self.assertEqual(kinds, {"timer_update", "adc_eoc", "gpio_edge",
                                   "dma_complete", "rtos_exception"})
+
+    def test_double_enable_no_duplicate(self):
+        bus = _make_bus()
+        emu = _TraceEmu(bus)
+        emu.enable_event_trace()
+        emu.enable_event_trace()
+        bus.emit(PeripheralEvent(kind="test"))
+        self.assertEqual(len(emu._event_trace), 1, "double enable should not duplicate events")
+
+    def test_direction_and_size_captured(self):
+        bus = _make_bus()
+        emu = _TraceEmu(bus)
+        emu.enable_event_trace()
+        bus.emit(PeripheralEvent(kind="dma_request", direction="p2m", size=2))
+        entry = emu._event_trace[0]
+        self.assertEqual(entry["direction"], "p2m")
+        self.assertEqual(entry["size"], 2)
+
+    def test_direction_omitted_when_empty(self):
+        bus = _make_bus()
+        emu = _TraceEmu(bus)
+        emu.enable_event_trace()
+        bus.emit(PeripheralEvent(kind="timer_update"))
+        entry = emu._event_trace[0]
+        self.assertNotIn("direction", entry)
+        self.assertNotIn("size", entry)
 
 
 # ── JSONL export tests ────────────────────────────────────────────
