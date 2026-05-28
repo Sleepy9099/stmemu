@@ -1,0 +1,47 @@
+target:
+  svd: cmsis-svd-stm32/stm32h7/STM32H743.svd
+  sram_size: 0x80000
+
+emulator:
+  tick_scale: 1
+  stuck_threshold: 5000
+  interrupt_stuck_threshold: 50000000
+  bus_policy: permissive
+
+# Examples for event-driven experiments. They are disabled for the default
+# smoke run; uncomment as needed while probing firmware behavior.
+# timed_events:
+#   - at: 10000
+#     action: gpio_inject
+#     port: GPIOA
+#     pin: 0
+#     level: high
+#
+#   - at: 50000
+#     action: uart_inject
+#     peripheral: USART1
+#     hex: "48656C6C6F"
+#
+#   - at: 100000
+#     action: adc_sample
+#     peripheral: ADC1
+#     value: 4095
+#
+#   - at: 200000
+#     action: event_emit
+#     kind: sensor_ready
+#     source: scenario
+#
+#   - at: 500000
+#     action: snapshot
+#     name: checkpoint_500k
+
+startup_commands:
+  - mmioprof 250000 20
+  - pcprof 250000 10
+  - fault show
+
+# Optional manual nudge for older PWR behavior:
+# startup_commands:
+#   - atpc 0x08003E8C PWR.D3CR = 0x6000
+#   - mmioprof 250000 20

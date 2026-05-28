@@ -10,6 +10,7 @@ from stmemu.peripherals.i2c import I2cPeripheral
 from stmemu.peripherals.dma import DmaPeripheral
 from stmemu.peripherals.rcc import RccPeripheral
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
+from stmemu.peripherals.factory import create_default_registry
 
 
 def _make_peripheral(name: str, registers: tuple[SvdRegister, ...] = (), interrupts=()) -> SvdPeripheral:
@@ -63,6 +64,30 @@ _DMA_REGS = (
     SvdRegister(name="S0PAR", offset=0x18),
     SvdRegister(name="S0M0AR", offset=0x1C),
 )
+
+
+class PeripheralFactoryTests(unittest.TestCase):
+    def test_pwr_ready_fields_are_forced_after_reads(self) -> None:
+        pwr = _make_peripheral(
+            "PWR",
+            (
+                SvdRegister(
+                    name="D3CR",
+                    offset=0x18,
+                    reset_value=0x4000,
+                    fields=(
+                        SvdField(name="VOSRDY", bit_offset=13, bit_width=1),
+                        SvdField(name="VOS", bit_offset=14, bit_width=2),
+                    ),
+                ),
+            ),
+        )
+
+        model = create_default_registry().build(pwr)
+
+        for _ in range(9):
+            self.assertEqual(model.read(0x18, 4) & (1 << 13), 0)
+        self.assertEqual(model.read(0x18, 4) & (1 << 13), 1 << 13)
 
 
 class GpioTests(unittest.TestCase):

@@ -82,13 +82,13 @@ def create_default_registry() -> PeripheralFactoryRegistry:
 
     def build_pwr(peripheral: SvdPeripheral) -> PeripheralModel:
         model = GenericRegisterFilePeripheral(peripheral)
-        # Find CSR-like registers and auto-set voltage-ready bits
+        # Firmware commonly polls PWR ready/status bits after voltage scaling
+        # writes. Let those bits settle after a few reads, including H7 D3CR.VOSRDY.
         for reg in peripheral.registers:
-            rname = reg.name.upper()
-            if "CSR" in rname or "SR" in rname:
-                for f in reg.fields:
-                    if "RDY" in f.name.upper() or "VOF" in f.name.upper():
-                        model.force_bit_after_reads(reg.offset, f.bit_offset, reads_before_set=10)
+            for f in reg.fields:
+                fname = f.name.upper()
+                if "RDY" in fname or "VOF" in fname:
+                    model.force_bit_after_reads(reg.offset, f.bit_offset, reads_before_set=10)
         return model
 
     # Exact name registrations (kept for backward compat, but patterns handle the rest)

@@ -14,6 +14,38 @@ from stmemu.peripherals.factory import build_default_bus
 log = get_logger(__name__)
 
 
+_STRUCTURED_CFG_SUFFIXES = {".yaml", ".yml", ".json"}
+_PRELAUNCH_CFG_KEYS = {
+    "svd",
+    "base",
+    "sram_base",
+    "sram_size",
+    "sysmem_base",
+    "tick_scale",
+    "stuck_threshold",
+    "interrupt_stuck_threshold",
+    "stuck_manual",
+    "log_level",
+    "quiet",
+    "board",
+}
+
+
+def _is_prelaunch_cfg_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    sep = "=" if "=" in stripped else ":" if ":" in stripped else ""
+    if not sep:
+        return False
+    key = stripped.split(sep, 1)[0].strip().lower().replace("-", "_")
+    return key in _PRELAUNCH_CFG_KEYS
+
+
+def _is_structured_cfg(path: Path) -> bool:
+    return path.suffix.lower() in _STRUCTURED_CFG_SUFFIXES
+
+
 def run_app(
     image_path: Path,
     base_addr: int,
@@ -86,28 +118,39 @@ def run_app(
         for msg in messages:
             log.info("board: %s", msg)
 
-    # Run optional startup script from --cfg (supports ';' and newlines; '#' line comments)
+    # Run optional startup/scenario config from --cfg.
+    ran_cfg_script = False
     if getattr(args, 'cfg', None):
-        import os
-        cfg_path = args.cfg
-        if not os.path.exists(cfg_path):
+        cfg_path = Path(args.cfg)
+        if not cfg_path.exists():
             raise FileNotFoundError(cfg_path)
-        with open(cfg_path, 'r', encoding='utf-8', errors='replace') as f:
-            raw = f.read()
-        # Strip full-line comments and normalize newlines to ';' so it feeds run_script()
-        cleaned_lines = []
-        for ln in raw.splitlines():
-            s = ln.strip()
-            if not s or s.startswith('#'):
-                continue
-            cleaned_lines.append(ln)
-        script = ';'.join(cleaned_lines)
-        if script.strip():
-            sh.run_script(script)
+        if _is_structured_cfg(cfg_path):
+            from stmemu.board_config import load_board_config, apply_board_config
+
+            cfg = load_board_config(cfg_path)
+            messages = apply_board_config(cfg, bus, emu, shell=sh, base_dir=cfg_path.parent)
+            for msg in messages:
+                log.info("cfg: %s", msg)
+            ran_cfg_script = True
+        else:
+            raw = cfg_path.read_text(encoding='utf-8', errors='replace')
+            # Strip full-line comments and normalize newlines to ';' so it feeds run_script().
+            cleaned_lines = []
+            for ln in raw.splitlines():
+                s = ln.strip()
+                if not s or s.startswith('#'):
+                    continue
+                if _is_prelaunch_cfg_line(s):
+                    continue
+                cleaned_lines.append(ln)
+            script = ';'.join(cleaned_lines)
+            if script.strip():
+                sh.run_script(script)
+                ran_cfg_script = True
 
     # Run scripted commands first (if provided)
     if cmd.strip():
         sh.run_script(cmd)
 
-    if shell or not cmd.strip():
+    if shell or (not cmd.strip() and not ran_cfg_script):
         sh.cmdloop()
