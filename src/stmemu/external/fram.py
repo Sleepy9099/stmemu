@@ -74,7 +74,7 @@ class FramFm25v02a(ExternalDevice):
     _mem: bytearray = field(default_factory=lambda: bytearray(FM25V02A_SIZE), init=False, repr=False)
     _wel: bool = field(default=False, init=False, repr=False)
     _status_reg: int = field(default=0, init=False, repr=False)
-    _cs_active: bool = field(default=False, init=False, repr=False)
+    cs_active: bool = field(default=False, init=False, repr=False)
     _state: str = field(default="IDLE", init=False, repr=False)
     _cmd: int = field(default=0, init=False, repr=False)
     _addr: int = field(default=0, init=False, repr=False)
@@ -99,7 +99,7 @@ class FramFm25v02a(ExternalDevice):
 
     def cs_select(self) -> None:
         """CS asserted (falling edge). Begin a new command frame."""
-        self._cs_active = True
+        self.cs_active = True
         self._state = "IDLE"
         self._cmd = 0
         self._addr = 0
@@ -108,7 +108,7 @@ class FramFm25v02a(ExternalDevice):
 
     def cs_release(self) -> None:
         """CS deasserted (rising edge). End the current command frame."""
-        self._cs_active = False
+        self.cs_active = False
         # Per the FM25V02A datasheet, WEL is cleared after a WRITE / WRSR
         # transaction completes. Other commands leave WEL untouched.
         if self._cmd in (0x02, 0x01):
@@ -304,7 +304,7 @@ class FramFm25v02a(ExternalDevice):
             "mem": bytes(self._mem),
             "wel": self._wel,
             "status_reg": self._status_reg,
-            "cs_active": self._cs_active,
+            "cs_active": self.cs_active,
             "state": self._state,
             "cmd": self._cmd,
             "addr": self._addr,
@@ -324,7 +324,7 @@ class FramFm25v02a(ExternalDevice):
             self._mem[:] = bytes(mem)
         self._wel = bool(state.get("wel", False))
         self._status_reg = int(state.get("status_reg", 0)) & 0xFF
-        self._cs_active = bool(state.get("cs_active", False))
+        self.cs_active = bool(state.get("cs_active", False))
         self._state = str(state.get("state", "IDLE"))
         self._cmd = int(state.get("cmd", 0)) & 0xFF
         self._addr = int(state.get("addr", 0)) & 0xFFFF

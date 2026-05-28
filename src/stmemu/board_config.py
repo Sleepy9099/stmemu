@@ -491,6 +491,10 @@ def _attach_i2c_devices(bus: object, cfg: dict[str, Any]) -> str:
                 address=addr, whoami_reg=whoami_reg, whoami_value=whoami_value,
             )
             dev.name = dev_cfg.get("name", f"imu_{addr:#x}")
+        elif dev_type in ("ms5611", "baro_ms5611"):
+            from stmemu.external.ms5611 import Ms5611I2cDevice
+            dev = Ms5611I2cDevice(address=addr)
+            dev.name = dev_cfg.get("name", f"ms5611_{addr:#x}")
         elif dev_type in ("register", "sensor"):
             dev = RegisterI2cDevice(address=addr)
             dev.name = dev_cfg.get("name", f"reg_{addr:#x}")
@@ -543,6 +547,32 @@ def _attach_spi_device(
     if not hasattr(spi_model, "attach_device"):
         return f"spi: {periph_name} does not support device attach"
 
+    dev, extra = _build_spi_device(dev_type, cfg, base_dir=base_dir)
+    if dev is None:
+        return f"spi: unknown device type '{dev_type}'"
+
+    cs_port = cfg.get("cs_port")
+    cs_pin = cfg.get("cs_pin")
+    if cs_port is not None and cs_pin is not None:
+        _wire_spi_cs(bus, dev, str(cs_port).upper(), int(_parse_int(cs_pin)))
+        cs_desc = f" cs={cs_port}.{cs_pin}"
+    else:
+        # Auto-CS: latch onto the first GPIO pin to see a falling edge.
+        _wire_spi_cs_auto(bus, dev)
+        cs_desc = " cs=auto"
+
+    spi_model.attach_device(dev)
+    _spi_devices_register(bus, dev)
+    return f"spi: attached {dev_type} '{dev.name}' to {periph_name}{cs_desc}{extra}"
+
+
+def _build_spi_device(
+    dev_type: str,
+    cfg: dict[str, Any],
+    *,
+    base_dir: Path | None,
+) -> tuple[object | None, str]:
+    """Construct an SPI slave model. Returns (device, extra description)."""
     if dev_type in ("fm25v02a", "fram", "fm25v02"):
         from stmemu.external.fram import FramFm25v02a
 
@@ -557,28 +587,25 @@ def _attach_spi_device(
             name=str(cfg.get("name", "fram")),
             image_path=image_path,
         )
+        extra = f" image={image_path.name}" if image_path is not None else ""
+        return dev, extra
 
-        cs_port = cfg.get("cs_port")
-        cs_pin = cfg.get("cs_pin")
-        if cs_port is not None and cs_pin is not None:
-            _wire_spi_cs(bus, dev, str(cs_port).upper(), int(_parse_int(cs_pin)))
-            cs_desc = f" cs={cs_port}.{cs_pin}"
-        else:
-            # Auto-CS: latch onto the first GPIO pin to see a falling edge
-            # and treat that as the device's chip-select for the rest of
-            # the session.
-            _wire_spi_cs_auto(bus, dev)
-            cs_desc = " cs=auto"
+    if dev_type in ("icm42688", "icm-42688", "icm42688p", "icm-42688-p"):
+        from stmemu.external.spi_imu import Icm42688Device
+        dev = Icm42688Device(name=str(cfg.get("name", "icm42688")))
+        return dev, " whoami=0x47"
 
-        spi_model.attach_device(dev)
-        # Stash a reference on the bus so the shell can find it by name.
-        _spi_devices_register(bus, dev)
-        suffix = ""
-        if image_path is not None:
-            suffix = f" image={image_path.name}"
-        return f"spi: attached fm25v02a '{dev.name}' to {periph_name}{cs_desc}{suffix}"
+    if dev_type in ("bmi088_a", "bmi088-accel", "bmi088a", "bmi055_a"):
+        from stmemu.external.spi_imu import Bmi088AccelDevice
+        dev = Bmi088AccelDevice(name=str(cfg.get("name", "bmi088_a")))
+        return dev, " whoami=0x1E"
 
-    return f"spi: unknown device type '{dev_type}'"
+    if dev_type in ("bmi088_g", "bmi088-gyro", "bmi088g", "bmi055_g"):
+        from stmemu.external.spi_imu import Bmi088GyroDevice
+        dev = Bmi088GyroDevice(name=str(cfg.get("name", "bmi088_g")))
+        return dev, " whoami=0x0F"
+
+    return None, ""
 
 
 def _wire_spi_cs(bus: object, device: object, port_name: str, pin: int) -> None:

@@ -22,7 +22,7 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
     _tx_fifo: bytearray = field(default_factory=bytearray, init=False, repr=False)
     _rx_fifo: deque[int] = field(default_factory=deque, init=False, repr=False)
-    _device: object | None = field(default=None, init=False, repr=False)
+    _devices: list[object] = field(default_factory=list, init=False, repr=False)
 
     # Standard SPI register offsets (legacy F1/F4/F7 layout).
     _CR1 = 0x00
@@ -101,10 +101,7 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         if size in (1, 2, 4) and self._is_data_write(offset):
             byte = int(value) & 0xFF
             self._tx_fifo.append(byte)
-            if self._device is not None and hasattr(self._device, "exchange"):
-                miso = int(self._device.exchange(byte)) & 0xFF
-            else:
-                miso = 0xFF  # no slave attached
+            miso = self._exchange_with_selected(byte)
             self._rx_fifo.append(miso)
             self._refresh_status()
             return
@@ -120,16 +117,50 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
                     self.write_register_value(self._CR1, cleared)
             self._refresh_status()
 
-    def attach_device(self, device: object) -> None:
-        """Wire an SPI slave so MOSI bytes go through device.exchange()."""
-        self._device = device
+    def _exchange_with_selected(self, byte: int) -> int:
+        """Route MOSI to whichever attached slave currently has CS asserted.
 
-    def detach_device(self) -> None:
-        self._device = None
+        Multiple devices can share one SPI peripheral (e.g. SPI1 with an
+        IMU and two BMI088 chips). Each device tracks its own ``cs_active``;
+        the first one whose CS is low gets the byte. If no slave's CS is
+        asserted but the bus has exactly one attached device, route to it
+        anyway -- a single-slave bus with no CS detection (FRAM auto-CS
+        before the first GPIO falling edge is seen) shouldn't go silent.
+        """
+        for dev in self._devices:
+            if getattr(dev, "cs_active", False) and hasattr(dev, "exchange"):
+                return int(dev.exchange(byte)) & 0xFF
+        if len(self._devices) == 1:
+            dev = self._devices[0]
+            if hasattr(dev, "exchange"):
+                return int(dev.exchange(byte)) & 0xFF
+        return 0xFF
+
+    def attach_device(self, device: object) -> None:
+        """Wire an SPI slave so MOSI bytes go through device.exchange().
+
+        Multiple devices may be attached to one SPI bus; each is dispatched
+        based on its ``cs_active`` flag at exchange time.
+        """
+        if device not in self._devices:
+            self._devices.append(device)
+
+    def detach_device(self, device: object | None = None) -> None:
+        if device is None:
+            self._devices.clear()
+        else:
+            try:
+                self._devices.remove(device)
+            except ValueError:
+                pass
 
     @property
     def attached_device(self) -> object | None:
-        return self._device
+        return self._devices[0] if self._devices else None
+
+    @property
+    def attached_devices(self) -> tuple[object, ...]:
+        return tuple(self._devices)
 
     def _refresh_status(self) -> None:
         sr = self.read_register_value(self._SR)
@@ -163,6 +194,7 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         super().reset()
         self._tx_fifo.clear()
         self._rx_fifo.clear()
+        # Devices stay attached across reset (board topology persists).
         self._refresh_status()
 
     def snapshot_state(self) -> object | None:

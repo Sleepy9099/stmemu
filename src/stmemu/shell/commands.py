@@ -1191,9 +1191,36 @@ class Commands:
             data = self._snapshot_diff_data(left, right)
             return self._format_snapshot_diff_data(data)
 
+        if sub == "export":
+            if len(argv) != 3:
+                return "usage: snap export <name> <file.snap>"
+            try:
+                n = self.emu.export_snapshot(argv[1], argv[2])
+            except KeyError:
+                return f"unknown snapshot: {argv[1]}"
+            except Exception as e:
+                return f"export failed: {e}"
+            return f"exported snapshot '{argv[1]}' -> {argv[2]} ({n} bytes)"
+
+        if sub == "import":
+            if len(argv) not in (2, 3):
+                return "usage: snap import <file.snap> [name]"
+            try:
+                name = argv[2] if len(argv) == 3 else None
+                snap = self.emu.import_snapshot(argv[1], name=name)
+            except Exception as e:
+                return f"import failed: {e}"
+            mem_bytes = self._snapshot_mem_bytes(snap)
+            return (
+                f"imported snapshot '{snap.name}' "
+                f"pc=0x{int(snap.regs.get('pc', 0)):08X} "
+                f"mem=0x{mem_bytes:X}"
+            )
+
         return (
             "usage: snap [list] | snap save <name> | snap load <name> | "
-            "snap diff <name> [other|current] | snap clear <name|all>"
+            "snap diff <name> [other|current] | snap clear <name|all> | "
+            "snap export <name> <file> | snap import <file> [name]"
         )
 
     @staticmethod
