@@ -159,9 +159,15 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
         base = self._context.base
         name = self._context.name
         if (cr3 & self._CR3_DMAR) and (isr & self._ISR_RXFNE):
-            self._context.bus.request_dma(base + self._RDR, "p2m", size=1, source=name)
+            self._context.bus.request_dma(
+                base + self._RDR, "p2m", size=1, source=name,
+                request=f"{name.upper()}_RX",
+            )
         if (cr3 & self._CR3_DMAT) and (isr & self._ISR_TXFNF):
-            self._context.bus.request_dma(base + self._TDR, "m2p", size=1, source=name)
+            self._context.bus.request_dma(
+                base + self._TDR, "m2p", size=1, source=name,
+                request=f"{name.upper()}_TX",
+            )
 
     def _update_irq(self) -> None:
         if self.irq is None or self._context is None or self._context.interrupts is None:

@@ -72,7 +72,10 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
     _stream_mar_base: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _stream_pos: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _stream_busy: dict[int, bool] = field(default_factory=dict, init=False, repr=False)
-    _pending_requests: list[tuple[int, str, int]] = field(
+    # Optional DMAMUX request label per stream (e.g. {1: "SPI1_TX"}). When set,
+    # a request only drives the stream if its request name matches.
+    _stream_request: dict[int, str] = field(default_factory=dict, init=False, repr=False)
+    _pending_requests: list[tuple[int, str, int, "str | None"]] = field(
         default_factory=list, init=False, repr=False,
     )
     _dispatching: bool = field(default=False, init=False, repr=False)
@@ -101,29 +104,41 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         if context.bus is not None:
             context.bus.add_dma_listener(self)
 
-    def on_peripheral_request(self, periph_addr: int, direction: str, size: int = 1) -> None:
+    def set_stream_request(self, stream: int, request: str | None) -> None:
+        """Map (or clear) the DMAMUX request line a stream responds to."""
+        if request:
+            self._stream_request[stream] = str(request).upper()
+        else:
+            self._stream_request.pop(stream, None)
+
+    def on_peripheral_request(
+        self, periph_addr: int, direction: str, size: int = 1,
+        request: str | None = None,
+    ) -> None:
         # Re-entrant requests (e.g. an SPI exchange triggered by a
         # transferred byte emits another request mid-loop) are queued
         # and drained after the current dispatch returns.
         if self._dispatching:
-            self._pending_requests.append((periph_addr, direction, size))
+            self._pending_requests.append((periph_addr, direction, size, request))
             return
         self._dispatching = True
         try:
-            self._dispatch_request(periph_addr, direction, size)
+            self._dispatch_request(periph_addr, direction, size, request)
             while self._pending_requests:
-                a, d, s = self._pending_requests.pop(0)
-                self._dispatch_request(a, d, s)
+                a, d, s, r = self._pending_requests.pop(0)
+                self._dispatch_request(a, d, s, r)
         finally:
             self._dispatching = False
 
     def _dispatch_request(
         self, periph_addr: int, direction: str, size: int = 1,
+        request: str | None = None,
     ) -> None:
         dir_map = {"p2m": self._DIR_P2M, "m2p": self._DIR_M2P}
         expected_dir = dir_map.get(direction.lower())
         if expected_dir is None:
             return
+        want = request.upper() if request else None
         for stream in range(8):
             stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
             cr = self.read_register_value(stream_offset + self._SxCR)
@@ -131,15 +146,23 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
                 continue
             par = self.read_register_value(stream_offset + self._SxPAR)
             actual_dir = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
-            if par == periph_addr and actual_dir == expected_dir:
-                if self._stream_busy.get(stream):
-                    continue
-                self._stream_busy[stream] = True
-                try:
-                    self._transfer_one_item(stream)
-                finally:
-                    self._stream_busy[stream] = False
-                break
+            if par != periph_addr or actual_dir != expected_dir:
+                continue
+            # DMAMUX request routing: when this stream is mapped to a specific
+            # request line, only the matching request drives it. Streams with
+            # no mapping fall back to PAR+direction (keeps simple configs and
+            # existing behaviour working).
+            mapped = self._stream_request.get(stream)
+            if mapped is not None and want is not None and mapped != want:
+                continue
+            if self._stream_busy.get(stream):
+                continue
+            self._stream_busy[stream] = True
+            try:
+                self._transfer_one_item(stream)
+            finally:
+                self._stream_busy[stream] = False
+            break
 
     def write(self, offset: int, size: int, value: int) -> None:
         if self._access_targets(offset, size, self._LIFCR):
@@ -422,6 +445,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         base["stream_ndtr_reload"] = dict(self._stream_ndtr_reload)
         base["stream_mar_base"] = dict(self._stream_mar_base)
         base["stream_pos"] = dict(self._stream_pos)
+        base["stream_request"] = dict(self._stream_request)
         return base
 
     def restore_state(self, state: object) -> None:
@@ -437,6 +461,9 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         pos = state.get("stream_pos")
         if isinstance(pos, dict):
             self._stream_pos = {int(k): int(v) for k, v in pos.items()}
+        req = state.get("stream_request")
+        if isinstance(req, dict):
+            self._stream_request = {int(k): str(v).upper() for k, v in req.items()}
 
 
 def build_dma(peripheral: SvdPeripheral) -> DmaPeripheral:

@@ -156,6 +156,7 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
             self._context.bus.request_dma(
                 self._context.base + self._DR, "p2m", size=2,
                 source=self._context.name,
+                request=self._context.name.upper(),
             )
 
     def _update_irq(self) -> None:

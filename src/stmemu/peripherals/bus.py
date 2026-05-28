@@ -223,12 +223,14 @@ class PeripheralBus:
 
     def request_dma(
         self, peripheral_addr: int, direction: str, size: int = 1,
-        *, source: str = "",
+        *, source: str = "", request: str | None = None,
     ) -> None:
         """Signal a DMA-capable peripheral event.
 
-        Emits a ``dma_request`` event and also dispatches directly to
-        legacy DMA listeners for backward compatibility.
+        ``request`` is the symbolic DMAMUX request line (e.g. ``"SPI1_RX"``),
+        used to route the request to the stream/channel firmware mapped to it.
+        Emits a ``dma_request`` event and also dispatches directly to legacy DMA
+        listeners for backward compatibility.
         """
         self.emit(PeripheralEvent(
             kind="dma_request",
@@ -236,10 +238,13 @@ class PeripheralBus:
             address=peripheral_addr,
             direction=direction,
             size=size,
+            payload={"request": request} if request else None,
         ))
         for dma in self._dma_listeners:
             if hasattr(dma, "on_peripheral_request"):
-                dma.on_peripheral_request(peripheral_addr, direction, size)
+                dma.on_peripheral_request(
+                    peripheral_addr, direction, size, request=request,
+                )
 
     def mounted_ranges(self) -> tuple[MountedPeripheral, ...]:
         return tuple(self._mounted)

@@ -310,6 +310,7 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         if addr is not None:
             self._context.bus.request_dma(
                 addr, "p2m", size=1, source=self._context.name,
+                request=f"{self._context.name.upper()}_RX",
             )
 
     def _emit_dma_request_tx(self) -> None:
@@ -322,6 +323,7 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         if addr is not None:
             self._context.bus.request_dma(
                 addr, "m2p", size=1, source=self._context.name,
+                request=f"{self._context.name.upper()}_TX",
             )
 
     def _kick_dma_on_enable(self) -> None:
