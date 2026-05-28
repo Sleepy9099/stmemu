@@ -147,6 +147,8 @@ class BoardConfigLoadTests(unittest.TestCase):
 
 
 class BoardConfigApplyTests(unittest.TestCase):
+    def setUp(self):
+        _applied_configs.clear()
     def test_uart_device_attach(self):
         bus, uart, i2c, gpio, adc = _make_bus()
         cfg = {
@@ -253,6 +255,8 @@ class BoardConfigApplyTests(unittest.TestCase):
 
 
 class BoardConfigRegisterTests(unittest.TestCase):
+    def setUp(self):
+        _applied_configs.clear()
     def test_peripheral_register_write(self):
         bus, uart, i2c, gpio, adc = _make_bus()
         cfg = {
@@ -286,6 +290,8 @@ class BoardConfigRegisterTests(unittest.TestCase):
 
 
 class BoardConfigMemoryTests(unittest.TestCase):
+    def setUp(self):
+        _applied_configs.clear()
     def test_hex_memory_write(self):
         bus, uart, i2c, gpio, adc = _make_bus()
 
@@ -311,6 +317,8 @@ class BoardConfigMemoryTests(unittest.TestCase):
 
 
 class BoardConfigBreakpointTests(unittest.TestCase):
+    def setUp(self):
+        _applied_configs.clear()
     def test_pc_breakpoints(self):
         bus, uart, i2c, gpio, adc = _make_bus()
 
@@ -363,6 +371,8 @@ class BoardConfigBreakpointTests(unittest.TestCase):
 
 
 class BoardConfigEmulatorTests(unittest.TestCase):
+    def setUp(self):
+        _applied_configs.clear()
     def test_emulator_settings(self):
         bus, uart, i2c, gpio, adc = _make_bus()
 
@@ -408,6 +418,8 @@ class BoardConfigEmulatorTests(unittest.TestCase):
 
 
 class BoardConfigNestedTests(unittest.TestCase):
+    def setUp(self):
+        _applied_configs.clear()
     def test_board_subsection(self):
         bus, uart, i2c, gpio, adc = _make_bus()
         cfg = {
@@ -434,6 +446,7 @@ class BoardConfigNestedTests(unittest.TestCase):
 
 class BoardConfigShellTests(unittest.TestCase):
     def setUp(self):
+        _applied_configs.clear()
         from stmemu.shell.commands import Commands
         from stmemu.core.symbols import SymbolTable
         from stmemu.core.semihosting import SemihostingHandler
@@ -509,13 +522,15 @@ class BoardConfigDoubleApplyTests(unittest.TestCase):
     def setUp(self):
         _applied_configs.clear()
 
-    def test_double_apply_warns(self):
+    def test_double_apply_skips_topology(self):
         bus, uart, i2c, gpio, adc = _make_bus()
-        cfg1 = {"uart_devices": [{"peripheral": "USART1", "device": "ublox"}]}
-        cfg2 = {"uart_devices": [{"peripheral": "USART1", "device": "ublox"}]}
+        cfg1 = {"uart_devices": [{"peripheral": "USART1", "device": "ublox", "name": "gps1"}]}
+        cfg2 = {"uart_devices": [{"peripheral": "USART1", "device": "ublox", "name": "gps2"}]}
         apply_board_config(cfg1, bus, source="first")
+        self.assertEqual(len(bus.serial_lines()), 1)
         msgs = apply_board_config(cfg2, bus, source="second")
-        self.assertTrue(any("already applied" in m for m in msgs))
+        self.assertTrue(any("skipped" in m for m in msgs))
+        self.assertEqual(len(bus.serial_lines()), 1, "second topology should be skipped")
 
     def test_no_warning_without_board_topology(self):
         bus, uart, i2c, gpio, adc = _make_bus()

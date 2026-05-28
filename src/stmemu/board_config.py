@@ -215,21 +215,22 @@ def apply_board_config(
     for w in warnings:
         messages.append(f"warning: {w}")
 
-    # Track applied configs for double-apply detection
+    # Track applied configs and prevent double-apply of board topology
     has_board_topology = any(
         k in config or k in config.get("board", {})
         for k in ("uart_devices", "i2c_devices", "gpio_levels", "adc")
     )
+    skip_topology = False
     if has_board_topology and _applied_configs:
         prev_sources = [c.get("_source", "?") for c in _applied_configs if c.get("_has_board")]
         if prev_sources:
             messages.append(
-                f"warning: board topology already applied from {prev_sources[0]}; "
-                "devices may be duplicated"
+                f"board topology skipped: already applied from {prev_sources[0]}"
             )
+            skip_topology = True
     _applied_configs.append({
         "_source": source,
-        "_has_board": has_board_topology,
+        "_has_board": has_board_topology and not skip_topology,
         "_sections": [k for k in config if k != "target"],
     })
 
@@ -246,13 +247,13 @@ def apply_board_config(
         messages.append(f"bus policy: {policy}")
 
     # 2. Board topology — check both "board" sub-key and top-level keys
-    board = config.get("board", {})
-    if isinstance(board, dict) and board:
-        messages.extend(_apply_board_topology(board, bus))
-    # Also process top-level device keys (backward compat)
-    for key in ("uart_devices", "i2c_devices", "gpio_levels", "adc"):
-        if key in config and key not in board:
-            messages.extend(_apply_board_topology({key: config[key]}, bus))
+    if not skip_topology:
+        board = config.get("board", {})
+        if isinstance(board, dict) and board:
+            messages.extend(_apply_board_topology(board, bus))
+        for key in ("uart_devices", "i2c_devices", "gpio_levels", "adc"):
+            if key in config and key not in (board if isinstance(board, dict) else {}):
+                messages.extend(_apply_board_topology({key: config[key]}, bus))
 
     # 3. Register pre-sets
     for reg_cfg in config.get("registers", []):
