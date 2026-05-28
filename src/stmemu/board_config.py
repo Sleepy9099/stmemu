@@ -436,17 +436,22 @@ def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
         from stmemu.external.ublox import UbloxGpsDevice
         dev = UbloxGpsDevice()
         dev.name = cfg.get("name", f"{periph_name.lower()}_gps")
+        _INT_ATTRS = {"rate_cycles", "ttff_ticks"}
         for attr in ("mode", "lat", "lon", "alt", "speed_knots", "rate_cycles", "ttff_ticks"):
             if attr in cfg:
                 val = cfg[attr]
-                if isinstance(val, str) and attr != "mode":
+                if attr == "mode":
+                    pass
+                elif attr in _INT_ATTRS:
+                    val = _parse_int(val)
+                elif isinstance(val, str):
                     val = float(val)
                 setattr(dev, attr, val)
     else:
         return f"uart: unknown device type '{dev_type}'"
 
     from stmemu.external.serial_line import SerialLine
-    line = SerialLine(dev.name, uart=uart_model, device=dev)
+    line = SerialLine(dev.name, uart=uart_model, device=dev, bus=bus)
     bus.attach_serial_line(line)
     return f"uart: attached {dev_type} '{dev.name}' to {periph_name}"
 

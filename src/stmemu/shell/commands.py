@@ -3891,7 +3891,7 @@ class Commands:
 
         from stmemu.external.serial_line import SerialLine
         line_name = dev.name
-        line = SerialLine(line_name, uart=uart_model, device=dev)
+        line = SerialLine(line_name, uart=uart_model, device=dev, bus=self.bus)
         self.bus.attach_serial_line(line)
 
         parts = [
