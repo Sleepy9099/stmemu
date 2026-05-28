@@ -3838,7 +3838,7 @@ class Commands:
 
     def _board_show(self) -> str:
         from stmemu.board_config import config_applied_summary
-        applied = config_applied_summary()
+        applied = config_applied_summary(self.bus)
         lines_dict = self.bus.serial_lines()
         timed = self.emu.list_timed_events() if hasattr(self.emu, "list_timed_events") else []
         evt_bps = self.emu.list_event_breakpoints() if hasattr(self.emu, "list_event_breakpoints") else []

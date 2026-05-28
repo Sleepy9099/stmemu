@@ -177,15 +177,32 @@ def validate_config(config: dict[str, Any]) -> list[str]:
     return warnings
 
 
-_applied_configs: list[dict[str, Any]] = []
+def _bus_applied_configs(bus: object) -> list[dict[str, Any]]:
+    """Per-session applied-config history, stored on the bus instance.
+
+    Tracking applied configs on the bus (rather than a module global) scopes
+    the double-apply guard to a single emulator session: a fresh bus starts
+    with empty history, so configs applied by a previous session in the same
+    process no longer suppress board topology in a new one.
+    """
+    configs = getattr(bus, "_applied_configs", None)
+    if configs is None:
+        configs = []
+        try:
+            setattr(bus, "_applied_configs", configs)
+        except Exception:
+            # Bus doesn't allow attribute assignment; fall back to a transient
+            # list (guard degrades to "never previously applied" for this bus).
+            pass
+    return configs
 
 
-def config_applied_count() -> int:
-    return len(_applied_configs)
+def config_applied_count(bus: object) -> int:
+    return len(_bus_applied_configs(bus))
 
 
-def config_applied_summary() -> list[dict[str, Any]]:
-    return list(_applied_configs)
+def config_applied_summary(bus: object) -> list[dict[str, Any]]:
+    return list(_bus_applied_configs(bus))
 
 
 def apply_board_config(
@@ -220,15 +237,16 @@ def apply_board_config(
         k in config or k in config.get("board", {})
         for k in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc")
     )
+    applied = _bus_applied_configs(bus)
     skip_topology = False
-    if has_board_topology and _applied_configs:
-        prev_sources = [c.get("_source", "?") for c in _applied_configs if c.get("_has_board")]
+    if has_board_topology and applied:
+        prev_sources = [c.get("_source", "?") for c in applied if c.get("_has_board")]
         if prev_sources:
             messages.append(
                 f"board topology skipped: already applied from {prev_sources[0]}"
             )
             skip_topology = True
-    _applied_configs.append({
+    applied.append({
         "_source": source,
         "_has_board": has_board_topology and not skip_topology,
         "_sections": [k for k in config if k != "target"],

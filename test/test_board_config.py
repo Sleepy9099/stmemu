@@ -45,7 +45,7 @@ from stmemu.peripherals.gpio import GpioPeripheral
 from stmemu.peripherals.adc import Stm32AdcPeripheral
 from stmemu.board_config import (
     load_board_config, apply_board_config, validate_config,
-    config_applied_count, config_applied_summary, _applied_configs,
+    config_applied_count, config_applied_summary,
 )
 
 
@@ -148,7 +148,7 @@ class BoardConfigLoadTests(unittest.TestCase):
 
 class BoardConfigApplyTests(unittest.TestCase):
     def setUp(self):
-        _applied_configs.clear()
+        pass
     def test_uart_device_attach(self):
         bus, uart, i2c, gpio, adc = _make_bus()
         cfg = {
@@ -256,7 +256,7 @@ class BoardConfigApplyTests(unittest.TestCase):
 
 class BoardConfigRegisterTests(unittest.TestCase):
     def setUp(self):
-        _applied_configs.clear()
+        pass
     def test_peripheral_register_write(self):
         bus, uart, i2c, gpio, adc = _make_bus()
         cfg = {
@@ -291,7 +291,7 @@ class BoardConfigRegisterTests(unittest.TestCase):
 
 class BoardConfigMemoryTests(unittest.TestCase):
     def setUp(self):
-        _applied_configs.clear()
+        pass
     def test_hex_memory_write(self):
         bus, uart, i2c, gpio, adc = _make_bus()
 
@@ -318,7 +318,7 @@ class BoardConfigMemoryTests(unittest.TestCase):
 
 class BoardConfigBreakpointTests(unittest.TestCase):
     def setUp(self):
-        _applied_configs.clear()
+        pass
     def test_pc_breakpoints(self):
         bus, uart, i2c, gpio, adc = _make_bus()
 
@@ -372,7 +372,7 @@ class BoardConfigBreakpointTests(unittest.TestCase):
 
 class BoardConfigEmulatorTests(unittest.TestCase):
     def setUp(self):
-        _applied_configs.clear()
+        pass
     def test_emulator_settings(self):
         bus, uart, i2c, gpio, adc = _make_bus()
 
@@ -419,7 +419,7 @@ class BoardConfigEmulatorTests(unittest.TestCase):
 
 class BoardConfigNestedTests(unittest.TestCase):
     def setUp(self):
-        _applied_configs.clear()
+        pass
     def test_board_subsection(self):
         bus, uart, i2c, gpio, adc = _make_bus()
         cfg = {
@@ -446,7 +446,6 @@ class BoardConfigNestedTests(unittest.TestCase):
 
 class BoardConfigShellTests(unittest.TestCase):
     def setUp(self):
-        _applied_configs.clear()
         from stmemu.shell.commands import Commands
         from stmemu.core.symbols import SymbolTable
         from stmemu.core.semihosting import SemihostingHandler
@@ -519,8 +518,28 @@ class BoardConfigValidationTests(unittest.TestCase):
 
 
 class BoardConfigDoubleApplyTests(unittest.TestCase):
-    def setUp(self):
-        _applied_configs.clear()
+    def test_topology_not_skipped_on_fresh_bus(self):
+        # Regression: applied-config history is tracked per-bus, so a new
+        # session (fresh bus) must still apply board topology even though a
+        # previous session applied some. With the old module-global the second
+        # apply inherited the first's history and wrongly skipped topology.
+        bus1, *_ = _make_bus()
+        apply_board_config(
+            {"uart_devices": [{"peripheral": "USART1", "device": "ublox", "name": "gps1"}]},
+            bus1, source="session1",
+        )
+        self.assertEqual(len(bus1.serial_lines()), 1)
+
+        bus2, *_ = _make_bus()
+        msgs = apply_board_config(
+            {"uart_devices": [{"peripheral": "USART1", "device": "ublox", "name": "gps2"}]},
+            bus2, source="session2",
+        )
+        self.assertFalse(
+            any("skipped" in m for m in msgs),
+            "fresh bus must not inherit a prior session's applied-config history",
+        )
+        self.assertEqual(len(bus2.serial_lines()), 1)
 
     def test_double_apply_skips_topology(self):
         bus, uart, i2c, gpio, adc = _make_bus()
@@ -548,9 +567,9 @@ class BoardConfigDoubleApplyTests(unittest.TestCase):
 
     def test_applied_count(self):
         bus, uart, i2c, gpio, adc = _make_bus()
-        initial = config_applied_count()
+        initial = config_applied_count(bus)
         apply_board_config({"bus_policy": "permissive"}, bus, source="test")
-        self.assertEqual(config_applied_count(), initial + 1)
+        self.assertEqual(config_applied_count(bus), initial + 1)
 
     def test_spi_devices_triggers_double_apply(self):
         bus, uart, i2c, gpio, adc = _make_bus()
@@ -566,7 +585,7 @@ class BoardConfigDoubleApplyTests(unittest.TestCase):
         )
 
     def tearDown(self):
-        _applied_configs.clear()
+        pass
 
 
 class BoardConfigShowTests(unittest.TestCase):
@@ -574,7 +593,6 @@ class BoardConfigShowTests(unittest.TestCase):
         from stmemu.shell.commands import Commands
         from stmemu.core.symbols import SymbolTable
         from stmemu.core.semihosting import SemihostingHandler
-        _applied_configs.clear()
 
         self.bus, self.uart, self.i2c, self.gpio, self.adc = _make_bus()
 
@@ -625,7 +643,7 @@ class BoardConfigShowTests(unittest.TestCase):
         self.assertIn("OK", out)
 
     def tearDown(self):
-        _applied_configs.clear()
+        pass
 
 
 if __name__ == "__main__":
