@@ -115,6 +115,79 @@ def load_board_config(path: Path) -> dict[str, Any]:
     return json.loads(text)
 
 
+_KNOWN_TOP_KEYS = {
+    "target", "emulator", "board", "bus_policy",
+    "uart_devices", "i2c_devices", "gpio_levels", "adc",
+    "registers", "memory", "breakpoints", "timed_events",
+    "startup_commands",
+}
+
+_KNOWN_EMULATOR_KEYS = {
+    "tick_scale", "stuck_threshold", "interrupt_stuck_threshold",
+    "bus_policy", "trace", "coverage",
+}
+
+_KNOWN_UART_KEYS = {
+    "peripheral", "device", "name", "mode", "lat", "lon", "alt",
+    "speed_knots", "rate_cycles", "ttff_ticks",
+}
+
+_KNOWN_I2C_DEV_KEYS = {
+    "type", "address", "name", "whoami_reg", "whoami_value", "registers",
+}
+
+
+def validate_config(config: dict[str, Any]) -> list[str]:
+    """Validate a scenario config, returning a list of warnings."""
+    warnings: list[str] = []
+    if not isinstance(config, dict):
+        warnings.append("config must be a mapping")
+        return warnings
+
+    unknown_top = set(config.keys()) - _KNOWN_TOP_KEYS
+    for k in sorted(unknown_top):
+        if not isinstance(config[k], (dict, list)):
+            warnings.append(f"unknown top-level key: '{k}'")
+
+    emu_cfg = config.get("emulator", {})
+    if isinstance(emu_cfg, dict):
+        for k in emu_cfg:
+            if k not in _KNOWN_EMULATOR_KEYS:
+                warnings.append(f"unknown emulator key: '{k}'")
+
+    for uart_cfg in config.get("uart_devices", []) + config.get("board", {}).get("uart_devices", []):
+        if isinstance(uart_cfg, dict):
+            for k in uart_cfg:
+                if k not in _KNOWN_UART_KEYS:
+                    warnings.append(f"unknown uart_device key: '{k}'")
+
+    bp_cfg = config.get("breakpoints", {})
+    if isinstance(bp_cfg, dict):
+        for k in bp_cfg:
+            if k not in ("pc", "events", "watchpoints"):
+                warnings.append(f"unknown breakpoints key: '{k}'")
+
+    for te in config.get("timed_events", []):
+        if isinstance(te, dict):
+            if "at" not in te:
+                warnings.append("timed_event missing 'at' field")
+            if "action" not in te:
+                warnings.append("timed_event missing 'action' field")
+
+    return warnings
+
+
+_applied_configs: list[dict[str, Any]] = []
+
+
+def config_applied_count() -> int:
+    return len(_applied_configs)
+
+
+def config_applied_summary() -> list[dict[str, Any]]:
+    return list(_applied_configs)
+
+
 def apply_board_config(
     config: dict[str, Any],
     bus: object,
@@ -122,6 +195,7 @@ def apply_board_config(
     *,
     shell: object | None = None,
     base_dir: Path | None = None,
+    source: str = "config",
 ) -> list[str]:
     """Apply a full scenario config. Returns status messages.
 
@@ -135,6 +209,29 @@ def apply_board_config(
     7. startup_commands (shell commands)
     """
     messages: list[str] = []
+
+    # Validate config
+    warnings = validate_config(config)
+    for w in warnings:
+        messages.append(f"warning: {w}")
+
+    # Track applied configs for double-apply detection
+    has_board_topology = any(
+        k in config or k in config.get("board", {})
+        for k in ("uart_devices", "i2c_devices", "gpio_levels", "adc")
+    )
+    if has_board_topology and _applied_configs:
+        prev_sources = [c.get("_source", "?") for c in _applied_configs if c.get("_has_board")]
+        if prev_sources:
+            messages.append(
+                f"warning: board topology already applied from {prev_sources[0]}; "
+                "devices may be duplicated"
+            )
+    _applied_configs.append({
+        "_source": source,
+        "_has_board": has_board_topology,
+        "_sections": [k for k in config if k != "target"],
+    })
 
     # 1. Emulator settings
     emu_cfg = config.get("emulator", {})

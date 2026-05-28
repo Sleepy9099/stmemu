@@ -114,6 +114,7 @@ def run_app(
         messages = apply_board_config(
             board_cfg, bus, emu,
             shell=sh, base_dir=Path(board_cfg_path).parent,
+            source=f"--board {board_cfg_path}",
         )
         for msg in messages:
             log.info("board: %s", msg)
@@ -128,7 +129,10 @@ def run_app(
             from stmemu.board_config import load_board_config, apply_board_config
 
             cfg = load_board_config(cfg_path)
-            messages = apply_board_config(cfg, bus, emu, shell=sh, base_dir=cfg_path.parent)
+            messages = apply_board_config(
+                cfg, bus, emu, shell=sh, base_dir=cfg_path.parent,
+                source=f"--cfg {cfg_path}",
+            )
             for msg in messages:
                 log.info("cfg: %s", msg)
             ran_cfg_script = True

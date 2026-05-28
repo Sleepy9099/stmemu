@@ -43,7 +43,10 @@ from stmemu.peripherals.usart import Stm32UsartPeripheral
 from stmemu.peripherals.i2c import I2cPeripheral
 from stmemu.peripherals.gpio import GpioPeripheral
 from stmemu.peripherals.adc import Stm32AdcPeripheral
-from stmemu.board_config import load_board_config, apply_board_config
+from stmemu.board_config import (
+    load_board_config, apply_board_config, validate_config,
+    config_applied_count, config_applied_summary, _applied_configs,
+)
 
 
 _USART_REGS = (
@@ -465,6 +468,136 @@ class BoardConfigShellTests(unittest.TestCase):
     def test_board_usage(self):
         out = self.cmds.cmd_board([])
         self.assertIn("usage:", out)
+
+
+class BoardConfigValidationTests(unittest.TestCase):
+    def test_valid_config_no_warnings(self):
+        cfg = {
+            "emulator": {"tick_scale": 1},
+            "board": {"gpio_levels": {"GPIOA": {"0": "high"}}},
+        }
+        warnings = validate_config(cfg)
+        self.assertEqual(len(warnings), 0)
+
+    def test_unknown_top_level_key(self):
+        cfg = {"bogus_key": "value"}
+        warnings = validate_config(cfg)
+        self.assertTrue(any("unknown top-level" in w for w in warnings))
+
+    def test_unknown_emulator_key(self):
+        cfg = {"emulator": {"invalid_setting": 42}}
+        warnings = validate_config(cfg)
+        self.assertTrue(any("unknown emulator" in w for w in warnings))
+
+    def test_timed_event_missing_at(self):
+        cfg = {"timed_events": [{"action": "gpio_inject"}]}
+        warnings = validate_config(cfg)
+        self.assertTrue(any("missing 'at'" in w for w in warnings))
+
+    def test_timed_event_missing_action(self):
+        cfg = {"timed_events": [{"at": 100}]}
+        warnings = validate_config(cfg)
+        self.assertTrue(any("missing 'action'" in w for w in warnings))
+
+    def test_unknown_breakpoint_key(self):
+        cfg = {"breakpoints": {"invalid": []}}
+        warnings = validate_config(cfg)
+        self.assertTrue(any("unknown breakpoints" in w for w in warnings))
+
+
+class BoardConfigDoubleApplyTests(unittest.TestCase):
+    def setUp(self):
+        _applied_configs.clear()
+
+    def test_double_apply_warns(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        cfg1 = {"uart_devices": [{"peripheral": "USART1", "device": "ublox"}]}
+        cfg2 = {"uart_devices": [{"peripheral": "USART1", "device": "ublox"}]}
+        apply_board_config(cfg1, bus, source="first")
+        msgs = apply_board_config(cfg2, bus, source="second")
+        self.assertTrue(any("already applied" in m for m in msgs))
+
+    def test_no_warning_without_board_topology(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        cfg1 = {"emulator": {"tick_scale": 1}}
+        cfg2 = {"registers": [{"reg": "r0", "value": "0"}]}
+
+        class _FakeEmu:
+            tick_scale = 1
+            _regs = {}
+            def write_reg(self, name, value): self._regs[name] = value
+        emu = _FakeEmu()
+        apply_board_config(cfg1, bus, emu, source="a")
+        msgs = apply_board_config(cfg2, bus, emu, source="b")
+        self.assertFalse(any("already applied" in m for m in msgs))
+
+    def test_applied_count(self):
+        bus, uart, i2c, gpio, adc = _make_bus()
+        initial = config_applied_count()
+        apply_board_config({"bus_policy": "permissive"}, bus, source="test")
+        self.assertEqual(config_applied_count(), initial + 1)
+
+    def tearDown(self):
+        _applied_configs.clear()
+
+
+class BoardConfigShowTests(unittest.TestCase):
+    def setUp(self):
+        from stmemu.shell.commands import Commands
+        from stmemu.core.symbols import SymbolTable
+        from stmemu.core.semihosting import SemihostingHandler
+        _applied_configs.clear()
+
+        self.bus, self.uart, self.i2c, self.gpio, self.adc = _make_bus()
+
+        class _FakeEmu:
+            symbols = SymbolTable()
+            semihosting = SemihostingHandler()
+            coverage_enabled = False
+            _coverage = set()
+            _coverage_hits = {}
+            flash_base = 0x08000000
+            flash_end = 0x08010000
+            pc = 0x08000100
+            rtos_trace_enabled = False
+            _timed_events = []
+            _event_breakpoints = []
+            def list_timed_events(self): return list(self._timed_events)
+            def list_event_breakpoints(self): return list(self._event_breakpoints)
+        self.cmds = Commands(emu=_FakeEmu(), bus=self.bus)
+
+    def test_board_show_empty(self):
+        out = self.cmds.cmd_board(["show"])
+        self.assertIn("configs applied: 0", out)
+        self.assertIn("bus policy:", out)
+
+    def test_board_show_after_load(self):
+        cfg = {"gpio_levels": {"GPIOA": {"0": "high"}}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump(cfg, f)
+            f.flush()
+            self.cmds.cmd_board(["load", f.name])
+        out = self.cmds.cmd_board(["show"])
+        self.assertIn("configs applied: 1", out)
+
+    def test_board_validate(self):
+        cfg = {"bogus": "value", "emulator": {"invalid": 1}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump(cfg, f)
+            f.flush()
+            out = self.cmds.cmd_board(["validate", f.name])
+        self.assertIn("warning:", out)
+
+    def test_board_validate_ok(self):
+        cfg = {"emulator": {"tick_scale": 1}}
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump(cfg, f)
+            f.flush()
+            out = self.cmds.cmd_board(["validate", f.name])
+        self.assertIn("OK", out)
+
+    def tearDown(self):
+        _applied_configs.clear()
 
 
 if __name__ == "__main__":

@@ -3610,13 +3610,14 @@ class Commands:
     # ── Board config commands ─────────────────────────────────────
 
     def cmd_board(self, argv: list[str]) -> str:
-        usage = "usage: board load <file.yaml|file.json>"
+        usage = "usage: board load <file> | board show | board validate <file>"
         if not argv:
             return usage
         sub = argv[0].lower()
+
         if sub == "load":
             if len(argv) != 2:
-                return usage
+                return "usage: board load <file.yaml|file.json>"
             from stmemu.board_config import load_board_config, apply_board_config
             path = Path(argv[1]).expanduser()
             try:
@@ -3627,11 +3628,55 @@ class Commands:
                 messages = apply_board_config(
                     config, self.bus, self.emu,
                     base_dir=path.parent,
+                    source=f"board load {path.name}",
                 )
             except Exception as e:
                 return f"error applying board config: {e}"
             return "\n".join(messages) if messages else "board config applied (empty)"
+
+        if sub == "show":
+            return self._board_show()
+
+        if sub == "validate":
+            if len(argv) != 2:
+                return "usage: board validate <file>"
+            from stmemu.board_config import load_board_config, validate_config
+            path = Path(argv[1]).expanduser()
+            try:
+                config = load_board_config(path)
+            except Exception as e:
+                return f"error loading: {e}"
+            warnings = validate_config(config)
+            if not warnings:
+                return "config OK (no warnings)"
+            return "\n".join(f"warning: {w}" for w in warnings)
+
         return usage
+
+    def _board_show(self) -> str:
+        from stmemu.board_config import config_applied_summary
+        applied = config_applied_summary()
+        lines_dict = self.bus.serial_lines()
+        timed = self.emu.list_timed_events() if hasattr(self.emu, "list_timed_events") else []
+        evt_bps = self.emu.list_event_breakpoints() if hasattr(self.emu, "list_event_breakpoints") else []
+
+        lines = [f"configs applied: {len(applied)}"]
+        for i, a in enumerate(applied):
+            lines.append(f"  [{i}] {a.get('_source', '?')} sections={a.get('_sections', [])}")
+
+        lines.append(f"serial lines: {len(lines_dict)}")
+        for name, line in lines_dict.items():
+            dev = getattr(line, "device", None)
+            lines.append(f"  {name}: {type(dev).__name__ if dev else 'none'}")
+
+        lines.append(f"timed events: {len(timed)} pending")
+        lines.append(f"event breakpoints: {len(evt_bps)}")
+        lines.append(f"bus policy: {self.bus.access_policy}")
+        if hasattr(self.emu, "rtos_trace_enabled"):
+            lines.append(f"rtos trace: {'on' if self.emu.rtos_trace_enabled else 'off'}")
+        if hasattr(self.emu, "coverage_enabled"):
+            lines.append(f"coverage: {'on' if self.emu.coverage_enabled else 'off'}")
+        return "\n".join(lines)
 
     # ── Timed event commands ─────────────────────────────────────
 
