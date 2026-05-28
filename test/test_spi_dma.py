@@ -418,6 +418,34 @@ class H7SpiDmaTests(unittest.TestCase):
         rx = emu.mem_read(rx_addr, 2)
         self.assertEqual(rx[1], 0x47, "ICM-42688 WHOAMI through H7 DMA")
 
+    def test_h7_16bit_frame_sends_both_bytes(self):
+        # CFG1.DSIZE = 15 selects 16-bit frames; a TXDR write must clock out
+        # both bytes (MSB first) and RXDR must return the reassembled frame.
+        bus, spi, dma, _nvic, emu = _make_h7_setup()
+        spi.write(0x08, 4, 15)  # CFG1.DSIZE = 15 -> 16-bit
+
+        class _Echo:
+            cs_active = True
+            def exchange(self, b):
+                return b
+
+        spi.attach_device(_Echo())
+        spi.write(0x20, 4, 0x1234)  # TXDR
+        self.assertEqual(spi.drain_tx(), bytes([0x12, 0x34]))
+        self.assertEqual(spi.read(0x30, 4), 0x1234)  # RXDR
+
+    def test_h7_eot_clears_via_ifcr_and_stays_clear(self):
+        # EOT must be a latched flag: set on transfer completion, cleared by
+        # writing EOTC to IFCR, and it must NOT immediately re-assert on the
+        # next SR read (which would stall firmware polling on EOT).
+        bus, spi, dma, _nvic, emu = _make_h7_setup()
+        spi.write(0x00, 4, spi._H7_CR1_SPE | spi._H7_CR1_CSTART)
+        self.assertTrue(spi.read(0x14, 4) & spi._H7_SR_EOT, "CSTART latches EOT")
+
+        spi.write(0x18, 4, spi._H7_IFCR_EOTC)  # IFCR.EOTC
+        self.assertFalse(spi.read(0x14, 4) & spi._H7_SR_EOT, "EOTC clears EOT")
+        self.assertFalse(spi.read(0x14, 4) & spi._H7_SR_EOT, "EOT stays clear")
+
 
 # ── Snapshot of in-progress transfer + device state ─────────────
 

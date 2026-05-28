@@ -231,6 +231,22 @@ class SpiTests(unittest.TestCase):
         self.assertEqual(spi.read(0x0C, 4), 0xAB)
         self.assertEqual(spi.read(0x0C, 4), 0xCD)
 
+    def test_16bit_frame_sends_both_bytes(self) -> None:
+        # With CR1.DFF set the frame is 16-bit: a DR write must clock out both
+        # bytes (MSB first) instead of dropping the high byte.
+        spi = self._make_spi()
+        spi.write(0x00, 4, spi._CR1_DFF)
+
+        class _Echo:
+            cs_active = True
+            def exchange(self, b: int) -> int:
+                return b  # loopback
+
+        spi.attach_device(_Echo())
+        spi.write(0x0C, 4, 0xABCD)
+        self.assertEqual(spi.drain_tx(), bytes([0xAB, 0xCD]))
+        self.assertEqual(spi.read(0x0C, 4), 0xABCD)  # full frame reassembled
+
     def test_reset_clears_fifos(self) -> None:
         spi = self._make_spi()
         spi.write(0x0C, 4, 0x01)
