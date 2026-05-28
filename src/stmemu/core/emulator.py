@@ -1818,12 +1818,21 @@ class Emulator:
         # Semihosting: intercept BKPT 0xAB (opcode 0xBEAB)
         if size == 2 and self.semihosting.enabled:
             try:
-                opcode = int.from_bytes(bytes(uc.mem_read(pc, 2)), "little")
+                opcode = int.from_bytes(bytes(uc.mem_read(pc & ~1, 2)), "little")
                 if opcode == BKPT_SEMIHOST:
                     r0 = uc.reg_read(UC_ARM_REG_R0)
                     r1 = uc.reg_read(UC_ARM_REG_R1)
                     result = self.semihosting.handle(r0, r1, uc.mem_read, uc.mem_write, uc)
                     uc.reg_write(UC_ARM_REG_R0, result & 0xFFFFFFFF)
+                    # The BKPT instruction itself would raise UC_ERR_EXCEPTION and
+                    # leave PC unchanged, so we must step over it ourselves: advance
+                    # past the 2-byte BKPT and stop this single-step cycle cleanly.
+                    self._special_step_consumed = True
+                    uc.reg_write(UC_ARM_REG_PC, ((pc & ~1) + 2) | 1)
+                    try:
+                        uc.emu_stop()
+                    except Exception:
+                        pass
                     return
             except Exception:
                 pass
