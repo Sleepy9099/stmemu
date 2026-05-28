@@ -198,10 +198,12 @@ class PeripheralBus:
                 pass
 
     def emit(self, event: PeripheralEvent) -> None:
-        """Emit a peripheral event to all subscribers of its kind."""
+        """Emit a peripheral event to all subscribers of its kind and wildcard."""
         if self.event_log_enabled:
             self._event_log.append(event)
         for handler in self._event_subscribers.get(event.kind, ()):
+            handler(event)
+        for handler in self._event_subscribers.get("*", ()):
             handler(event)
 
     def drain_event_log(self) -> list[PeripheralEvent]:

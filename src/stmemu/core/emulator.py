@@ -156,6 +156,9 @@ class Emulator:
         self.rtos_trace_enabled: bool = False
         self._rtos_switch_count: int = 0
         self._rtos_last_psp: int = 0
+        self.event_trace_enabled: bool = False
+        self._event_trace: list[dict] = []
+        self._event_trace_max: int = 10000
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
 
@@ -683,6 +686,67 @@ class Emulator:
             "instruction_count": self._instruction_count,
             "in_handler": bool(self._exception_stack),
         }
+
+    # --- Event trace ---
+
+    def enable_event_trace(self, max_events: int = 10000) -> None:
+        self._event_trace_max = max_events
+        if not self.event_trace_enabled:
+            self.bus.subscribe("*", self._on_trace_event)
+        self.event_trace_enabled = True
+
+    def disable_event_trace(self) -> None:
+        self.event_trace_enabled = False
+        self.bus.unsubscribe("*", self._on_trace_event)
+
+    def _on_trace_event(self, event) -> None:
+        if not self.event_trace_enabled:
+            return
+        entry = {
+            "instruction": self._instruction_count,
+            "pc": self.pc & 0xFFFFFFFF,
+            "kind": event.kind,
+            "source": getattr(event, "source", ""),
+            "address": getattr(event, "address", 0),
+        }
+        direction = getattr(event, "direction", "")
+        if direction:
+            entry["direction"] = direction
+        size = getattr(event, "size", 0)
+        if size:
+            entry["size"] = size
+        payload = getattr(event, "payload", None)
+        if payload is not None:
+            entry["payload"] = payload
+        self._event_trace.append(entry)
+        if len(self._event_trace) > self._event_trace_max:
+            self._event_trace = self._event_trace[-self._event_trace_max:]
+
+    def event_trace_list(self, count: int = 20) -> list[dict]:
+        return list(self._event_trace[-count:])
+
+    def event_trace_clear(self) -> int:
+        n = len(self._event_trace)
+        self._event_trace.clear()
+        return n
+
+    def event_trace_export(self, path) -> int:
+        """Export event trace as JSONL (one JSON object per line)."""
+        import json
+        from pathlib import Path
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w", encoding="utf-8") as f:
+            for entry in self._event_trace:
+                safe = {}
+                for k, v in entry.items():
+                    try:
+                        json.dumps(v)
+                        safe[k] = v
+                    except (TypeError, ValueError):
+                        safe[k] = str(v)
+                f.write(json.dumps(safe) + "\n")
+        return len(self._event_trace)
 
     @staticmethod
     def _reg_alias_to_unicorn(name: str):
