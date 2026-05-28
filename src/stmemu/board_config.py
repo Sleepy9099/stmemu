@@ -355,19 +355,24 @@ def _apply_register(cfg: dict[str, Any], bus: object, emu: object | None) -> str
         if model is None:
             return f"register: {periph} not found"
         val = _parse_int(cfg.get("value", 0))
-        # Find register offset by name
+        # Find register offset (and width) by name. Honor the register's
+        # declared size so an 8/16-bit register isn't written as 32 bits,
+        # which would spill into adjacent registers or be rejected.
         offset = None
+        width = 4
         if hasattr(model, "peripheral"):
             for reg in model.peripheral.registers:
                 if reg.name.upper() == str(register).upper():
                     offset = reg.offset
+                    byte_width = max(1, int(getattr(reg, "size_bits", 32) or 32) // 8)
+                    width = byte_width if byte_width in (1, 2, 4) else 4
                     break
         if offset is None:
             try:
                 offset = _parse_int(register)
             except ValueError:
                 return f"register: {periph}.{register} not found"
-        model.write(offset, 4, val)
+        model.write(offset, width, val)
         return f"register: {periph}.{register} = 0x{val:08X}"
 
     return "register: missing 'reg' or 'peripheral'+'register'"
