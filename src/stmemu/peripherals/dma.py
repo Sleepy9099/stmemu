@@ -55,6 +55,10 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
     _SxCR_PINC = 1 << 9
     _SxCR_DIR_SHIFT = 6
     _SxCR_DIR_MASK = 0x3
+    # MSIZE (SxCR[14:13]) only sets the memory bus access width, which is not
+    # observable against byte-addressed RAM, so the transfer logic acts on
+    # PSIZE alone. The constant is kept to document the field (and is exercised
+    # by tests asserting that a mismatched MSIZE does not corrupt the transfer).
     _SxCR_MSIZE_SHIFT = 13
     _SxCR_PSIZE_SHIFT = 11
     _SxCR_MINC = 1 << 10

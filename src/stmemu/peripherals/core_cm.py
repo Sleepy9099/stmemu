@@ -280,8 +280,16 @@ class CortexMCorePeripheral(RegisterPeripheral):
             load = 0x00FFFFFF
 
         value = self.read_register_value(self._SYST_CVR) & 0x00FFFFFF
-        wrapped = cycles > 0 and value < cycles
-        value = (value - cycles) % (load + 1)
+        period = load + 1
+        # The counter decrements each cycle and fires when it reaches 0. From a
+        # non-zero value that takes `value` cycles (so landing exactly on 0
+        # counts); when already resting at 0 it must count a full period before
+        # the next reach-zero. The old `value < cycles` test was off by one in
+        # both directions (missed the exact-zero case, and spuriously fired
+        # while sitting at 0).
+        cycles_to_zero = value if value > 0 else period
+        wrapped = cycles > 0 and cycles >= cycles_to_zero
+        value = (value - cycles) % period
         if wrapped:
             self.write_register_value(self._SYST_CSR, ctrl | self._SYST_CSR_COUNTFLAG)
             if ctrl & self._SYST_CSR_TICKINT:

@@ -607,6 +607,30 @@ class SysTickValTests(unittest.TestCase):
         val = core.read_register_value(0xE018)
         self.assertEqual(val, 0, "writing SYST_CVR should clear it to 0")
 
+    def test_countflag_set_when_counter_lands_exactly_on_zero(self):
+        # Reaching 0 exactly (value == cycles) must fire COUNTFLAG; the old
+        # `value < cycles` test missed this boundary.
+        core = self._make_core()
+        core.write_register_value(0xE010, 0x01)  # ENABLE
+        core.write_register_value(0xE014, 10)     # LOAD = 10
+        core.write_register_value(0xE018, 5)      # CVR = 5
+        core.tick(5)                               # counts down exactly to 0
+        ctrl = core.read_register_value(0xE010)
+        self.assertTrue(ctrl & (1 << 16), "COUNTFLAG must set when counter reaches 0")
+        self.assertEqual(core.read_register_value(0xE018) & 0xFFFFFF, 0)
+
+    def test_no_spurious_countflag_when_resting_at_zero(self):
+        # Sitting at 0 then advancing less than a full period must NOT fire;
+        # the counter just reloads and counts down again.
+        core = self._make_core()
+        core.write_register_value(0xE010, 0x01)  # ENABLE
+        core.write_register_value(0xE014, 10)     # LOAD = 10
+        core.write_register_value(0xE018, 0)      # CVR = 0
+        core.tick(1)
+        ctrl = core.read_register_value(0xE010)
+        self.assertFalse(ctrl & (1 << 16), "leaving 0 must not set COUNTFLAG")
+        self.assertEqual(core.read_register_value(0xE018) & 0xFFFFFF, 10)
+
     def test_write_val_clears_countflag(self):
         core = self._make_core()
         core.write_register_value(0xE010, 0x01)  # ENABLE
