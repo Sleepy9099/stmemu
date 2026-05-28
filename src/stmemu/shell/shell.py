@@ -145,6 +145,9 @@ class StmEmuShell(cmd.Cmd):
     def do_spi(self, arg: str) -> None:
         self.default("spi " + arg if arg else "spi")
 
+    def do_fram(self, arg: str) -> None:
+        self.default("fram " + arg if arg else "fram")
+
     def do_i2c(self, arg: str) -> None:
         self.default("i2c " + arg if arg else "i2c")
 

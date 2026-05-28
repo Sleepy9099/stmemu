@@ -52,6 +52,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
     _SxCR_TCIE = 1 << 4
     _SxCR_HTIE = 1 << 3
     _SxCR_CIRC = 1 << 8
+    _SxCR_PINC = 1 << 9
     _SxCR_DIR_SHIFT = 6
     _SxCR_DIR_MASK = 0x3
     _SxCR_MSIZE_SHIFT = 13
@@ -163,7 +164,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         emu = self._get_emulator()
         if emu is not None:
             try:
-                self._do_transfer(emu, direction, par, mar, item_size)
+                self._do_transfer(emu, direction, par, mar, item_size, cr=cr)
             except Exception:
                 log.debug("DMA stream %d item transfer failed", stream)
 
@@ -196,7 +197,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             item_size = 1 << ((cr >> self._SxCR_PSIZE_SHIFT) & 0x3)
             byte_count = ndtr * item_size
             try:
-                self._do_transfer(emu, direction, par, mar, byte_count)
+                self._do_transfer(emu, direction, par, mar, byte_count, cr=cr)
             except Exception:
                 log.debug("DMA stream %d transfer failed", stream)
 
@@ -250,35 +251,37 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
 
     def _do_transfer(
         self, emu: object, direction: int, par: int, mar: int, byte_count: int,
+        cr: int = 0,
     ) -> None:
+        pinc = bool(cr & self._SxCR_PINC)
         if direction == self._DIR_P2M:
-            data = self._bus_read_bytes(par, byte_count)
+            data = self._bus_read_bytes(par, byte_count, pinc=pinc)
             emu.mem_write(mar, data)
         elif direction == self._DIR_M2P:
             data = bytes(emu.mem_read(mar, byte_count))
-            self._bus_write_bytes(par, data)
+            self._bus_write_bytes(par, data, pinc=pinc)
         elif direction == self._DIR_M2M:
             data = bytes(emu.mem_read(par, byte_count))
             emu.mem_write(mar, data)
 
-    def _bus_read_bytes(self, addr: int, count: int) -> bytes:
+    def _bus_read_bytes(self, addr: int, count: int, pinc: bool = True) -> bytes:
         if not self._context:
             return b"\x00" * count
         result = bytearray()
         for i in range(count):
             try:
-                val = self._context.bus.read(addr + i, 1)
+                val = self._context.bus.read(addr + (i if pinc else 0), 1)
                 result.append(val & 0xFF)
             except Exception:
                 result.append(0)
         return bytes(result)
 
-    def _bus_write_bytes(self, addr: int, data: bytes) -> None:
+    def _bus_write_bytes(self, addr: int, data: bytes, pinc: bool = True) -> None:
         if not self._context:
             return
         for i, b in enumerate(data):
             try:
-                self._context.bus.write(addr + i, 1, b)
+                self._context.bus.write(addr + (i if pinc else 0), 1, b)
             except Exception:
                 pass
 

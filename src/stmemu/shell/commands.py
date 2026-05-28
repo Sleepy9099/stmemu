@@ -2535,6 +2535,101 @@ class Commands:
 
         return usage
 
+    # --- FRAM commands (SPI-attached F-RAM devices) ---
+
+    def _spi_attached_devices(self) -> dict:
+        return getattr(self.bus, "_spi_attached_devices", {}) or {}
+
+    def _resolve_fram(self, name: str | None):
+        devices = self._spi_attached_devices()
+        if not devices:
+            return None
+        if name is None:
+            return next(iter(devices.values()))
+        return devices.get(name)
+
+    def cmd_fram(self, argv: list[str]) -> str:
+        usage = (
+            "usage: fram list | fram status [name] | fram save [name] [path] | "
+            "fram dump [name] <offset> <length> | fram poke [name] <offset> <hex>"
+        )
+        devices = self._spi_attached_devices()
+        if not argv or argv[0].lower() == "list":
+            if not devices:
+                return "(no spi devices attached)"
+            lines = [f"{len(devices)} spi device(s):"]
+            for name, dev in devices.items():
+                stats = dev.stats() if hasattr(dev, "stats") else {}
+                lines.append(
+                    f"  {name:16s} type={type(dev).__name__} "
+                    f"cmds={stats.get('commands', '?')} "
+                    f"reads={stats.get('reads', '?')} "
+                    f"writes={stats.get('writes', '?')} "
+                    f"dirty={stats.get('dirty', '?')}"
+                )
+            return "\n".join(lines)
+
+        sub = argv[0].lower()
+        if sub == "status":
+            name = argv[1] if len(argv) > 1 else None
+            dev = self._resolve_fram(name)
+            if dev is None:
+                return f"unknown fram device: {name}"
+            if not hasattr(dev, "stats"):
+                return f"{type(dev).__name__}: no stats"
+            stats = dev.stats()
+            return ", ".join(f"{k}={v}" for k, v in stats.items())
+
+        if sub == "save":
+            if len(argv) >= 3:
+                name, path_arg = argv[1], argv[2]
+            elif len(argv) == 2:
+                name, path_arg = (argv[1], None) if argv[1] in devices else (None, argv[1])
+            else:
+                name, path_arg = None, None
+            dev = self._resolve_fram(name)
+            if dev is None:
+                return f"unknown fram device: {name}"
+            if not hasattr(dev, "save_image"):
+                return f"{type(dev).__name__}: no save support"
+            try:
+                target = Path(path_arg) if path_arg else None
+                out = dev.save_image(target)
+            except Exception as e:
+                return f"save failed: {e}"
+            return f"saved {dev.name} -> {out}"
+
+        if sub == "dump":
+            args = argv[1:]
+            name = args[0] if args and args[0] in devices else None
+            if name is not None:
+                args = args[1:]
+            if len(args) != 2:
+                return "usage: fram dump [name] <offset> <length>"
+            dev = self._resolve_fram(name)
+            if dev is None:
+                return f"unknown fram device: {name or '(default)'}"
+            offset = _int(args[0])
+            length = _int(args[1])
+            data = dev.memory()[offset:offset + length]
+            return f"fram {dev.name} [{offset:#06x}..{offset + len(data):#06x}]:\n" + hexdump(data, base=offset)
+
+        if sub == "poke":
+            args = argv[1:]
+            name = args[0] if args and args[0] in devices else None
+            if name is not None:
+                args = args[1:]
+            if len(args) != 2:
+                return "usage: fram poke [name] <offset> <hex>"
+            dev = self._resolve_fram(name)
+            if dev is None:
+                return f"unknown fram device: {name or '(default)'}"
+            payload = self._read_bytes_spec(args[1])
+            dev.poke(_int(args[0]), payload)
+            return f"poked {len(payload)} byte(s) into {dev.name} @ {_int(args[0]):#x}"
+
+        return usage
+
     # --- I2C commands ---
     def _resolve_i2c_model(self, name: str) -> I2cPeripheral:
         model = self.bus.model_for_name(name)

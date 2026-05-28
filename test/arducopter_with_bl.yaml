@@ -1,0 +1,63 @@
+target:
+  svd: cmsis-svd-stm32/stm32h7/STM32H743.svd
+  base: 0x08000000
+  # AXI SRAM (D1) on H7. ArduCopter MSP=0x24000600.
+  sram_base: 0x24000000
+  sram_size: 0x80000
+
+emulator:
+  tick_scale: 1
+  stuck_threshold: 200000
+  interrupt_stuck_threshold: 500000000
+  bus_policy: permissive
+
+board:
+  # GPS on UART5 (highest reference count in the binary -> most likely GPS).
+  # UbloxGpsDevice speaks UBX + NMEA; ArduPilot's AP_GPS_UBLOX driver will
+  # autoconfigure it once the UART driver wakes up.
+  uart_devices:
+    - peripheral: UART5
+      device: ublox
+      name: gps_ublox
+      mode: ubx
+      lat: 37.7749
+      lon: -122.4194
+      alt: 30.0
+
+  # I2C2 commonly hosts the compass/baro on Pixhawk-class H7 boards.
+  # A register-style sensor and an IMU-style WHOAMI responder cover the
+  # most common probe patterns ArduPilot uses.
+  i2c_devices:
+    - peripheral: I2C2
+      devices:
+        - type: imu
+          name: imu_invensense
+          address: 0x68
+          whoami_reg: 0x75
+          whoami_value: 0x71  # ICM-20689 / MPU-9250 family
+        - type: register
+          name: compass_ist8310
+          address: 0x0E
+          registers:
+            0x00: 0x10  # WAI
+        - type: register
+          name: baro_ms5611
+          address: 0x77
+          registers:
+            0x00: 0x00
+
+  # FM25V02A 256-Kbit SPI F-RAM on SPI2 — used by ArduPilot for parameter
+  # storage. The image_file persists FRAM contents across runs so the firmware
+  # only has to format it once. With cs_port/cs_pin omitted, the device
+  # latches onto the first GPIO pin to see a falling edge as its CS line.
+  spi_devices:
+    - peripheral: SPI2
+      type: fm25v02a
+      name: storage_fram
+      image_file: arducopter_fram.bin
+
+  gpio_levels:
+    GPIOA:
+      0: low
+    GPIOB:
+      0: low

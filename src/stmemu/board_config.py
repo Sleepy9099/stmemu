@@ -117,7 +117,7 @@ def load_board_config(path: Path) -> dict[str, Any]:
 
 _KNOWN_TOP_KEYS = {
     "target", "emulator", "board", "bus_policy",
-    "uart_devices", "i2c_devices", "gpio_levels", "adc",
+    "uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc",
     "registers", "memory", "breakpoints", "timed_events",
     "startup_commands",
 }
@@ -250,10 +250,10 @@ def apply_board_config(
     if not skip_topology:
         board = config.get("board", {})
         if isinstance(board, dict) and board:
-            messages.extend(_apply_board_topology(board, bus))
-        for key in ("uart_devices", "i2c_devices", "gpio_levels", "adc"):
+            messages.extend(_apply_board_topology(board, bus, base_dir=base_dir))
+        for key in ("uart_devices", "i2c_devices", "spi_devices", "gpio_levels", "adc"):
             if key in config and key not in (board if isinstance(board, dict) else {}):
-                messages.extend(_apply_board_topology({key: config[key]}, bus))
+                messages.extend(_apply_board_topology({key: config[key]}, bus, base_dir=base_dir))
 
     # 3. Register pre-sets
     for reg_cfg in config.get("registers", []):
@@ -316,12 +316,19 @@ def _apply_emulator_settings(
     return msgs
 
 
-def _apply_board_topology(board: dict[str, Any], bus: object) -> list[str]:
+def _apply_board_topology(
+    board: dict[str, Any],
+    bus: object,
+    *,
+    base_dir: Path | None = None,
+) -> list[str]:
     msgs: list[str] = []
     for uart_cfg in board.get("uart_devices", []):
         msgs.append(_attach_uart_device(bus, uart_cfg))
     for i2c_cfg in board.get("i2c_devices", []):
         msgs.append(_attach_i2c_devices(bus, i2c_cfg))
+    for spi_cfg in board.get("spi_devices", []):
+        msgs.append(_attach_spi_device(bus, spi_cfg, base_dir=base_dir))
     for port_name, pins in board.get("gpio_levels", {}).items():
         msgs.append(_set_gpio_levels(bus, port_name, pins))
     for adc_name, adc_cfg in board.get("adc", {}).items():
@@ -519,6 +526,116 @@ def _set_gpio_levels(bus: object, port_name: str, pins: dict) -> str:
         model.set_input_level(pin, high)
         count += 1
     return f"gpio: {port_name} set {count} pin(s)"
+
+
+def _attach_spi_device(
+    bus: object,
+    cfg: dict[str, Any],
+    *,
+    base_dir: Path | None = None,
+) -> str:
+    periph_name = str(cfg.get("peripheral", "")).upper()
+    dev_type = str(cfg.get("type", "")).lower()
+
+    spi_model = bus.model_for_name(periph_name)
+    if spi_model is None:
+        return f"spi: {periph_name} not found"
+    if not hasattr(spi_model, "attach_device"):
+        return f"spi: {periph_name} does not support device attach"
+
+    if dev_type in ("fm25v02a", "fram", "fm25v02"):
+        from stmemu.external.fram import FramFm25v02a
+
+        image_file = cfg.get("image_file") or cfg.get("image")
+        image_path: Path | None = None
+        if image_file:
+            image_path = Path(str(image_file)).expanduser()
+            if base_dir and not image_path.is_absolute():
+                image_path = base_dir / image_path
+
+        dev = FramFm25v02a(
+            name=str(cfg.get("name", "fram")),
+            image_path=image_path,
+        )
+
+        cs_port = cfg.get("cs_port")
+        cs_pin = cfg.get("cs_pin")
+        if cs_port is not None and cs_pin is not None:
+            _wire_spi_cs(bus, dev, str(cs_port).upper(), int(_parse_int(cs_pin)))
+            cs_desc = f" cs={cs_port}.{cs_pin}"
+        else:
+            # Auto-CS: latch onto the first GPIO pin to see a falling edge
+            # and treat that as the device's chip-select for the rest of
+            # the session.
+            _wire_spi_cs_auto(bus, dev)
+            cs_desc = " cs=auto"
+
+        spi_model.attach_device(dev)
+        # Stash a reference on the bus so the shell can find it by name.
+        _spi_devices_register(bus, dev)
+        suffix = ""
+        if image_path is not None:
+            suffix = f" image={image_path.name}"
+        return f"spi: attached fm25v02a '{dev.name}' to {periph_name}{cs_desc}{suffix}"
+
+    return f"spi: unknown device type '{dev_type}'"
+
+
+def _wire_spi_cs(bus: object, device: object, port_name: str, pin: int) -> None:
+    """Drive the device's cs_select/cs_release from GPIO edge events."""
+
+    def _on_edge(event):
+        if str(getattr(event, "source", "")).upper() != port_name:
+            return
+        payload = getattr(event, "payload", None) or {}
+        if int(payload.get("pin", -1)) != pin:
+            return
+        if payload.get("falling"):
+            device.cs_select()
+        elif payload.get("rising"):
+            device.cs_release()
+
+    bus.subscribe("gpio_edge", _on_edge)
+
+
+def _wire_spi_cs_auto(bus: object, device: object) -> None:
+    """CS auto-detection: latch onto whichever GPIO pin first falls.
+
+    Many ArduPilot boards drive the FRAM CS through a GPIO line whose
+    identity we don't know up front. To stay useful without per-board
+    config, listen to every ``gpio_edge`` event and adopt the first pin
+    that goes low as the chip-select. Once latched, only edges on that
+    pin reach the device.
+    """
+    state = {"port": None, "pin": None}
+
+    def _on_edge(event):
+        payload = getattr(event, "payload", None) or {}
+        src = str(getattr(event, "source", "")).upper()
+        pin = int(payload.get("pin", -1))
+        if state["port"] is None:
+            if not payload.get("falling"):
+                return
+            state["port"] = src
+            state["pin"] = pin
+            device.cs_select()
+            return
+        if src != state["port"] or pin != state["pin"]:
+            return
+        if payload.get("falling"):
+            device.cs_select()
+        elif payload.get("rising"):
+            device.cs_release()
+
+    bus.subscribe("gpio_edge", _on_edge)
+
+
+def _spi_devices_register(bus: object, device: object) -> None:
+    table = getattr(bus, "_spi_attached_devices", None)
+    if table is None:
+        table = {}
+        setattr(bus, "_spi_attached_devices", table)
+    table[device.name] = device
 
 
 def _configure_adc(bus: object, adc_name: str, cfg: dict[str, Any]) -> str:
