@@ -446,7 +446,7 @@ def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
         return f"uart: unknown device type '{dev_type}'"
 
     from stmemu.external.serial_line import SerialLine
-    line = SerialLine(dev.name, uart=uart_model, device=dev)
+    line = SerialLine(dev.name, uart=uart_model, device=dev, bus=bus)
     bus.attach_serial_line(line)
     return f"uart: attached {dev_type} '{dev.name}' to {periph_name}"
 
