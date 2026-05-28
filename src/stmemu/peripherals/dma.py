@@ -67,6 +67,11 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
     _stream_ndtr_reload: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _stream_mar_base: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _stream_pos: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _stream_busy: dict[int, bool] = field(default_factory=dict, init=False, repr=False)
+    _pending_requests: list[tuple[int, str, int]] = field(
+        default_factory=list, init=False, repr=False,
+    )
+    _dispatching: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -93,6 +98,24 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             context.bus.add_dma_listener(self)
 
     def on_peripheral_request(self, periph_addr: int, direction: str, size: int = 1) -> None:
+        # Re-entrant requests (e.g. an SPI exchange triggered by a
+        # transferred byte emits another request mid-loop) are queued
+        # and drained after the current dispatch returns.
+        if self._dispatching:
+            self._pending_requests.append((periph_addr, direction, size))
+            return
+        self._dispatching = True
+        try:
+            self._dispatch_request(periph_addr, direction, size)
+            while self._pending_requests:
+                a, d, s = self._pending_requests.pop(0)
+                self._dispatch_request(a, d, s)
+        finally:
+            self._dispatching = False
+
+    def _dispatch_request(
+        self, periph_addr: int, direction: str, size: int = 1,
+    ) -> None:
         dir_map = {"p2m": self._DIR_P2M, "m2p": self._DIR_M2P}
         expected_dir = dir_map.get(direction.lower())
         if expected_dir is None:
@@ -105,10 +128,13 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
             par = self.read_register_value(stream_offset + self._SxPAR)
             actual_dir = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
             if par == periph_addr and actual_dir == expected_dir:
-                if cr & self._SxCR_CIRC:
+                if self._stream_busy.get(stream):
+                    continue
+                self._stream_busy[stream] = True
+                try:
                     self._transfer_one_item(stream)
-                else:
-                    self._execute_transfer(stream)
+                finally:
+                    self._stream_busy[stream] = False
                 break
 
     def write(self, offset: int, size: int, value: int) -> None:
@@ -134,14 +160,37 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         cr = self.read_register_value(stream_offset + self._SxCR)
         ndtr = self.read_register_value(stream_offset + self._SxNDTR) & 0xFFFF
         mar = self.read_register_value(stream_offset + self._SxM0AR)
+        par = self.read_register_value(stream_offset + self._SxPAR)
+        direction = (cr >> self._SxCR_DIR_SHIFT) & self._SxCR_DIR_MASK
         self._stream_ndtr_reload[stream] = ndtr
         self._stream_mar_base[stream] = mar
         self._stream_pos[stream] = 0
 
         if cr & self._SxCR_CIRC:
-            pass
-        else:
-            self._execute_transfer(stream)
+            return
+        # Peripheral DMA (P2M/M2P with PAR inside a mounted peripheral)
+        # waits for the peripheral to assert dma_request; no bulk-on-enable.
+        # M2M and "anonymous" PAR addresses fall through to the existing
+        # bulk-completion path so legacy tests (and pure memcpy DMA) still
+        # auto-complete.
+        if self._is_peripheral_driven(par, direction):
+            return
+        self._execute_transfer(stream)
+
+    def _is_peripheral_driven(self, par: int, direction: int) -> bool:
+        if direction == self._DIR_M2M:
+            return False
+        if not self._context or not getattr(self._context, "bus", None):
+            return False
+        bus = self._context.bus
+        mount_for = getattr(bus, "_mount_for_addr", None)
+        if mount_for is None:
+            return False
+        mounted = mount_for(par)
+        if mounted is None:
+            return False
+        # Don't treat our own DMA controller registers as peripheral DMA.
+        return mounted.model is not self
 
     def _transfer_one_item(self, stream: int) -> None:
         stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
@@ -170,6 +219,7 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
 
         pos += 1
         ndtr = reload - pos
+        circular = bool(cr & self._SxCR_CIRC)
 
         half = reload // 2
         if pos == half and half > 0:
@@ -177,8 +227,16 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
 
         if ndtr <= 0:
             self._set_tcif(stream, cr)
-            pos = 0
-            ndtr = reload
+            if circular:
+                pos = 0
+                ndtr = reload
+            else:
+                # Non-circular: stream completes and clears EN. NDTR stays
+                # at 0 so firmware can observe completion.
+                ndtr = 0
+                self.write_register_value(
+                    stream_offset + self._SxCR, cr & ~self._SxCR_EN,
+                )
             self._emit_dma_event("dma_complete", stream, cr, par, reload * item_size)
 
         self._stream_pos[stream] = pos
@@ -295,6 +353,32 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         self._stream_ndtr_reload.clear()
         self._stream_mar_base.clear()
         self._stream_pos.clear()
+        self._stream_busy.clear()
+        self._pending_requests.clear()
+        self._dispatching = False
+
+    def snapshot_state(self) -> object | None:
+        base = super().snapshot_state()
+        if not isinstance(base, dict):
+            base = {}
+        base["stream_ndtr_reload"] = dict(self._stream_ndtr_reload)
+        base["stream_mar_base"] = dict(self._stream_mar_base)
+        base["stream_pos"] = dict(self._stream_pos)
+        return base
+
+    def restore_state(self, state: object) -> None:
+        super().restore_state(state)
+        if not isinstance(state, dict):
+            return
+        reload = state.get("stream_ndtr_reload")
+        if isinstance(reload, dict):
+            self._stream_ndtr_reload = {int(k): int(v) for k, v in reload.items()}
+        mar = state.get("stream_mar_base")
+        if isinstance(mar, dict):
+            self._stream_mar_base = {int(k): int(v) for k, v in mar.items()}
+        pos = state.get("stream_pos")
+        if isinstance(pos, dict):
+            self._stream_pos = {int(k): int(v) for k, v in pos.items()}
 
 
 def build_dma(peripheral: SvdPeripheral) -> DmaPeripheral:
