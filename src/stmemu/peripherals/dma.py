@@ -138,13 +138,15 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
                 break
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size == 4 and offset == self._LIFCR:
+        if self._access_targets(offset, size, self._LIFCR):
+            clear_mask = self._aligned_write_value(offset, size, self._LIFCR, value)
             current = self.read_register_value(self._LISR)
-            self.write_register_value(self._LISR, current & ~int(value))
+            self.write_register_value(self._LISR, current & ~clear_mask)
             return
-        if size == 4 and offset == self._HIFCR:
+        if self._access_targets(offset, size, self._HIFCR):
+            clear_mask = self._aligned_write_value(offset, size, self._HIFCR, value)
             current = self.read_register_value(self._HISR)
-            self.write_register_value(self._HISR, current & ~int(value))
+            self.write_register_value(self._HISR, current & ~clear_mask)
             return
 
         super().write(offset, size, value)
@@ -152,8 +154,10 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
         for stream in range(8):
             stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE
             cr_offset = stream_offset + self._SxCR
-            if offset == cr_offset and (int(value) & self._SxCR_EN):
-                self._on_stream_enable(stream)
+            if self._access_targets(offset, size, cr_offset):
+                aligned = self._aligned_write_value(offset, size, cr_offset, value)
+                if aligned & self._SxCR_EN:
+                    self._on_stream_enable(stream)
 
     def _on_stream_enable(self, stream: int) -> None:
         stream_offset = self._STREAM_BASE + stream * self._STREAM_STRIDE

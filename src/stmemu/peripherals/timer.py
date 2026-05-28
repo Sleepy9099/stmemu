@@ -78,15 +78,20 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         self._update_irq()
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size == 4 and offset == self._SR:
+        if self._access_targets(offset, size, self._SR):
+            # SR is rc_w0: writing 0 clears a flag, writing 1 keeps it. For a
+            # sub-word write only the written bytes participate; bytes outside
+            # the access keep their current value.
             current = self.read_register_value(self._SR)
-            self.write_register_value(self._SR, current & int(value))
+            aligned = self._aligned_write_value(offset, size, self._SR, value)
+            keep_outside = ~self._written_byte_mask(offset, size, self._SR)
+            self.write_register_value(self._SR, current & (aligned | keep_outside))
             self._update_irq()
             return
 
-        if size == 4 and offset == self._EGR:
+        if self._access_targets(offset, size, self._EGR):
             super().write(offset, size, value)
-            if int(value) & self._EGR_UG:
+            if self._aligned_write_value(offset, size, self._EGR, value) & self._EGR_UG:
                 self.write_register_value(self._CNT, 0)
                 self._prescaler_accum = 0
                 self._on_update_event()

@@ -123,20 +123,21 @@ class I2cPeripheral(GenericRegisterFilePeripheral):
         return super().read(offset, size)
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size == 4 and offset == self._TXDR:
+        if self._access_targets(offset, size, self._TXDR):
+            byte = int(value) & 0xFF
             if self._state == _STATE_TX and self._i2c_bus is not None:
-                ack = self._i2c_bus.write_byte(int(value) & 0xFF)
+                ack = self._i2c_bus.write_byte(byte)
                 if not ack:
                     self._nack = True
                 self._bytes_remaining = max(0, self._bytes_remaining - 1)
             else:
-                self._tx_fifo.append(int(value) & 0xFF)
+                self._tx_fifo.append(byte)
             self._refresh_status()
             self._update_irq()
             return
 
-        if size == 4 and offset == self._ICR:
-            clear_mask = int(value)
+        if self._access_targets(offset, size, self._ICR):
+            clear_mask = self._aligned_write_value(offset, size, self._ICR, value)
             isr = self.read_register_value(self._ISR)
             self.write_register_value(self._ISR, isr & ~clear_mask)
             if clear_mask & self._ISR_NACKF:
@@ -146,7 +147,7 @@ class I2cPeripheral(GenericRegisterFilePeripheral):
 
         super().write(offset, size, value)
 
-        if size == 4 and offset == self._CR2:
+        if self._access_targets(offset, size, self._CR2):
             self._handle_cr2_write()
 
     def _handle_cr2_write(self) -> None:

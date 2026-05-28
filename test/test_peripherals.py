@@ -136,6 +136,33 @@ class GpioTests(unittest.TestCase):
         odr = gpio.read(0x14, 4)
         self.assertEqual(odr & 1, 0)
 
+    def test_bsrr_halfword_set(self) -> None:
+        # Halfword (STRH) write to BSRR low half must still set ODR bits.
+        gpio = self._make_gpio()
+        gpio.write(0x18, 2, 0x0003)
+        self.assertEqual(gpio.read(0x14, 4) & 0x0003, 0x0003)
+
+    def test_bsrr_high_halfword_reset(self) -> None:
+        # The classic reset idiom: STRH to BSRR+2 targets the reset bits [31:16].
+        gpio = self._make_gpio()
+        gpio.write(0x14, 4, 0xFFFF)   # all ODR bits set
+        gpio.write(0x1A, 2, 0x0005)   # reset bits 0 and 2 via BSRR high half
+        odr = gpio.read(0x14, 4)
+        self.assertEqual(odr & 0x0005, 0)
+        self.assertEqual(odr & 0x0002, 0x0002)  # bit 1 untouched
+
+    def test_idr_byte_read_synthesizes_input(self) -> None:
+        # Byte (LDRB) read of IDR must still reflect the synthesized pin levels.
+        gpio = self._make_gpio()
+        moder = 0
+        for pin in (1, 3, 5, 7):
+            moder |= MODE_OUTPUT << (pin * 2)
+        gpio.write(0x00, 4, moder)
+        gpio.write(0x14, 4, 0x00AA)   # ODR
+        self.assertEqual(gpio.read(0x10, 1), 0xAA)        # low byte
+        self.assertEqual(gpio.read(0x11, 1), 0x00)        # next byte
+        self.assertEqual(gpio.read(0x10, 2), 0x00AA)      # halfword
+
 
 class FlashTests(unittest.TestCase):
 
@@ -311,6 +338,12 @@ class I2cTests(unittest.TestCase):
         i2c.write(0x28, 4, 0xAB)
         self.assertEqual(i2c.drain_tx(), bytes([0xAB]))
 
+    def test_write_txdr_byte_captures_data(self) -> None:
+        # DMA-driven I2C TX issues byte writes to TXDR; they must not be dropped.
+        i2c = self._make_i2c()
+        i2c.write(0x28, 1, 0xAB)
+        self.assertEqual(i2c.drain_tx(), bytes([0xAB]))
+
 
 class DmaTests(unittest.TestCase):
 
@@ -345,6 +378,14 @@ class DmaTests(unittest.TestCase):
         dma.write(0x08, 4, 1 << 5)  # Clear TCIF0 via LIFCR
         lisr = dma.read(0x00, 4)
         self.assertFalse(lisr & (1 << 5))
+
+    def test_lifcr_halfword_clears_lisr(self) -> None:
+        # A sub-word write to LIFCR must still clear the targeted flag.
+        dma = self._make_dma()
+        dma.write(0x10, 4, 0x01)  # Enable stream 0 -> sets TCIF0 (bit 5)
+        self.assertTrue(dma.read(0x00, 4) & (1 << 5))
+        dma.write(0x08, 2, 1 << 5)  # halfword clear of low LIFCR half
+        self.assertFalse(dma.read(0x00, 4) & (1 << 5))
 
 
 # ── RCC register definitions ──────────────────────────────────────

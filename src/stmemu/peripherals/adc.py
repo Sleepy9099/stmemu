@@ -84,23 +84,24 @@ class Stm32AdcPeripheral(GenericRegisterFilePeripheral):
         self._trigger_source = ""
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size == 4 and offset == self._ISR:
+        if self._access_targets(offset, size, self._ISR):
+            clear_mask = self._aligned_write_value(offset, size, self._ISR, value)
             isr = self.read_register_value(self._ISR)
-            self.write_register_value(self._ISR, isr & ~int(value))
+            self.write_register_value(self._ISR, isr & ~clear_mask)
             return
 
         super().write(offset, size, value)
 
-        if size == 4 and offset == self._CR:
+        if self._access_targets(offset, size, self._CR):
             self._handle_cr_write()
 
     def read(self, offset: int, size: int) -> int:
-        if size == 4 and offset == self._CR and self._calibration_reads_remaining > 0:
+        if self._access_targets(offset, size, self._CR) and self._calibration_reads_remaining > 0:
             self._calibration_reads_remaining -= 1
             if self._calibration_reads_remaining == 0:
                 cr = self.read_register_value(self._CR)
                 self.write_register_value(self._CR, cr & ~self._CR_ADCAL)
-        if size == 4 and offset == self._DR:
+        if self._access_targets(offset, size, self._DR):
             isr = self.read_register_value(self._ISR)
             self.write_register_value(self._ISR, isr & ~(self._ISR_EOC | self._ISR_EOS))
         return super().read(offset, size)

@@ -66,7 +66,7 @@ class GpioPeripheral(GenericRegisterFilePeripheral):
         self._context = context
 
     def read(self, offset: int, size: int) -> int:
-        if size == 4 and offset == self._IDR:
+        if self._access_targets(offset, size, self._IDR):
             moder = self.read_register_value(self._MODER)
             odr = self.read_register_value(self._ODR) & 0xFFFF
             result = 0
@@ -76,22 +76,27 @@ class GpioPeripheral(GenericRegisterFilePeripheral):
                     result |= odr & (1 << pin)
                 else:
                     result |= self._input_levels & (1 << pin)
-            return result
+            # Stash the synthesized value so the generic handler can slice the
+            # requested byte/halfword/word out of it.
+            self.write_register_value(self._IDR, result)
         return super().read(offset, size)
 
     def write(self, offset: int, size: int, value: int) -> None:
-        if size == 4 and offset == self._BSRR:
+        if self._access_targets(offset, size, self._BSRR):
+            aligned = self._aligned_write_value(offset, size, self._BSRR, value)
             odr_before = self.read_register_value(self._ODR) & 0xFFFF
-            set_bits = int(value) & 0xFFFF
-            reset_bits = (int(value) >> 16) & 0xFFFF
+            set_bits = aligned & 0xFFFF
+            reset_bits = (aligned >> 16) & 0xFFFF
             odr_after = (odr_before | set_bits) & ~reset_bits & 0xFFFF
             self.write_register_value(self._ODR, odr_after)
             self._emit_odr_edges(odr_before, odr_after)
             return
-        if size == 4 and offset == self._ODR:
+        if self._access_targets(offset, size, self._ODR):
             odr_before = self.read_register_value(self._ODR) & 0xFFFF
-            odr_after = int(value) & 0xFFFF
+            # Let the generic handler merge just the written bytes, then read
+            # back the resulting ODR so edge detection sees partial writes.
             super().write(offset, size, value)
+            odr_after = self.read_register_value(self._ODR) & 0xFFFF
             self._emit_odr_edges(odr_before, odr_after)
             return
         super().write(offset, size, value)
