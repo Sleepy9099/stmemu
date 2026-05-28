@@ -3571,6 +3571,67 @@ class Commands:
         self._fuzz_engine.reset()
         return "fuzzer state reset"
 
+    # ── Event trace commands ────────────────────────────────────────
+
+    def cmd_events(self, argv: list[str]) -> str:
+        usage = (
+            "usage: events on|off | events list [n] | events clear | "
+            "events export <file.jsonl> | events count"
+        )
+        if not argv:
+            return usage
+        sub = argv[0].lower()
+
+        if sub in ("on", "off"):
+            if sub == "on":
+                max_events = _int(argv[1]) if len(argv) > 1 else 10000
+                self.emu.enable_event_trace(max_events)
+                return f"event trace on (max {max_events})"
+            else:
+                self.emu.disable_event_trace()
+                return "event trace off"
+
+        if sub == "list":
+            count = _int(argv[1]) if len(argv) > 1 else 20
+            entries = self.emu.event_trace_list(count)
+            if not entries:
+                return "(no events captured)"
+            lines = [f"{len(entries)} event(s) (of {len(self.emu._event_trace)} total):"]
+            for e in entries:
+                parts = [f"  [{e['instruction']:>8d}]"]
+                parts.append(f"0x{e['pc']:08X}")
+                parts.append(e["kind"])
+                if e.get("source"):
+                    parts.append(f"src={e['source']}")
+                payload = e.get("payload")
+                if isinstance(payload, dict):
+                    for k, v in list(payload.items())[:4]:
+                        parts.append(f"{k}={v}")
+                lines.append(" ".join(parts))
+            return "\n".join(lines)
+
+        if sub == "clear":
+            count = self.emu.event_trace_clear()
+            return f"cleared {count} trace event(s)"
+
+        if sub == "export":
+            if len(argv) != 2:
+                return "usage: events export <file.jsonl>"
+            try:
+                count = self.emu.event_trace_export(argv[1])
+            except Exception as e:
+                return f"error: {e}"
+            return f"exported {count} events to {argv[1]}"
+
+        if sub == "count":
+            return (
+                f"trace: {'on' if self.emu.event_trace_enabled else 'off'} "
+                f"events: {len(self.emu._event_trace)} "
+                f"max: {self.emu._event_trace_max}"
+            )
+
+        return usage
+
     # ── RTOS awareness commands ────────────────────────────────────
 
     def cmd_rtos(self, argv: list[str]) -> str:
