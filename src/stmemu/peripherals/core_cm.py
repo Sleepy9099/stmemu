@@ -71,7 +71,6 @@ class CortexMCorePeripheral(RegisterPeripheral):
             RegisterSpec(
                 name="DWT.CYCCNT",
                 offset=self._DWT_CYCCNT,
-                on_read=self._on_read_cyccnt,
             )
         )
         self.add_register(RegisterSpec(name="SysTick.CTRL", offset=self._SYST_CSR))
@@ -86,7 +85,6 @@ class CortexMCorePeripheral(RegisterPeripheral):
             RegisterSpec(
                 name="SysTick.VAL",
                 offset=self._SYST_CVR,
-                on_read=self._on_read_systick_val,
                 on_write=self._on_write_systick_val,
             )
         )
@@ -290,10 +288,6 @@ class CortexMCorePeripheral(RegisterPeripheral):
                 self.set_system_pending("SysTick", True)
         self.write_register_value(self._SYST_CVR, value)
 
-    def _on_read_cyccnt(self, current: int) -> int:
-        self.tick(10)
-        return self.read_register_value(self._DWT_CYCCNT)
-
     def _on_read_icsr(self, current: int) -> int:
         return self._build_icsr_value()
 
@@ -310,10 +304,6 @@ class CortexMCorePeripheral(RegisterPeripheral):
         if next_value & (1 << 31):
             self.set_system_pending("NMI", True)
         return self._build_icsr_value()
-
-    def _on_read_systick_val(self, current: int) -> int:
-        self.tick(1)
-        return self.read_register_value(self._SYST_CVR)
 
     def _on_write_systick_load(self, current: int, next_value: int) -> int:
         return next_value & 0x00FFFFFF
