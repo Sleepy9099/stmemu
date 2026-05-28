@@ -47,10 +47,20 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
     # CR1 flags (legacy)
     _CR1_SPE = 1 << 6   # SPI enable
 
+    # CR2 flags (legacy)
+    _CR2_RXDMAEN = 1 << 0  # RX buffer DMA enable
+    _CR2_TXDMAEN = 1 << 1  # TX buffer DMA enable
+
     # H7 CR1 flags
     _H7_CR1_SPE = 1 << 0      # SPI enable
     _H7_CR1_CSTART = 1 << 9   # Master transfer start (self-clearing on EOT)
     _H7_CR1_CSUSP = 1 << 10   # Master transfer suspend (self-clearing on EOT)
+
+    # H7 CFG1 fields. On the H7 layout the DMA enable bits live in CFG1
+    # rather than CR2; the bits are TXDMAEN=15, RXDMAEN=14 per RM0433.
+    _H7_CFG1: int | None = None
+    _H7_CFG1_TXDMAEN = 1 << 15
+    _H7_CFG1_RXDMAEN = 1 << 14
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -68,6 +78,8 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
                 self._TXDR = reg.offset
             elif rname == "RXDR":
                 self._RXDR = reg.offset
+            elif rname == "CFG1":
+                self._H7_CFG1 = reg.offset
         # When the SVD provides split TX/RX (H7), suppress the legacy
         # combined DR so writes to that offset don't accidentally clock
         # the bus — on H7 0x0C is the CFG2 register.
@@ -92,6 +104,10 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         if self._is_data_read(offset):
             value = self._rx_fifo.popleft() if self._rx_fifo else 0
             self._refresh_status()
+            # If RX DMA is enabled and the FIFO still has data, signal
+            # another drain request so DMA keeps consuming bytes.
+            if self._rx_fifo:
+                self._emit_dma_request_rx()
             return value
         if offset == self._SR:
             self._refresh_status()
@@ -104,6 +120,10 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
             miso = self._exchange_with_selected(byte)
             self._rx_fifo.append(miso)
             self._refresh_status()
+            # A byte just landed in the RX FIFO — drain via RX DMA, then
+            # ask DMA for the next TX byte if TX DMA is enabled.
+            self._emit_dma_request_rx()
+            self._emit_dma_request_tx()
             return
         super().write(offset, size, value)
         if offset == self._CR1:
@@ -116,6 +136,12 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
                 if cleared != cr1:
                     self.write_register_value(self._CR1, cleared)
             self._refresh_status()
+            self._kick_dma_on_enable()
+        elif offset == self._CR2 or (
+            self._H7_CFG1 is not None and offset == self._H7_CFG1
+        ):
+            self._refresh_status()
+            self._kick_dma_on_enable()
 
     def _exchange_with_selected(self, byte: int) -> int:
         """Route MOSI to whichever attached slave currently has CS asserted.
@@ -180,6 +206,94 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
             # BSY stays 0 (transfers complete instantly)
         self.write_register_value(self._SR, sr)
 
+    def _data_register_address(self) -> int | None:
+        """Return the absolute bus address peripherals would point PAR at."""
+        if self._context is None:
+            return None
+        if self._RXDR is not None:
+            return self._context.base + self._RXDR
+        if self._DR >= 0:
+            return self._context.base + self._DR
+        return None
+
+    def _tx_register_address(self) -> int | None:
+        if self._context is None:
+            return None
+        if self._TXDR is not None:
+            return self._context.base + self._TXDR
+        if self._DR >= 0:
+            return self._context.base + self._DR
+        return None
+
+    def _dma_flags(self) -> tuple[bool, bool]:
+        """Return (rxdma_enabled, txdma_enabled) honoring legacy/H7 layouts."""
+        if self._H7_CFG1 is not None:
+            cfg1 = self.read_register_value(self._H7_CFG1)
+            return (
+                bool(cfg1 & self._H7_CFG1_RXDMAEN),
+                bool(cfg1 & self._H7_CFG1_TXDMAEN),
+            )
+        cr2 = self.read_register_value(self._CR2)
+        return (bool(cr2 & self._CR2_RXDMAEN), bool(cr2 & self._CR2_TXDMAEN))
+
+    def _emit_dma_request_rx(self) -> None:
+        if self._context is None or self._context.bus is None:
+            return
+        rx_en, _ = self._dma_flags()
+        if not rx_en or not self._rx_fifo:
+            return
+        addr = self._data_register_address()
+        if addr is not None:
+            self._context.bus.request_dma(
+                addr, "p2m", size=1, source=self._context.name,
+            )
+
+    def _emit_dma_request_tx(self) -> None:
+        if self._context is None or self._context.bus is None:
+            return
+        _, tx_en = self._dma_flags()
+        if not tx_en:
+            return
+        addr = self._tx_register_address()
+        if addr is not None:
+            self._context.bus.request_dma(
+                addr, "m2p", size=1, source=self._context.name,
+            )
+
+    def _kick_dma_on_enable(self) -> None:
+        """Fire an initial TX DMA request after a CR1/CR2/CFG1 write.
+
+        Real silicon starts asserting the TX DMA request line as soon as
+        SPE and TXDMAEN are both set, because the TX shift register is
+        empty. We emulate that by emitting one M2P request here; the DMA
+        stream will keep pulling bytes via the per-exchange chain.
+        """
+        if not self._spi_dma_active():
+            return
+        self._emit_dma_request_tx()
+
+    def _spi_dma_active(self) -> bool:
+        if self._context is None:
+            return False
+        cr1 = self.read_register_value(self._CR1)
+        if self._TXDR is not None or self._RXDR is not None:
+            return bool(cr1 & self._H7_CR1_SPE)
+        return bool(cr1 & self._CR1_SPE)
+
+    def on_dma_armed(self, offset: int, direction: str) -> None:
+        """Called by DMA when a stream targeting this peripheral arms.
+
+        Handles the firmware order ``configure SPI + DMAEN -> arm streams``:
+        the initial TX request emitted at CR1/CR2/CFG1 write time would
+        otherwise have been dropped because no stream was enabled yet.
+        """
+        if not self._spi_dma_active():
+            return
+        if direction == "m2p" and self._is_data_write(offset):
+            self._emit_dma_request_tx()
+        elif direction == "p2m" and self._is_data_read(offset):
+            self._emit_dma_request_rx()
+
     def drain_tx(self) -> bytes:
         data = bytes(self._tx_fifo)
         self._tx_fifo.clear()
@@ -188,7 +302,11 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
     def inject_rx(self, data: bytes) -> None:
         for b in data:
             self._rx_fifo.append(int(b) & 0xFF)
-        self._refresh_status()
+            self._refresh_status()
+            self._emit_dma_request_rx()
+        # Final refresh covers the empty-input case.
+        if not data:
+            self._refresh_status()
 
     def reset(self) -> None:
         super().reset()
