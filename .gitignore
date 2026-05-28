@@ -4,3 +4,10 @@ __pycache__/
 src/stmemu.egg-info/
 svd/
 cmsis-svd-stm32/
+
+# Test/iteration artifacts that are session-local
+test/*.log
+test/*.snap
+test/arducopter_fram.bin
+.claude/
+.venv/

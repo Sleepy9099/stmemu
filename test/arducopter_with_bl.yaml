@@ -6,10 +6,11 @@ target:
   sram_size: 0x80000
 
 emulator:
-  # tick_scale=1 → peripheral timers advance one cycle per emulated
-  # instruction. Higher values cause TIM2 to fire so often the scheduler
-  # starves user threads.
-  tick_scale: 1
+  # tick_scale trades emulated time per instruction. Values >1 make the
+  # firmware see clock progress faster, so chThdSleepMilliseconds() and
+  # similar boot delays elapse in fewer emulated instructions. Too high
+  # (~1000) and TIM2 ticks every instruction, starving user threads.
+  tick_scale: 10
   stuck_threshold: 200000
   interrupt_stuck_threshold: 500000000
   bus_policy: permissive
@@ -37,9 +38,9 @@ board:
       cs_port: GPIOC
       cs_pin: 14
 
-    # FM25V02A FRAM on SPI2. The ArduPilot board config maps this to the
-    # parameter storage chip. cs=auto latches onto the first GPIO falling
-    # edge as its CS line since this is the only SPI2 slave.
+    # FM25V02A FRAM on SPI2. Only slave on this bus, so dispatch routes
+    # all SPI2 bytes to it whether or not a GPIO falling edge has been
+    # observed yet.
     - peripheral: SPI2
       type: fm25v02a
       name: storage_fram
@@ -48,8 +49,8 @@ board:
   # ── On-board I2C ──────────────────────────────────────────────
   #
   # ArduPilot "I2C bus 0" maps to STM32 I2C4 on Pixhawk-class H7 boards
-  # (PD12 SCL / PD13 SDA). The MS5611 baro is strapped at either 0x76 or
-  # 0x77 depending on the CSB pin; this board has it at both for redundancy.
+  # (PD12 SCL / PD13 SDA). MS5611 baro is strapped at either 0x76 or 0x77
+  # depending on the CSB pin; this board has it at both for redundancy.
   i2c_devices:
     - peripheral: I2C4
       devices:
