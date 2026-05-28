@@ -6,11 +6,16 @@ target:
   sram_size: 0x80000
 
 emulator:
-  # tick_scale trades emulated time per instruction. Values >1 make the
-  # firmware see clock progress faster, so chThdSleepMilliseconds() and
-  # similar boot delays elapse in fewer emulated instructions. Too high
-  # (~1000) and TIM2 ticks every instruction, starving user threads.
-  tick_scale: 10
+  # tick_scale must stay at 1 for ChibiOS H7. ChibiOS's stSetAlarm() in
+  # st_lld_serve_interrupt does:
+  #   write CCR1 = CNT + 10
+  #   read CNT
+  #   if (CNT - prev) >= 10 -> retry with longer alarm, up to 10 tries
+  # Each instruction advances CNT by tick_scale cycles, so tick_scale > 1
+  # means CCR1 is already in the past by the time CNT is re-read.
+  # ChibiOS retries until it gives up, then CC1IF is permanently set
+  # against a stale CCR1 and IRQ28 (TIM2 CC1) fires forever.
+  tick_scale: 1
   stuck_threshold: 200000
   interrupt_stuck_threshold: 500000000
   bus_policy: permissive
