@@ -6,18 +6,31 @@ target:
   sram_size: 0x80000
 
 emulator:
-  # tick_scale=1000. Sounds aggressive but the math holds:
-  #   TIM2 prescaler 199 (divider 200) -> CNT advances by tick_scale/200
-  #   ticks per instruction. At 1000 -> 5 CNT per instruction.
-  #   ChibiOS stSetAlarm writes CCR1=CNT+10 then re-reads CNT. Between
-  #   write and read is ~1 instruction (a single LDR), so CNT advances ~5.
-  #   The break check "CNT - iVar3 < 10" still holds (5 < 10). The race
-  #   only triggers above ~tick_scale=2000 where one instruction's worth
-  #   of CNT advance crosses the full alarm window.
+  # tick_scale=10 for the THREADED phase (see hybrid note below).
   #
-  # Boot delay budget at tick_scale=1000: 5s emulated ~= 1M instructions
-  # ~= 50 s wall-clock at our throughput.
-  tick_scale: 1000
+  # The emulator runs ChibiOS's own software scheduler as guest code.
+  # TIM2 is a 1 MHz free-running counter (CNT == microseconds); CNT
+  # advances tick_scale/200 ticks per instruction. So a
+  # delay_microseconds(1000) sleep == 200000/tick_scale instructions,
+  # while a context switch is ~100-300 instructions.
+  #
+  # ArduPilot's main_loop() drops the main thread to APM_STARTUP_PRIORITY
+  # (10) right before hal_initialized() + setup(), well below the
+  # timer/rcout threads (181). At high tick_scale a 1 ms sleep is only
+  # ~200 instructions -- comparable to switch overhead -- so the
+  # high-priority threads never leave a gap and the prio-10 startup
+  # thread STARVES, never reaching setup(). At tick_scale<=10 sleeps
+  # dominate (>=20000 instr/ms) so the high-prio threads idle ~99% of the
+  # time and main runs. Confirmed: tick_scale=1000 never reaches setup()
+  # in 250 s emulated; tick_scale=10 reaches it in <2 min wall.
+  #
+  # HYBRID PATTERN for speed: boot to main() at tick_scale=1000
+  #   stmemu ... --cmd "reg set sp 0x24000600; reg set pc 0x08020DE9;
+  #                     run 15000000; snap export at_main test/at_main.snap"
+  #   (~13 s to reach main). Then drive the threaded/setup phase from
+  #   that snapshot with `tickscale 10`. Best of both: fast boot, correct
+  #   scheduling. This file keeps tick_scale=10 as the safe default.
+  tick_scale: 10
   # Generous stuck thresholds: ArduPilot's Scheduler::delay_microseconds is
   # a tight busy-wait reading TIM2.CNT, which trips the same-PC counter.
   stuck_threshold: 10000000
