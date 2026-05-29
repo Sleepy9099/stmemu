@@ -93,6 +93,19 @@ class SdmmcPeripheral(GenericRegisterFilePeripheral):
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
 
+    def read(self, offset: int, size: int) -> int:
+        if offset == self._STAR:
+            # If a command was previously issued (CPSMEN was set in CMDR)
+            # and CMDSENT/CTIMEOUT haven't been flagged yet, settle them
+            # now. Handles snapshots taken mid-poll where the write-side
+            # hook never ran.
+            cmd_value = self.read_register_value(self._CMDR)
+            if cmd_value & _CMDR_CPSMEN:
+                star = self.read_register_value(self._STAR)
+                if not (star & (_STAR_CMDSENT | _STAR_CMDREND | _STAR_CTIMEOUT)):
+                    self._on_command(cmd_value)
+        return super().read(offset, size)
+
     def write(self, offset: int, size: int, value: int) -> None:
         if offset == self._ICR:
             # Clear corresponding STAR bits.
