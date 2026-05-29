@@ -6,18 +6,18 @@ target:
   sram_size: 0x80000
 
 emulator:
-  # tick_scale=100 is safe for ChibiOS H7:
-  #   TIM2 prescaler 199 (divider 200), so CNT advances by tick_scale/200
-  #   ticks per instruction. At 100 -> 1 CNT per 2 instructions.
-  #   ChibiOS stSetAlarm() writes CCR1=CNT+10 then re-reads CNT. Between
-  #   the two ops ~3 instructions elapse, so CNT advances ~1 -- the break
-  #   check "CNT - iVar3 < 10" holds, no race. (tick_scale would need to
-  #   exceed ~600 before each instruction crossed a full 10-CNT alarm
-  #   window.)
+  # tick_scale=1000. Sounds aggressive but the math holds:
+  #   TIM2 prescaler 199 (divider 200) -> CNT advances by tick_scale/200
+  #   ticks per instruction. At 1000 -> 5 CNT per instruction.
+  #   ChibiOS stSetAlarm writes CCR1=CNT+10 then re-reads CNT. Between
+  #   write and read is ~1 instruction (a single LDR), so CNT advances ~5.
+  #   The break check "CNT - iVar3 < 10" still holds (5 < 10). The race
+  #   only triggers above ~tick_scale=2000 where one instruction's worth
+  #   of CNT advance crosses the full alarm window.
   #
-  # Boot delay budget at tick_scale=100: 5s emulated ~= 10M instructions
-  # ~= 8 min wall-clock at our throughput.
-  tick_scale: 100
+  # Boot delay budget at tick_scale=1000: 5s emulated ~= 1M instructions
+  # ~= 50 s wall-clock at our throughput.
+  tick_scale: 1000
   # Generous stuck thresholds: ArduPilot's Scheduler::delay_microseconds is
   # a tight busy-wait reading TIM2.CNT, which trips the same-PC counter.
   stuck_threshold: 10000000
