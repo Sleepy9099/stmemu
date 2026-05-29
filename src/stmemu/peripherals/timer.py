@@ -18,6 +18,10 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     _prescaler_accum: int = field(default=0, init=False, repr=False)
     _last_counter: int = field(default=0, init=False, repr=False)
     _update_count: int = field(default=0, init=False, repr=False)
+    # Cached CR1.CEN state so the per-instruction tick() can skip stopped
+    # timers with an attribute check instead of a register read. Kept in sync
+    # wherever CEN can change (CR1 write, one-pulse clear, reset, restore).
+    _running: bool = field(default=False, init=False, repr=False)
 
     _CR1 = 0x00
     _DIER = 0x0C
@@ -36,20 +40,28 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     _SR_CC1IF = 1 << 1
     _EGR_UG = 1 << 0
 
+    def _sync_running(self) -> None:
+        self._running = bool(self.read_register_value(self._CR1) & self._CR1_CEN)
+
     def reset(self) -> None:
         super().reset()
         self._prescaler_accum = 0
         self._last_counter = 0
         self._update_count = 0
+        self._sync_running()
         self._update_irq()
 
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
+        self._sync_running()
 
     def tick(self, cycles: int) -> None:
-        cr1 = self.read_register_value(self._CR1)
-        if not (cr1 & self._CR1_CEN):
+        # Stopped timers are the common case (most TIMs are disabled); skip
+        # them with a cached-flag check, no register read. _running mirrors
+        # CR1.CEN and is resynced on every write that can change it.
+        if not self._running:
             return
+        cr1 = self.read_register_value(self._CR1)
 
         prescaler = self.read_register_value(self._PSC) & 0xFFFF
         divider = max(1, prescaler + 1)
@@ -81,6 +93,7 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         if overflows > 0:
             if one_pulse:
                 self.write_register_value(self._CR1, cr1 & ~self._CR1_CEN)
+                self._running = False
                 self._on_update_event(1)
             elif self.coalesce_updates:
                 # Coalesce into one event carrying the overflow count, so an
@@ -118,6 +131,8 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             return
 
         super().write(offset, size, value)
+        if offset == self._CR1:
+            self._sync_running()
         if offset in {self._CR1, self._DIER, self._CCR1}:
             self._catch_up_compare()
             self._update_irq()
@@ -228,6 +243,7 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         self._prescaler_accum = int(state.get("prescaler_accum", 0))
         self._last_counter = int(state.get("last_counter", 0)) & 0xFFFFFFFF
         self._update_count = int(state.get("update_count", 0))
+        self._sync_running()
         self._update_irq()
 
 

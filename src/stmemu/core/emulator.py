@@ -1675,8 +1675,9 @@ class Emulator:
             if self._deliver_pending_exception():
                 continue
 
-            start = self.pc | 1
-            pre_pc = self.pc & 0xFFFFFFFF
+            cur_pc = self.pc
+            start = cur_pc | 1
+            pre_pc = cur_pc & 0xFFFFFFFF
             self._special_step_consumed = False
             try:
                 self.uc.emu_start(start, self.flash_end, count=1)
