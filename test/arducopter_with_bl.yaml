@@ -18,8 +18,10 @@ emulator:
   # Boot delay budget at tick_scale=100: 5s emulated ~= 10M instructions
   # ~= 8 min wall-clock at our throughput.
   tick_scale: 100
-  stuck_threshold: 200000
-  interrupt_stuck_threshold: 500000000
+  # Generous stuck thresholds: ArduPilot's Scheduler::delay_microseconds is
+  # a tight busy-wait reading TIM2.CNT, which trips the same-PC counter.
+  stuck_threshold: 10000000
+  interrupt_stuck_threshold: 5000000000
   bus_policy: permissive
 
 board:
