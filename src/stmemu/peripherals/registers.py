@@ -21,13 +21,12 @@ class RegisterSpec:
     on_read: Optional[ReadHandler] = None
     on_write: Optional[WriteHandler] = None
 
-    @property
-    def size_bytes(self) -> int:
-        return max(1, (self.size_bits + 7) // 8)
-
-    @property
-    def value_mask(self) -> int:
-        return mask_for_size(self.size_bytes)
+    # size_bytes / value_mask depend only on size_bits and never change after
+    # construction, so precompute them once instead of recomputing the bit math
+    # on every register read (this path runs millions of times per run).
+    def __post_init__(self) -> None:
+        self.size_bytes: int = max(1, (self.size_bits + 7) // 8)
+        self.value_mask: int = mask_for_size(self.size_bytes)
 
 
 class RegisterPeripheral(PeripheralModel):

@@ -119,6 +119,10 @@ class PeripheralBus:
         self._event_subscribers: dict[str, list[EventHandler]] = defaultdict(list)
         self._event_log: list[PeripheralEvent] = []
         self.event_log_enabled: bool = False
+        # Precomputed list of unique models whose tick() actually does work
+        # (timers, core DWT/SysTick, ...). Rebuilt on mount. Lets tick() skip
+        # the per-call dedup and the ~100 no-op ticks every instruction.
+        self._tick_targets: list[PeripheralModel] = []
 
     def register_peripheral(self, name: str, model: PeripheralModel) -> None:
         p = self.amap.find_peripheral_by_name(name)
@@ -144,6 +148,7 @@ class PeripheralBus:
         self._models[name.upper()] = model
         self._mounted.append(mounted)
         self._mounted.sort(key=lambda item: (item.base, item.end - item.base))
+        self._rebuild_tick_targets()
         model.attach(
             PeripheralContext(
                 name=name,
@@ -259,14 +264,33 @@ class PeripheralBus:
     def serial_lines(self) -> dict[str, object]:
         return dict(self._serial_lines)
 
-    def tick(self, cycles: int) -> None:
+    def _rebuild_tick_targets(self) -> None:
+        """Recompute the unique set of models whose tick() does real work.
+
+        Most peripherals inherit the no-op ``RegisterPeripheral.tick`` /
+        ``PeripheralModel.tick``; calling them every instruction (and
+        de-duplicating the mounted list each time) dominated the run cost.
+        We precompute the few models that actually override tick (timers,
+        core DWT/SysTick) once, so the hot path iterates a short list.
+        """
+        from stmemu.peripherals.registers import RegisterPeripheral
+
+        noop_ticks = {PeripheralModel.tick, RegisterPeripheral.tick}
+        targets: list[PeripheralModel] = []
         seen: set[int] = set()
         for mounted in self._mounted:
-            ident = id(mounted.model)
+            model = mounted.model
+            ident = id(model)
             if ident in seen:
                 continue
             seen.add(ident)
-            mounted.model.tick(cycles)
+            if type(model).tick not in noop_ticks:
+                targets.append(model)
+        self._tick_targets = targets
+
+    def tick(self, cycles: int) -> None:
+        for model in self._tick_targets:
+            model.tick(cycles)
         for line in self._serial_lines.values():
             line.tick(cycles)
 

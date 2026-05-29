@@ -1995,10 +1995,19 @@ class Emulator:
         # Treat tight loops as suspicious, but let interrupt-driven idle loops run longer.
         c = self._pc_hist.get(address, 0) + 1
         self._pc_hist[address] = c
-        threshold = self._stuck_loop_threshold()
-        if threshold > 0 and c == threshold:
-            log.error("Likely stuck polling at PC=0x%08X (hit %d times)", address, c)
-            uc.emu_stop()
+        # The effective threshold is always >= stuck_loop_threshold (when set),
+        # so until the repeat count reaches that floor nothing can fire. Skip the
+        # per-instruction NVIC-state probe (pending/enabled IRQs) below it -- this
+        # runs on essentially every instruction.
+        base = self.stuck_loop_threshold
+        floor = base if base > 0 else (
+            self.interrupt_stuck_threshold if self.stuck_loop_auto else 0
+        )
+        if floor > 0 and c >= floor:
+            threshold = self._stuck_loop_threshold()
+            if threshold > 0 and c == threshold:
+                log.error("Likely stuck polling at PC=0x%08X (hit %d times)", address, c)
+                uc.emu_stop()
 
     def _stuck_loop_threshold(self) -> int:
         base = max(0, int(self.stuck_loop_threshold))
