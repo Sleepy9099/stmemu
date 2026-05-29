@@ -60,12 +60,17 @@ board:
       cs_port: GPIOC
       cs_pin: 14
 
-    # FM25V02A FRAM on SPI2. Only slave on this bus, so dispatch routes
-    # all SPI2 bytes to it whether or not a GPIO falling edge has been
-    # observed yet.
+    # FM25V02A FRAM on SPI2. CS is GPIOD.4 (found empirically: the only pin
+    # that toggles during the AP_RAMTRON storage transaction). ArduPilot's
+    # AP_RAMTRON::read brackets the offset-send + data-read with explicit
+    # set_chip_select(true/false), so the device's command framing must
+    # reset on the CS falling edge -- pin it explicitly rather than relying
+    # on auto-CS (which would latch onto the first unrelated GPIO edge).
     - peripheral: SPI2
       type: fm25v02a
       name: storage_fram
+      cs_port: GPIOD
+      cs_pin: 4
       image_file: arducopter_fram.bin
 
   # ── On-board I2C ──────────────────────────────────────────────

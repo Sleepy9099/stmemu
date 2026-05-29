@@ -103,6 +103,40 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             self._catch_up_compare()
             self._update_irq()
 
+    def cycles_until_irq(self) -> int | None:
+        """Cycles until this timer next raises an enabled interrupt.
+
+        Used by the emulator's idle fast-forward: when the CPU is parked in
+        the idle self-loop, time can jump straight to the next timer event
+        instead of single-stepping millions of idle instructions. Returns
+        None when the timer is stopped or has no enabled IRQ source.
+        """
+        cr1 = self.read_register_value(self._CR1)
+        if not (cr1 & self._CR1_CEN):
+            return None
+        dier = self.read_register_value(self._DIER)
+        if not (dier & (self._DIER_UIE | self._DIER_CC1IE)):
+            return None
+        divider = max(1, (self.read_register_value(self._PSC) & 0xFFFF) + 1)
+        cnt = self.read_register_value(self._CNT) & 0xFFFFFFFF
+        arr = self.read_register_value(self._ARR) & 0xFFFFFFFF
+        period = arr + 1 if arr < 0xFFFFFFFF else 0x100000000
+        if period <= 0:
+            return None
+        candidates: list[int] = []
+        if dier & self._DIER_UIE:
+            candidates.append(period - cnt)
+        if dier & self._DIER_CC1IE:
+            ccr1 = self.read_register_value(self._CCR1) & 0xFFFFFFFF
+            d = (ccr1 - cnt) % period
+            candidates.append(d if d != 0 else period)
+        if not candidates:
+            return None
+        ticks = max(0, min(candidates))
+        # Subtract the prescaler cycles already accumulated toward the next tick.
+        cycles = ticks * divider - self._prescaler_accum
+        return max(1, int(cycles))
+
     def _on_update_event(self) -> None:
         self._update_count += 1
         sr = self.read_register_value(self._SR)
