@@ -36,7 +36,8 @@ class I2cPeripheral(GenericRegisterFilePeripheral):
         → on NBYTES reached: ISR.TC set
     """
 
-    irq: int | None = None
+    irq: int | None = None        # event vector (I2Cx_EV)
+    irq_er: int | None = None     # error vector (I2Cx_ER)
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
     _i2c_bus: object | None = field(default=None, init=False, repr=False)
     _tx_fifo: bytearray = field(default_factory=bytearray, init=False, repr=False)
@@ -272,10 +273,17 @@ class I2cPeripheral(GenericRegisterFilePeripheral):
         self.write_register_value(self._ISR, isr)
 
     def _update_irq(self) -> None:
-        if self.irq is None or self._context is None or self._context.interrupts is None:
+        if self._context is None or self._context.interrupts is None:
+            return
+        if self.irq is None:
             return
         cr1 = self.read_register_value(self._CR1)
         isr = self.read_register_value(self._ISR)
+        # All of TXIS/RXNE/NACKF/STOPF/TC/TCR/ADDR are routed to the I2Cx_EV
+        # (event) vector on STM32 (RM0433). Only true bus errors (BERR/ARLO/
+        # OVR) go to I2Cx_ER. We don't model those yet, so the event vector
+        # is what matters -- and it MUST be the _EV irq, not interrupts[0]
+        # which the SVD lists as _ER first.
         pending = bool(
             ((cr1 & self._CR1_TXIE) and (isr & self._ISR_TXIS))
             or ((cr1 & self._CR1_RXIE) and (isr & self._ISR_RXNE))
@@ -330,11 +338,27 @@ class I2cPeripheral(GenericRegisterFilePeripheral):
             self._i2c_bus.restore_state(bus_state)
 
 
-def _first_irq(peripheral: SvdPeripheral) -> Optional[int]:
-    if peripheral.interrupts:
-        return peripheral.interrupts[0].value
-    return None
+def _i2c_irqs(peripheral: SvdPeripheral) -> tuple[Optional[int], Optional[int]]:
+    """Return (event_irq, error_irq) for an STM32 I2C peripheral.
+
+    STM32 splits I2C into two vectors: I2Cx_EV (TXIS/RXNE/TC/STOPF/NACKF/
+    ADDR) and I2Cx_ER (bus errors). The SVD usually lists _ER first, so a
+    naive interrupts[0] picks the wrong one for normal transfers. Match on
+    the name suffix, falling back to the first interrupt for parts that
+    expose a single combined vector.
+    """
+    ev = er = None
+    for intr in peripheral.interrupts:
+        name = intr.name.upper()
+        if name.endswith("_EV") or name.endswith("EV"):
+            ev = intr.value
+        elif name.endswith("_ER") or name.endswith("ER"):
+            er = intr.value
+    if ev is None and peripheral.interrupts:
+        ev = peripheral.interrupts[0].value
+    return ev, er
 
 
 def build_i2c(peripheral: SvdPeripheral) -> I2cPeripheral:
-    return I2cPeripheral(peripheral=peripheral, irq=_first_irq(peripheral))
+    ev, er = _i2c_irqs(peripheral)
+    return I2cPeripheral(peripheral=peripheral, irq=ev, irq_er=er)

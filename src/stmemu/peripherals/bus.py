@@ -270,6 +270,36 @@ class PeripheralBus:
         for line in self._serial_lines.values():
             line.tick(cycles)
 
+    def cycles_until_irq(self) -> Optional[int]:
+        """Minimum cycles until any peripheral raises an enabled interrupt.
+
+        Returns None when no peripheral has a pending future IRQ. Used by the
+        emulator to fast-forward through CPU idle waits (e.g. the ChibiOS idle
+        self-loop) instead of single-stepping every idle instruction.
+        """
+        best: Optional[int] = None
+        seen: set[int] = set()
+        for mounted in self._mounted:
+            ident = id(mounted.model)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            fn = getattr(mounted.model, "cycles_until_irq", None)
+            if fn is None:
+                continue
+            try:
+                c = fn()
+            except Exception:
+                continue
+            if c is None:
+                continue
+            c = int(c)
+            if c < 1:
+                c = 1
+            if best is None or c < best:
+                best = c
+        return best
+
     def snapshot_models_state(self) -> dict[str, object]:
         states: dict[str, object] = {}
         seen: set[int] = set()

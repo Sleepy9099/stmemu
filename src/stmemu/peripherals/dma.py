@@ -21,6 +21,16 @@ _STREAM_FLAG_BITS: dict[int, tuple[int, int, int]] = {
     7: (1, 27, 26),
 }
 
+# Architecturally fixed STM32H7 DMA stream/channel IRQ numbers, used as a
+# fallback when the SVD interrupt names don't resolve to a stream. The H743
+# SVD names streams "DMA2_STR1" etc. and cross-pollutes each controller's
+# interrupt list, so name parsing alone is unreliable.
+_H7_DMA_IRQS: dict[str, dict[int, int]] = {
+    "DMA1": {0: 11, 1: 12, 2: 13, 3: 14, 4: 15, 5: 16, 6: 17, 7: 47},
+    "DMA2": {0: 56, 1: 57, 2: 58, 3: 59, 4: 60, 5: 68, 6: 69, 7: 70},
+    "BDMA": {0: 129, 1: 130, 2: 131, 3: 132, 4: 133, 5: 134, 6: 135, 7: 136},
+}
+
 
 @dataclass
 class DmaPeripheral(GenericRegisterFilePeripheral):
@@ -92,12 +102,50 @@ class DmaPeripheral(GenericRegisterFilePeripheral):
                 self._LIFCR = reg.offset
             elif rname in ("HIFCR",):
                 self._HIFCR = reg.offset
+        self._build_stream_irqs()
+
+    def _build_stream_irqs(self) -> None:
+        """Map per-stream (or per-channel) IRQ numbers.
+
+        The transfer-complete interrupt that wakes a thread blocked in a
+        ChibiOS SPI/UART DMA transfer is delivered on these vectors, so an
+        empty map means do_transfer() times out and the driver reports a
+        failure even though the bytes moved. Match the device's own name
+        plus a STR<i>/STREAM<i>/CH<i>/CHANNEL<i> suffix (the STM32H7 SVD
+        names them e.g. "DMA2_STR1", and pollutes each controller's list
+        with the *other* controller's "DMA_STR<i>" entries, so we must
+        prefer the self-named ones). Fall back to the architecturally fixed
+        STM32H7 table when the SVD names don't resolve.
+        """
+        import re
+
+        pname = self.peripheral.name.upper()
+        self_named: dict[int, int] = {}
+        loose: dict[int, int] = {}
         for intr in self.peripheral.interrupts:
             name = intr.name.upper()
-            for i in range(8):
-                if f"STREAM{i}" in name or f"CH{i}" in name or f"CHANNEL{i}" in name:
-                    self._irqs[i] = intr.value
-                    break
+            m = re.search(r"(?:STREAM|STR|CHANNEL|CH)(\d)", name)
+            if not m:
+                continue
+            i = int(m.group(1))
+            if i > 7:
+                continue
+            if name.startswith(pname):
+                self_named[i] = intr.value
+            else:
+                loose.setdefault(i, intr.value)
+
+        # Prefer self-named (DMA2_STR1), then loose matches, then the fixed
+        # H7 table for any stream still unmapped.
+        for i in range(8):
+            if i in self_named:
+                self._irqs[i] = self_named[i]
+            elif i in loose:
+                self._irqs[i] = loose[i]
+        fallback = _H7_DMA_IRQS.get(pname)
+        if fallback:
+            for i, irq in fallback.items():
+                self._irqs.setdefault(i, irq)
 
     def attach(self, context: PeripheralContext) -> None:
         self._context = context

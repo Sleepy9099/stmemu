@@ -11,3 +11,4 @@ test/*.snap
 test/arducopter_fram.bin
 .claude/
 .venv/
+test/ardupilot-master/

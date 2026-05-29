@@ -6,13 +6,35 @@ target:
   sram_size: 0x80000
 
 emulator:
-  # tick_scale trades emulated time per instruction. Values >1 make the
-  # firmware see clock progress faster, so chThdSleepMilliseconds() and
-  # similar boot delays elapse in fewer emulated instructions. Too high
-  # (~1000) and TIM2 ticks every instruction, starving user threads.
+  # tick_scale=10 for the THREADED phase (see hybrid note below).
+  #
+  # The emulator runs ChibiOS's own software scheduler as guest code.
+  # TIM2 is a 1 MHz free-running counter (CNT == microseconds); CNT
+  # advances tick_scale/200 ticks per instruction. So a
+  # delay_microseconds(1000) sleep == 200000/tick_scale instructions,
+  # while a context switch is ~100-300 instructions.
+  #
+  # ArduPilot's main_loop() drops the main thread to APM_STARTUP_PRIORITY
+  # (10) right before hal_initialized() + setup(), well below the
+  # timer/rcout threads (181). At high tick_scale a 1 ms sleep is only
+  # ~200 instructions -- comparable to switch overhead -- so the
+  # high-priority threads never leave a gap and the prio-10 startup
+  # thread STARVES, never reaching setup(). At tick_scale<=10 sleeps
+  # dominate (>=20000 instr/ms) so the high-prio threads idle ~99% of the
+  # time and main runs. Confirmed: tick_scale=1000 never reaches setup()
+  # in 250 s emulated; tick_scale=10 reaches it in <2 min wall.
+  #
+  # HYBRID PATTERN for speed: boot to main() at tick_scale=1000
+  #   stmemu ... --cmd "reg set sp 0x24000600; reg set pc 0x08020DE9;
+  #                     run 15000000; snap export at_main test/at_main.snap"
+  #   (~13 s to reach main). Then drive the threaded/setup phase from
+  #   that snapshot with `tickscale 10`. Best of both: fast boot, correct
+  #   scheduling. This file keeps tick_scale=10 as the safe default.
   tick_scale: 10
-  stuck_threshold: 200000
-  interrupt_stuck_threshold: 500000000
+  # Generous stuck thresholds: ArduPilot's Scheduler::delay_microseconds is
+  # a tight busy-wait reading TIM2.CNT, which trips the same-PC counter.
+  stuck_threshold: 10000000
+  interrupt_stuck_threshold: 5000000000
   bus_policy: permissive
 
 board:
@@ -38,12 +60,17 @@ board:
       cs_port: GPIOC
       cs_pin: 14
 
-    # FM25V02A FRAM on SPI2. Only slave on this bus, so dispatch routes
-    # all SPI2 bytes to it whether or not a GPIO falling edge has been
-    # observed yet.
+    # FM25V02A FRAM on SPI2. CS is GPIOD.4 (found empirically: the only pin
+    # that toggles during the AP_RAMTRON storage transaction). ArduPilot's
+    # AP_RAMTRON::read brackets the offset-send + data-read with explicit
+    # set_chip_select(true/false), so the device's command framing must
+    # reset on the CS falling edge -- pin it explicitly rather than relying
+    # on auto-CS (which would latch onto the first unrelated GPIO edge).
     - peripheral: SPI2
       type: fm25v02a
       name: storage_fram
+      cs_port: GPIOD
+      cs_pin: 4
       image_file: arducopter_fram.bin
 
   # ── On-board I2C ──────────────────────────────────────────────

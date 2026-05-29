@@ -33,13 +33,15 @@ log = get_logger(__name__)
 
 # JEDEC ID returned in response to RDID (0x9F).
 #
-# Datasheet behavior (Cypress/Infineon revision) is six 0x7F continuation
-# bytes followed by manufacturer 0xC2 (Cypress bank 7), family 0x22, and
-# density 0x08. Real ArduPilot AP_RAMTRON drivers shipped against the
-# original Ramtron part though, and only recognize the four-byte
-# Ramtron-era response: 0x7F 0x03 0x22 0x00. We default to that pattern so
-# unmodified firmware identifies the chip.
-FM25V02A_JEDEC = bytes([0x7F, 0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+# ArduPilot's AP_RAMTRON parses the 9-byte response as a Cypress RDID:
+#   struct cypress_rdid { uint8_t manufacturer[6]; uint8_t memory;
+#                         uint8_t id1; uint8_t id2; };
+# and matches ramtron_ids on id1 (byte 7) and id2 (byte 8) only. For the
+# FM25V02A those are 0x22 / 0x08. So byte 7 MUST be 0x22 and byte 8 MUST be
+# 0x08; bytes 0-6 are not checked for Cypress-type entries. We use the
+# canonical Cypress sequence: six 0x7F continuation codes, 0xC2 (Cypress
+# manufacturer), 0x22 (family), 0x08 (density = 256 Kbit).
+FM25V02A_JEDEC = bytes([0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xC2, 0x22, 0x08])
 
 FM25V02A_SIZE = 32 * 1024  # 32 KiB
 

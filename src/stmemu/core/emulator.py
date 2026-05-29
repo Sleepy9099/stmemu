@@ -161,6 +161,9 @@ class Emulator:
         self._event_trace_max: int = 10000
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
+        # Idle fast-forward: when the CPU spins on a self-branch (`b .`),
+        # jump emulated time to the next timer IRQ instead of single-stepping.
+        self._idle_skip_enabled: bool = True
 
         # Unsupported FP/VFP instructions are emulated as NOPs so firmware can
         # boot, but that can mask real FP side effects. Track how often it
@@ -1649,6 +1652,7 @@ class Emulator:
                 continue
 
             start = self.pc | 1
+            pre_pc = self.pc & 0xFFFFFFFF
             self._special_step_consumed = False
             try:
                 self.uc.emu_start(start, self.flash_end, count=1)
@@ -1667,6 +1671,39 @@ class Emulator:
                 or self.last_event_break is not None
             ):
                 break
+
+            # Idle fast-forward: a self-branch (`b .`) leaves PC unchanged.
+            # That is exactly the ChibiOS idle thread (and any wait-for-IRQ
+            # spin). Rather than single-step millions of idle branches while
+            # the bus ticks tick_scale at a time, jump straight to the next
+            # timer interrupt so the waiting thread wakes promptly. This makes
+            # idle nearly free in wall-clock and lets a low tick_scale (needed
+            # for correct ChibiOS thread scheduling) stay fast.
+            if self._idle_skip_enabled and (self.pc & 0xFFFFFFFF) == pre_pc:
+                self._idle_fast_forward()
+
+    def _idle_fast_forward(self) -> None:
+        # Don't skip while interrupts are masked -- the spin won't be broken by
+        # an IRQ, so jumping time forward would be wrong (and could loop).
+        if UC_ARM_REG_PRIMASK is not None:
+            try:
+                if int(self.uc.reg_read(UC_ARM_REG_PRIMASK)) & 0x1:
+                    return
+            except Exception:
+                pass
+        cyc = self.bus.cycles_until_irq() if hasattr(self.bus, "cycles_until_irq") else None
+        if not cyc or cyc <= self._effective_tick_scale():
+            return
+        # Cap a single jump so a runaway never advances unbounded.
+        cyc = min(int(cyc), 50_000_000)
+        self.bus.tick(cyc)
+        # NOTE: this advances *bus/peripheral* time only. Timed events keyed to
+        # the instruction count are NOT moved forward by the skipped cycles --
+        # idle fast-forward and instruction-count scheduling are not yet on a
+        # unified timebase. _check_timed_events() is still called so any
+        # already-due events fire, but cycle/instruction unification is future
+        # work (tracked for the timer/timebase branch).
+        self._check_timed_events()
 
     def _deliver_pending_exception(self) -> bool:
         if self.core_peripheral is None:
