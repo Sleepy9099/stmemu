@@ -504,7 +504,12 @@ class BoardConfigValidationTests(unittest.TestCase):
     def test_timed_event_missing_at(self):
         cfg = {"timed_events": [{"action": "gpio_inject"}]}
         warnings = validate_config(cfg)
-        self.assertTrue(any("missing 'at'" in w for w in warnings))
+        self.assertTrue(any("missing a deadline" in w for w in warnings))
+
+    def test_timed_event_cycle_deadline_is_valid(self):
+        cfg = {"timed_events": [{"at_cycle": 1000, "action": "gpio_inject"}]}
+        warnings = validate_config(cfg)
+        self.assertFalse(any("deadline" in w for w in warnings))
 
     def test_timed_event_missing_action(self):
         cfg = {"timed_events": [{"at": 100}]}

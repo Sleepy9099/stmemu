@@ -7,6 +7,7 @@ from stmemu.core.disasm import ThumbDisassembler
 from stmemu.core.loader import FirmwareSegment
 from stmemu.core.semihosting import SemihostingHandler, BKPT_SEMIHOST
 from stmemu.core.symbols import SymbolTable
+from stmemu.core.time_engine import EmulatedTime, VALID_MODES
 
 from unicorn import Uc, UcError, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
 from unicorn.arm_const import (
@@ -151,7 +152,7 @@ class Emulator:
         self.last_event_break: dict | None = None
         self._event_breakpoints: list[dict] = []
         self._event_bp_next_id: int = 1
-        self._instruction_count: int = 0
+        self.time = EmulatedTime()
         self._timed_events: list[dict] = []
         self.rtos_trace_enabled: bool = False
         self._rtos_switch_count: int = 0
@@ -161,9 +162,6 @@ class Emulator:
         self._event_trace_max: int = 10000
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
-        # Idle fast-forward: when the CPU spins on a self-branch (`b .`),
-        # jump emulated time to the next timer IRQ instead of single-stepping.
-        self._idle_skip_enabled: bool = True
 
         # Unsupported FP/VFP instructions are emulated as NOPs so firmware can
         # boot, but that can mask real FP side effects. Track how often it
@@ -535,15 +533,32 @@ class Emulator:
 
     @property
     def instruction_count(self) -> int:
-        return self._instruction_count
+        return self.time.instructions
 
     def add_timed_event(self, at: int, action: str, **params) -> dict:
         """Schedule an action at a specific instruction count."""
         evt = {"at": int(at), "action": str(action), "fired": False}
         evt.update(params)
         self._timed_events.append(evt)
-        self._timed_events.sort(key=lambda e: e["at"])
+        self._timed_events.sort(key=lambda e: e.get("at", float("inf")))
         return evt
+
+    def add_timed_event_cycle(self, at_cycle: int, action: str, **params) -> dict:
+        """Schedule an action at a specific emulated cycle deadline.
+
+        Cycle deadlines share the unified timebase, so they fire even when idle
+        fast-forward jumps over millions of instructions (unlike instruction
+        deadlines, which only advance one per executed instruction).
+        """
+        evt = {"at_cycle": int(at_cycle), "action": str(action), "fired": False}
+        evt.update(params)
+        self._timed_events.append(evt)
+        return evt
+
+    def add_timed_event_ms(self, after_ms: float, action: str, **params) -> dict:
+        """Schedule an action ``after_ms`` from now, on the nominal cycle clock."""
+        deadline = self.time.cycles + self.time.ms_to_cycles(after_ms)
+        return self.add_timed_event_cycle(deadline, action, **params)
 
     def list_timed_events(self) -> list[dict]:
         return [dict(e) for e in self._timed_events]
@@ -556,18 +571,27 @@ class Emulator:
     def _check_timed_events(self) -> None:
         if not self._timed_events:
             return
-        ic = self._instruction_count
-        while self._timed_events and self._timed_events[0]["at"] <= ic:
-            evt = self._timed_events[0]
-            if evt["fired"]:
-                self._timed_events.pop(0)
+        ic = self.time.instructions
+        cyc = self.time.cycles
+        fired_any = False
+        for evt in self._timed_events:
+            if evt.get("fired"):
                 continue
-            evt["fired"] = True
-            self._timed_events.pop(0)
-            self._execute_timed_action(evt)
+            at = evt.get("at")
+            at_cycle = evt.get("at_cycle")
+            due = (at is not None and at <= ic) or (at_cycle is not None and at_cycle <= cyc)
+            if due:
+                evt["fired"] = True
+                fired_any = True
+                self._execute_timed_action(evt)
+        if fired_any:
+            self._timed_events = [e for e in self._timed_events if not e.get("fired")]
 
     def _execute_timed_action(self, evt: dict) -> None:
         action = evt.get("action", "")
+        # Events may be scheduled by instruction ("at") or cycle ("at_cycle");
+        # use whichever is present for log/snapshot naming.
+        when = evt.get("at", evt.get("at_cycle", -1))
 
         if action == "gpio_inject":
             port = str(evt.get("port", "")).upper()
@@ -576,7 +600,7 @@ class Emulator:
             model = self.bus.model_for_name(port)
             if model is not None and hasattr(model, "set_input_level"):
                 model.set_input_level(pin, level in ("high", "1", "true"))
-                log.debug("timed@%d: gpio_inject %s pin %d %s", evt["at"], port, pin, level)
+                log.debug("timed@%s: gpio_inject %s pin %d %s", when, port, pin, level)
 
         elif action == "uart_inject":
             periph = str(evt.get("peripheral", "")).upper()
@@ -586,7 +610,7 @@ class Emulator:
                 data = bytes.fromhex(str(hex_data)) if hex_data else b""
                 if data:
                     model.inject_rx_bytes(data)
-                    log.debug("timed@%d: uart_inject %s %dB", evt["at"], periph, len(data))
+                    log.debug("timed@%s: uart_inject %s %dB", when, periph, len(data))
 
         elif action == "adc_sample":
             periph = str(evt.get("peripheral", "")).upper()
@@ -594,7 +618,7 @@ class Emulator:
             if model is not None and hasattr(model, "inject_sample"):
                 value = int(evt.get("value", 0))
                 model.inject_sample(value)
-                log.debug("timed@%d: adc_sample %s %d", evt["at"], periph, value)
+                log.debug("timed@%s: adc_sample %s %d", when, periph, value)
 
         elif action == "event_emit":
             from stmemu.peripherals.bus import PeripheralEvent
@@ -603,15 +627,15 @@ class Emulator:
             self.bus.emit(PeripheralEvent(
                 kind=kind, source=source, payload=evt.get("payload"),
             ))
-            log.debug("timed@%d: event_emit %s source=%s", evt["at"], kind, source)
+            log.debug("timed@%s: event_emit %s source=%s", when, kind, source)
 
         elif action == "snapshot":
-            name = str(evt.get("name", f"timed_{evt['at']}"))
+            name = str(evt.get("name", f"timed_{when}"))
             self.save_snapshot(name)
-            log.debug("timed@%d: snapshot '%s'", evt["at"], name)
+            log.debug("timed@%s: snapshot '%s'", when, name)
 
         else:
-            log.warning("timed@%d: unknown action '%s'", evt["at"], action)
+            log.warning("timed@%s: unknown action '%s'", when, action)
 
     # --- RTOS awareness ---
 
@@ -658,7 +682,7 @@ class Emulator:
                 "psp": self._read_psp(),
                 "control": self._read_control(),
                 "active_depth": len(self._exception_stack),
-                "instruction": self._instruction_count,
+                "instruction": self.time.instructions,
             },
         ))
 
@@ -679,7 +703,7 @@ class Emulator:
                 "msp": self._read_msp(),
                 "control": self._read_control(),
                 "pc": self.pc & 0xFFFFFFFF,
-                "instruction": self._instruction_count,
+                "instruction": self.time.instructions,
             },
         ))
 
@@ -693,7 +717,7 @@ class Emulator:
             "control": self._read_control(),
             "active_exceptions": list(self._exception_stack),
             "exception_depth": len(self._exception_stack),
-            "instruction_count": self._instruction_count,
+            "instruction_count": self.time.instructions,
             "in_handler": bool(self._exception_stack),
         }
 
@@ -713,7 +737,7 @@ class Emulator:
         if not self.event_trace_enabled:
             return
         entry = {
-            "instruction": self._instruction_count,
+            "instruction": self.time.instructions,
             "pc": self.pc & 0xFFFFFFFF,
             "kind": event.kind,
             "source": getattr(event, "source", ""),
@@ -1660,9 +1684,8 @@ class Emulator:
                 if not self._special_step_consumed:
                     raise
             executed += 1
-            self._instruction_count += 1
-            self.bus.tick(self._effective_tick_scale())
-            self._check_timed_events()
+            self.time.instructions += 1
+            self.advance_time(self._effective_tick_scale(), reason="instruction")
 
             if (
                 self.last_mmio_break is not None
@@ -1675,12 +1698,25 @@ class Emulator:
             # Idle fast-forward: a self-branch (`b .`) leaves PC unchanged.
             # That is exactly the ChibiOS idle thread (and any wait-for-IRQ
             # spin). Rather than single-step millions of idle branches while
-            # the bus ticks tick_scale at a time, jump straight to the next
-            # timer interrupt so the waiting thread wakes promptly. This makes
-            # idle nearly free in wall-clock and lets a low tick_scale (needed
-            # for correct ChibiOS thread scheduling) stay fast.
-            if self._idle_skip_enabled and (self.pc & 0xFFFFFFFF) == pre_pc:
+            # time creeps tick_scale at a time, jump straight to the next
+            # scheduled interrupt so the waiting thread wakes promptly.
+            if self.time.idle_fast_forward and (self.pc & 0xFFFFFFFF) == pre_pc:
                 self._idle_fast_forward()
+
+    def advance_time(self, cycles: int, *, reason: str = "step") -> None:
+        """The one canonical path that advances emulated time.
+
+        Every cycle increment — per-instruction stepping, idle fast-forward,
+        an explicit ``time advance`` — flows through here so the cycle counter,
+        all peripheral clocks (core DWT/SysTick, timers, external-device pacing,
+        DMA), and cycle-deadline scheduled events stay on a single timebase.
+        """
+        cycles = int(cycles)
+        if cycles <= 0:
+            return
+        self.time.cycles += cycles
+        self.bus.tick(cycles)
+        self._check_timed_events()
 
     def _idle_fast_forward(self) -> None:
         # Don't skip while interrupts are masked -- the spin won't be broken by
@@ -1695,15 +1731,12 @@ class Emulator:
         if not cyc or cyc <= self._effective_tick_scale():
             return
         # Cap a single jump so a runaway never advances unbounded.
-        cyc = min(int(cyc), 50_000_000)
-        self.bus.tick(cyc)
-        # NOTE: this advances *bus/peripheral* time only. Timed events keyed to
-        # the instruction count are NOT moved forward by the skipped cycles --
-        # idle fast-forward and instruction-count scheduling are not yet on a
-        # unified timebase. _check_timed_events() is still called so any
-        # already-due events fire, but cycle/instruction unification is future
-        # work (tracked for the timer/timebase branch).
-        self._check_timed_events()
+        cyc = min(int(cyc), self.time.max_fast_forward_cycles)
+        # NOTE: advancing here moves cycle-domain time (and any at_cycle events)
+        # forward, but NOT the instruction counter -- instruction-count-scheduled
+        # events are intentionally not advanced by skipped idle cycles. Schedule
+        # by cycle (at_cycle / after_ms) when you want idle-jumped time.
+        self.advance_time(cyc, reason="idle_fast_forward")
 
     def _deliver_pending_exception(self) -> bool:
         if self.core_peripheral is None:

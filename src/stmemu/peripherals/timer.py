@@ -11,6 +11,9 @@ from stmemu.svd.model import SvdPeripheral
 @dataclass
 class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     irq: int | None = None
+    # Coalesce a multi-period advance into one update event (default) instead
+    # of emitting one event per overflow ("exact" mode).
+    coalesce_updates: bool = True
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
     _prescaler_accum: int = field(default=0, init=False, repr=False)
     _last_counter: int = field(default=0, init=False, repr=False)
@@ -59,20 +62,34 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         arr = self.read_register_value(self._ARR) & 0xFFFFFFFF
         period = arr + 1 if arr < 0xFFFFFFFF else 0x100000000
         old_counter = self.read_register_value(self._CNT) & 0xFFFFFFFF
-        new_counter = old_counter + steps
+        total = old_counter + steps
 
-        overflowed = new_counter >= period
-        if overflowed:
-            new_counter %= period
-            self._on_update_event()
+        # How many times the counter rolled over ARR during this advance. A
+        # large accelerated jump (idle fast-forward) can cross many periods at
+        # once; we must not silently lose them.
+        overflows = total // period
+        new_counter = total % period
+
+        if overflows > 0:
             if cr1 & self._CR1_OPM:
+                # One-pulse mode: the timer generates a single update and stops,
+                # regardless of how many periods the jump would have spanned.
+                new_counter = 0
                 self.write_register_value(self._CR1, cr1 & ~self._CR1_CEN)
+                self._on_update_event(1)
+            elif self.coalesce_updates:
+                # Coalesce into one event carrying the overflow count, so an
+                # accelerated idle jump doesn't flood the event trace.
+                self._on_update_event(overflows)
+            else:
+                for _ in range(overflows):
+                    self._on_update_event(1)
 
         self.write_register_value(self._CNT, new_counter)
         self._last_counter = new_counter
 
         compare = self.read_register_value(self._CCR1) & 0xFFFFFFFF
-        if self._crossed_compare(old_counter, new_counter if not overflowed else old_counter + steps, compare, period):
+        if self._crossed_compare(old_counter, total, compare, period):
             self.write_register_value(self._SR, self.read_register_value(self._SR) | self._SR_CC1IF)
 
         self._update_irq()
@@ -137,20 +154,21 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         cycles = ticks * divider - self._prescaler_accum
         return max(1, int(cycles))
 
-    def _on_update_event(self) -> None:
-        self._update_count += 1
+    def _on_update_event(self, overflows: int = 1) -> None:
+        self._update_count += max(1, int(overflows))
         sr = self.read_register_value(self._SR)
         self.write_register_value(self._SR, sr | self._SR_UIF)
-        self._emit_update_event()
+        self._emit_update_event(overflows)
         self._update_irq()
 
-    def _emit_update_event(self) -> None:
+    def _emit_update_event(self, overflows: int = 1) -> None:
         if self._context is None or self._context.bus is None:
             return
         self._context.bus.emit(PeripheralEvent(
             kind="timer_update",
             source=self._context.name,
             payload={
+                "overflows": max(1, int(overflows)),
                 "cnt": self.read_register_value(self._CNT),
                 "arr": self.read_register_value(self._ARR),
                 "psc": self.read_register_value(self._PSC),
