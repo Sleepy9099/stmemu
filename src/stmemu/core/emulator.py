@@ -1697,6 +1697,12 @@ class Emulator:
         # Cap a single jump so a runaway never advances unbounded.
         cyc = min(int(cyc), 50_000_000)
         self.bus.tick(cyc)
+        # NOTE: this advances *bus/peripheral* time only. Timed events keyed to
+        # the instruction count are NOT moved forward by the skipped cycles --
+        # idle fast-forward and instruction-count scheduling are not yet on a
+        # unified timebase. _check_timed_events() is still called so any
+        # already-due events fire, but cycle/instruction unification is future
+        # work (tracked for the timer/timebase branch).
         self._check_timed_events()
 
     def _deliver_pending_exception(self) -> bool:

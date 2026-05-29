@@ -235,25 +235,27 @@ class LegacySpiDmaProbeTests(unittest.TestCase):
 
         tx_addr = 0x100
         rx_addr = 0x200
-        # RDID opcode + 4 dummy bytes to clock out the JEDEC response.
-        emu.mem_write(tx_addr, bytes([0x9F, 0x00, 0x00, 0x00, 0x00]))
+        # RDID opcode + 9 dummy bytes to clock out the full JEDEC response.
+        emu.mem_write(tx_addr, bytes([0x9F] + [0x00] * 9))
 
         dr_addr = 0x40013000 + 0x0C
-        rx_cr = _setup_dma_stream(dma, 0, dr_addr, rx_addr, 5, "p2m")
-        tx_cr = _setup_dma_stream(dma, 3, dr_addr, tx_addr, 5, "m2p")
+        rx_cr = _setup_dma_stream(dma, 0, dr_addr, rx_addr, 10, "p2m")
+        tx_cr = _setup_dma_stream(dma, 3, dr_addr, tx_addr, 10, "m2p")
         dma.write(0x10 + 0 * 0x18 + dma._SxCR, 4, rx_cr)
         dma.write(0x10 + 3 * 0x18 + dma._SxCR, 4, tx_cr)
 
         spi.write(0x04, 4, spi._CR2_TXDMAEN | spi._CR2_RXDMAEN)
         spi.write(0x00, 4, spi._CR1_SPE)
 
-        rx = emu.mem_read(rx_addr, 5)
-        # First byte echoes opcode (0xFF), then JEDEC bytes.
-        # AP_RAMTRON expects 0x7F 0x03 0x22 0x00 at offsets 1..4.
-        self.assertEqual(rx[1], 0x7F)
-        self.assertEqual(rx[2], 0x03)
-        self.assertEqual(rx[3], 0x22)
-        self.assertEqual(rx[4], 0x00)
+        rx = emu.mem_read(rx_addr, 10)
+        # rx[0] echoes the opcode (0xFF); rx[1..9] are the 9 JEDEC bytes.
+        # Cypress-style RDID: six 0x7F continuation codes, 0xC2 manufacturer,
+        # then the bytes AP_RAMTRON actually matches for the FM25V02A:
+        # id1=0x22 and id2=0x08.
+        self.assertEqual(list(rx[1:7]), [0x7F] * 6)
+        self.assertEqual(rx[7], 0xC2)
+        self.assertEqual(rx[8], 0x22, "AP_RAMTRON id1 for FM25V02A")
+        self.assertEqual(rx[9], 0x08, "AP_RAMTRON id2 for FM25V02A")
 
 
 # ── DMA completion semantics ────────────────────────────────────

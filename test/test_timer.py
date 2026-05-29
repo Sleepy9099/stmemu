@@ -326,5 +326,52 @@ class TimerShellTests(unittest.TestCase):
         self.assertIn("usage:", out)
 
 
+class TimerCyclesUntilIrqTests(unittest.TestCase):
+    """The cycles_until_irq() hook that drives the emulator idle fast-forward."""
+
+    def test_none_when_stopped(self):
+        bus, tim, nvic = _make_bus_timer()
+        tim.write_register_value(tim._ARR, 99)
+        tim.write_register_value(tim._DIER, tim._DIER_UIE)
+        self.assertIsNone(tim.cycles_until_irq(), "stopped timer reports no IRQ")
+
+    def test_none_without_enabled_irq(self):
+        bus, tim, nvic = _make_bus_timer()
+        tim.write_register_value(tim._ARR, 99)
+        tim.write(tim._CR1, 4, tim._CR1_CEN)
+        self.assertIsNone(tim.cycles_until_irq(), "no UIE/CC1IE -> no IRQ to wait for")
+
+    def test_uie_cycles_until_overflow(self):
+        bus, tim, nvic = _make_bus_timer()
+        tim.write_register_value(tim._ARR, 99)   # period = 100
+        tim.write_register_value(tim._PSC, 0)
+        tim.write_register_value(tim._DIER, tim._DIER_UIE)
+        tim.write(tim._CR1, 4, tim._CR1_CEN)
+        self.assertEqual(tim.cycles_until_irq(), 100)
+
+    def test_prescaler_scales_cycles(self):
+        bus, tim, nvic = _make_bus_timer()
+        tim.write_register_value(tim._ARR, 9)    # period = 10
+        tim.write_register_value(tim._PSC, 3)    # divider = 4
+        tim.write_register_value(tim._DIER, tim._DIER_UIE)
+        tim.write(tim._CR1, 4, tim._CR1_CEN)
+        self.assertEqual(tim.cycles_until_irq(), 40)
+
+    def test_ticking_reported_cycles_raises_irq(self):
+        # The promise the idle fast-forward relies on: jumping exactly
+        # cycles_until_irq() cycles makes the timer's IRQ pending, so the
+        # waiting thread wakes. Also checks the bus aggregates the value.
+        bus, tim, nvic = _make_bus_timer()
+        tim.write_register_value(tim._ARR, 99)
+        tim.write_register_value(tim._PSC, 0)
+        tim.write_register_value(tim._DIER, tim._DIER_UIE)
+        tim.write(tim._CR1, 4, tim._CR1_CEN)
+        cyc = tim.cycles_until_irq()
+        self.assertEqual(bus.cycles_until_irq(), cyc)
+        self.assertFalse(nvic.pending.get(28), "no IRQ before the jump")
+        bus.tick(cyc)
+        self.assertTrue(nvic.pending.get(28), "timer IRQ pends after fast-forward")
+
+
 if __name__ == "__main__":
     unittest.main()
