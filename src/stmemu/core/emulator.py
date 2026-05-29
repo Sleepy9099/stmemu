@@ -968,7 +968,19 @@ class Emulator:
     # ---- memory helpers
 
     def mem_read(self, addr: int, size: int) -> bytes:
-        return bytes(self.uc.mem_read(addr, size))
+        try:
+            return bytes(self.uc.mem_read(addr, size))
+        except UcError:
+            # Reads of erased flash beyond the loaded image return 0xFF on
+            # real silicon. The execution hook lazily maps such pages, but a
+            # direct API read (no hook) must mirror that, or tools/tests that
+            # peek unloaded flash see a fault instead of erased bytes.
+            a = int(addr) & 0xFFFFFFFF
+            n = int(size)
+            if any(lo <= a and a + n <= hi for lo, hi in self._FLASH_WINDOWS):
+                self._maybe_map_flash(a, n)
+                return bytes(self.uc.mem_read(addr, size))
+            raise
 
     def mem_write(self, addr: int, data: bytes) -> None:
         self.uc.mem_write(addr, data)
@@ -1405,6 +1417,8 @@ class Emulator:
     def _hook_unmapped_read(self, uc, access, address, size, value, user_data):
         if self._maybe_map_internal_ram(address, size):
             return True
+        if self._maybe_map_flash(address, size):
+            return True
         log.error("UNMAPPED READ: addr=0x%08X size=%d PC=0x%08X", address, size, self.pc)
         self.record_fault(
             "unmapped_read",
@@ -1470,6 +1484,33 @@ class Emulator:
             except Exception:
                 # Already mapped or overlaps an existing region.
                 continue
+        return mapped
+
+    # STM32 main-flash address window (alias at 0x08000000, up to 8 MB covers
+    # every family incl. H7 dual-bank 2 MB). Reads beyond the loaded image hit
+    # erased flash, which reads back as 0xFF on real silicon -- firmware does
+    # this legitimately (e.g. AP_HAL crash-dump / signature reads near the end
+    # of flash), so map those pages 0xFF-filled instead of faulting.
+    _FLASH_WINDOWS = ((0x08000000, 0x08800000),)
+
+    def _maybe_map_flash(self, address: int, size: int) -> bool:
+        addr = int(address) & 0xFFFFFFFF
+        span = max(1, int(size))
+        start = addr & ~0xFFF
+        end = (addr + span + 0xFFF) & ~0xFFF
+        if not any(lo <= start and end <= hi for lo, hi in self._FLASH_WINDOWS):
+            return False
+        mapped = False
+        for page in range(start, end, 0x1000):
+            try:
+                self.uc.mem_map(page, 0x1000, UC_PROT_ALL)
+            except Exception:
+                # Already mapped (part of the loaded image) -- leave its
+                # contents intact, never overwrite real flash data.
+                continue
+            self.uc.mem_write(page, b"\xFF" * 0x1000)
+            self._dynamic_ram_pages.add(int(page))
+            mapped = True
         return mapped
 
     def _hook_insn_invalid(self, uc, user_data):
