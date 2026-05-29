@@ -6,16 +6,18 @@ target:
   sram_size: 0x80000
 
 emulator:
-  # tick_scale must stay at 1 for ChibiOS H7. ChibiOS's stSetAlarm() in
-  # st_lld_serve_interrupt does:
-  #   write CCR1 = CNT + 10
-  #   read CNT
-  #   if (CNT - prev) >= 10 -> retry with longer alarm, up to 10 tries
-  # Each instruction advances CNT by tick_scale cycles, so tick_scale > 1
-  # means CCR1 is already in the past by the time CNT is re-read.
-  # ChibiOS retries until it gives up, then CC1IF is permanently set
-  # against a stale CCR1 and IRQ28 (TIM2 CC1) fires forever.
-  tick_scale: 1
+  # tick_scale=100 is safe for ChibiOS H7:
+  #   TIM2 prescaler 199 (divider 200), so CNT advances by tick_scale/200
+  #   ticks per instruction. At 100 -> 1 CNT per 2 instructions.
+  #   ChibiOS stSetAlarm() writes CCR1=CNT+10 then re-reads CNT. Between
+  #   the two ops ~3 instructions elapse, so CNT advances ~1 -- the break
+  #   check "CNT - iVar3 < 10" holds, no race. (tick_scale would need to
+  #   exceed ~600 before each instruction crossed a full 10-CNT alarm
+  #   window.)
+  #
+  # Boot delay budget at tick_scale=100: 5s emulated ~= 10M instructions
+  # ~= 8 min wall-clock at our throughput.
+  tick_scale: 100
   stuck_threshold: 200000
   interrupt_stuck_threshold: 500000000
   bus_policy: permissive

@@ -9,6 +9,7 @@ from stmemu.peripherals.bus import PeripheralBus, PeripheralModel
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
 from stmemu.peripherals.dma import build_dma
 from stmemu.peripherals.dmamux import build_dmamux
+from stmemu.peripherals.sdmmc import build_sdmmc
 from stmemu.peripherals.flash import build_flash
 from stmemu.peripherals.exti import ExtiPeripheral, _DEFAULT_EXTI_IRQS
 from stmemu.peripherals.generic import GenericRegisterFilePeripheral
@@ -42,6 +43,7 @@ _PERIPHERAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^DMAMUX\d*$", re.IGNORECASE), "dmamux"),
     (re.compile(r"^DMA\d*$", re.IGNORECASE), "dma"),
     (re.compile(r"^BDMA\d*$", re.IGNORECASE), "dma"),
+    (re.compile(r"^SDMMC\d*$", re.IGNORECASE), "sdmmc"),
     (re.compile(r"^OTG\d?_[A-Z]+_GLOBAL$", re.IGNORECASE), "otg_global"),
     (re.compile(r"^USB_OTG_[A-Z]+$", re.IGNORECASE), "otg_global"),
     (re.compile(r"^EXTI$", re.IGNORECASE), "exti"),
@@ -109,6 +111,7 @@ def create_default_registry() -> PeripheralFactoryRegistry:
     registry.register("__pattern__i2c", build_i2c)
     registry.register("__pattern__dma", build_dma)
     registry.register("__pattern__dmamux", build_dmamux)
+    registry.register("__pattern__sdmmc", build_sdmmc)
     registry.register("__pattern__otg_global", build_otg_global)
 
     def build_exti(peripheral: SvdPeripheral) -> PeripheralModel:
