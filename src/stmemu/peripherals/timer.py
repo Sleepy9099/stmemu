@@ -68,13 +68,18 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         # large accelerated jump (idle fast-forward) can cross many periods at
         # once; we must not silently lose them.
         overflows = total // period
-        new_counter = total % period
+        one_pulse = bool(overflows > 0 and (cr1 & self._CR1_OPM))
+        # One-pulse mode generates a single update then stops, regardless of how
+        # many periods the jump spanned.
+        new_counter = 0 if one_pulse else total % period
+
+        # Settle the counter *before* emitting the update event so its payload
+        # reports the final (wrapped) CNT, not the pre-overflow value.
+        self.write_register_value(self._CNT, new_counter)
+        self._last_counter = new_counter
 
         if overflows > 0:
-            if cr1 & self._CR1_OPM:
-                # One-pulse mode: the timer generates a single update and stops,
-                # regardless of how many periods the jump would have spanned.
-                new_counter = 0
+            if one_pulse:
                 self.write_register_value(self._CR1, cr1 & ~self._CR1_CEN)
                 self._on_update_event(1)
             elif self.coalesce_updates:
@@ -84,9 +89,6 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             else:
                 for _ in range(overflows):
                     self._on_update_event(1)
-
-        self.write_register_value(self._CNT, new_counter)
-        self._last_counter = new_counter
 
         compare = self.read_register_value(self._CCR1) & 0xFFFFFFFF
         if self._crossed_compare(old_counter, total, compare, period):

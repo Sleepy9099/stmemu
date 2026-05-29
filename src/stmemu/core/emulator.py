@@ -1718,6 +1718,28 @@ class Emulator:
         self.bus.tick(cycles)
         self._check_timed_events()
 
+    def _cycles_until_timed_event(self) -> int | None:
+        """Cycles until the nearest pending cycle-deadline timed event.
+
+        Idle fast-forward must not leap past a cycle-scheduled event (which may
+        inject input / pend an IRQ and change execution); it stops at the
+        deadline so the event fires at its proper time.
+        """
+        best: int | None = None
+        now = self.time.cycles
+        for evt in self._timed_events:
+            if evt.get("fired"):
+                continue
+            at_cycle = evt.get("at_cycle")
+            if at_cycle is None:
+                continue
+            delta = int(at_cycle) - int(now)
+            if delta <= 0:
+                return 1
+            if best is None or delta < best:
+                best = delta
+        return best
+
     def _idle_fast_forward(self) -> None:
         # Don't skip while interrupts are masked -- the spin won't be broken by
         # an IRQ, so jumping time forward would be wrong (and could loop).
@@ -1727,11 +1749,16 @@ class Emulator:
                     return
             except Exception:
                 pass
-        cyc = self.bus.cycles_until_irq() if hasattr(self.bus, "cycles_until_irq") else None
-        if not cyc or cyc <= self._effective_tick_scale():
+        irq_cyc = self.bus.cycles_until_irq() if hasattr(self.bus, "cycles_until_irq") else None
+        evt_cyc = self._cycles_until_timed_event()
+        floor = self._effective_tick_scale()
+        # Jump to whichever comes first -- the next peripheral IRQ or the next
+        # cycle-scheduled event -- so neither deadline is overshot.
+        candidates = [c for c in (irq_cyc, evt_cyc) if c is not None and c > floor]
+        if not candidates:
             return
         # Cap a single jump so a runaway never advances unbounded.
-        cyc = min(int(cyc), self.time.max_fast_forward_cycles)
+        cyc = min(min(candidates), self.time.max_fast_forward_cycles)
         # NOTE: advancing here moves cycle-domain time (and any at_cycle events)
         # forward, but NOT the instruction counter -- instruction-count-scheduled
         # events are intentionally not advanced by skipped idle cycles. Schedule

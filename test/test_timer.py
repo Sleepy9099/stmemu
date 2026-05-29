@@ -341,6 +341,7 @@ class TimerMultiOverflowTests(unittest.TestCase):
         updates = [e for e in bus.drain_event_log() if e.kind == "timer_update"]
         self.assertEqual(len(updates), 1, "coalesced into one event")
         self.assertEqual(updates[0].payload["overflows"], 3)
+        self.assertEqual(updates[0].payload["cnt"], 5, "payload reports settled CNT")
 
     def test_multi_overflow_exact_mode_emits_each(self):
         bus, tim, nvic = _make_bus_timer()

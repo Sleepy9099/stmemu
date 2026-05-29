@@ -153,16 +153,26 @@ class TimedEventTests(unittest.TestCase):
         emu.step(2)  # two instructions -> instruction deadline reached
         self.assertEqual(len(seen), 1)
 
-    def test_cycle_event_fires_across_idle_jump(self):
-        # The reviewer's concern: a large idle jump must still fire a cycle
-        # deadline that falls within the jump.
+    def test_idle_fast_forward_stops_at_cycle_event_before_irq(self):
+        # Idle fast-forward must stop at a cycle-event deadline that falls
+        # before the next IRQ, firing it at its proper time (not after leaping
+        # to the IRQ) -- the event may inject input / pend an IRQ.
         emu = _make_emu()
         emu.bus.mount(name="IRQIN", base=0x4000C000, size=0x100, model=_IrqIn(100_000))
         seen = []
-        emu.bus.subscribe("late", lambda e: seen.append(e))
-        emu.add_timed_event_cycle(40_000, "event_emit", kind="late", source="t")
-        emu._idle_fast_forward()  # jumps 100k cycles
-        self.assertEqual(len(seen), 1, "cycle event fires inside the idle jump")
+        emu.bus.subscribe("early", lambda e: seen.append(e))
+        emu.add_timed_event_cycle(40_000, "event_emit", kind="early", source="t")
+        emu._idle_fast_forward()
+        self.assertEqual(emu.time.cycles, 40_000, "stops at the event deadline")
+        self.assertEqual(len(seen), 1)
+
+    def test_idle_fast_forward_targets_irq_when_no_earlier_event(self):
+        # With the event after the IRQ, the jump targets the IRQ first.
+        emu = _make_emu()
+        emu.bus.mount(name="IRQIN", base=0x4000D000, size=0x100, model=_IrqIn(20_000))
+        emu.add_timed_event_cycle(80_000, "event_emit", kind="late", source="t")
+        emu._idle_fast_forward()
+        self.assertEqual(emu.time.cycles, 20_000, "stops at the nearer IRQ")
 
 
 class DwtUnifiedTimeTests(unittest.TestCase):
