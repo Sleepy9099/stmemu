@@ -6,7 +6,8 @@ from stmemu.svd.address_map import build_address_map
 from stmemu.peripherals.factory import build_default_bus
 from stmemu.core.emulator import Emulator
 from stmemu.board_config import load_board_config, apply_board_config
-from unicorn.arm_const import UC_ARM_REG_SP, UC_ARM_REG_R4
+from elf_symbols import parse_elf_symbols, resolve
+from unicorn.arm_const import UC_ARM_REG_R8, UC_ARM_REG_R2
 fw = load_firmware(ROOT/"test/arducopter_with_bl.bin", base_addr=0x08000000)
 dev = load_svd(ROOT/"cmsis-svd-stm32/stm32h7/STM32H743.svd")
 bus, core = build_default_bus(build_address_map(dev), flash_base=0x08000000)
@@ -16,20 +17,30 @@ emu = Emulator(bus=bus, flash_base=0x08000000, firmware_segments=fw.segments, sr
 emu.boot_from_vector_table()
 apply_board_config(load_board_config(ROOT/"test/arducopter_with_bl.yaml"), bus, emu, base_dir=ROOT/"test")
 emu.import_snapshot(str(ROOT/"test/snap_insinit.snap"), name="ins_init"); emu.load_snapshot("ins_init")
-LOOP_CHK=0x08062332
-def v3(sp,off):
-    raw=emu.mem_read((sp+off)&0xFFFFFFFF,12); return struct.unpack("<fff",raw)
-emu.add_breakpoint(LOOP_CHK)
-n=0
-for _ in range(900):
-    if n>=9: break
-    emu.run(400000)
-    if emu.last_pc_break != LOOP_CHK: continue
-    sp=emu.uc.reg_read(UC_ARM_REG_SP)&0xFFFFFFFF
-    j=struct.unpack('<i',emu.mem_read(sp+0x14,4))[0]
-    ncv=int.from_bytes(emu.mem_read(sp+0x1c,4),'little')
-    a0=v3(sp,0x120); a1=v3(sp,0x12c); d0=v3(sp,0x144); d1=v3(sp,0x150)
-    import math
-    ld0=math.sqrt(sum(x*x for x in d0)); ld1=math.sqrt(sum(x*x for x in d1))
-    print(f"j={j:3d} ncv={ncv} | avg0=({a0[0]:+.5f},{a0[1]:+.5f},{a0[2]:+.5f}) |diff0|={ld0:.6f} | avg1=({a1[0]:+.5f},{a1[1]:+.5f},{a1[2]:+.5f}) |diff1|={ld1:.6f}  (thr=0.001745)")
-    n+=1
+syms = parse_elf_symbols(ROOT/"test"/"arducopter.elf")
+def rd(a,n): 
+    try: return emu.mem_read(a&0xFFFFFFFF,n)
+    except Exception: return b"\x00"*n
+def u32(a): return int.from_bytes(rd(a,4),"little")
+def u64(a): return int.from_bytes(rd(a,8),"little")
+BP=0x08176974
+emu.add_breakpoint(BP)
+seen={}
+for _ in range(3000):
+    if len(seen)>=4: break
+    emu.run(120000)
+    if emu.last_pc_break != BP: continue
+    binfo=emu.uc.reg_read(UC_ARM_REG_R8)&0xFFFFFFFF
+    delay=emu.uc.reg_read(UC_ARM_REG_R2)&0xFFFF
+    if binfo in seen and seen[binfo][0]>=3:
+        continue
+    seen.setdefault(binfo,[0,[]]); seen[binfo][0]+=1
+    cbs=[]
+    cb=u32(binfo+0x20); guard=0
+    while cb and guard<8:
+        period=u32(cb+0xc); meth=u32(cb+8)
+        cbs.append((period, resolve(syms, meth|1)))
+        cb=u32(cb); guard+=1
+    seen[binfo][1]=cbs
+    print(f"DeviceBus 0x{binfo:08X}  delay={delay}us  callbacks:")
+    for p,m in cbs: print(f"    period={p:7d}us  {m}")

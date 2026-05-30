@@ -1,4 +1,4 @@
-import sys, struct; from pathlib import Path
+import sys; from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]; sys.path.insert(0, str(ROOT/"src")); sys.path.insert(0, str(ROOT/"test"))
 from stmemu.core.loader import load_firmware
 from stmemu.svd.svd_loader import load_svd
@@ -6,7 +6,6 @@ from stmemu.svd.address_map import build_address_map
 from stmemu.peripherals.factory import build_default_bus
 from stmemu.core.emulator import Emulator
 from stmemu.board_config import load_board_config, apply_board_config
-from unicorn.arm_const import UC_ARM_REG_SP, UC_ARM_REG_R4
 fw = load_firmware(ROOT/"test/arducopter_with_bl.bin", base_addr=0x08000000)
 dev = load_svd(ROOT/"cmsis-svd-stm32/stm32h7/STM32H743.svd")
 bus, core = build_default_bus(build_address_map(dev), flash_base=0x08000000)
@@ -16,20 +15,13 @@ emu = Emulator(bus=bus, flash_base=0x08000000, firmware_segments=fw.segments, sr
 emu.boot_from_vector_table()
 apply_board_config(load_board_config(ROOT/"test/arducopter_with_bl.yaml"), bus, emu, base_dir=ROOT/"test")
 emu.import_snapshot(str(ROOT/"test/snap_insinit.snap"), name="ins_init"); emu.load_snapshot("ins_init")
-LOOP_CHK=0x08062332
-def v3(sp,off):
-    raw=emu.mem_read((sp+off)&0xFFFFFFFF,12); return struct.unpack("<fff",raw)
-emu.add_breakpoint(LOOP_CHK)
-n=0
-for _ in range(900):
-    if n>=9: break
-    emu.run(400000)
-    if emu.last_pc_break != LOOP_CHK: continue
-    sp=emu.uc.reg_read(UC_ARM_REG_SP)&0xFFFFFFFF
-    j=struct.unpack('<i',emu.mem_read(sp+0x14,4))[0]
-    ncv=int.from_bytes(emu.mem_read(sp+0x1c,4),'little')
-    a0=v3(sp,0x120); a1=v3(sp,0x12c); d0=v3(sp,0x144); d1=v3(sp,0x150)
-    import math
-    ld0=math.sqrt(sum(x*x for x in d0)); ld1=math.sqrt(sum(x*x for x in d1))
-    print(f"j={j:3d} ncv={ncv} | avg0=({a0[0]:+.5f},{a0[1]:+.5f},{a0[2]:+.5f}) |diff0|={ld0:.6f} | avg1=({a1[0]:+.5f},{a1[1]:+.5f},{a1[2]:+.5f}) |diff1|={ld1:.6f}  (thr=0.001745)")
-    n+=1
+t2 = bus.model_for_name("TIM2")
+print("TIM2 model:", type(t2).__name__)
+def reg(off): return t2.read_register_value(off)
+for i in range(12):
+    emu.run(50000)
+    cr1=reg(0x00); dier=reg(0x0C); cnt=reg(0x24); psc=reg(0x28); arr=reg(0x2C); ccr1=reg(0x34)
+    cu = t2.cycles_until_irq()
+    busirq = bus.cycles_until_irq()
+    ccdist = (ccr1 - cnt) & 0xFFFFFFFF
+    print(f"[{i}] CEN={cr1&1} DIER=0x{dier:x}(UIE={dier&1},CC1IE={(dier>>1)&1}) cnt={cnt} ccr1={ccr1} (ccr1-cnt={ccdist}) arr={arr} psc={psc} | TIM2.cuI={cu} bus.cuI={busirq}")
