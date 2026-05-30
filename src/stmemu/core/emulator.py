@@ -1192,15 +1192,13 @@ class Emulator:
         }
         return snap
 
-    def snapshot_at(self, name: str, pc: int, *, max_instructions: int = 50_000_000,
-                    label: str = "") -> EmulatorSnapshot:
-        """Run until execution reaches address ``pc``, then snapshot there.
+    def run_until(self, pc: int, *, max_instructions: int = 50_000_000) -> bool:
+        """Run until execution reaches address ``pc``; return True if reached,
+        False if ``max_instructions`` elapsed first.
 
-        The one-liner for the common "boot to this point, then save" pattern we
-        do by hand in every diag. Address-first; pass ``label`` (e.g. a resolved
-        symbol) for the registry. Raises if ``pc`` is not reached within
-        ``max_instructions``. A breakpoint the caller already set at ``pc`` is
-        left intact; one we add is removed afterwards.
+        The address-first "run to symbol" primitive (resolve the symbol to an
+        address yourself; this stays usable on a stripped raw bin). A breakpoint
+        the caller already set at ``pc`` is preserved; one this adds is removed.
         """
         target = int(pc) & ~1
         had_bp = target in self._breakpoints
@@ -1210,7 +1208,19 @@ class Emulator:
         finally:
             if not had_bp:
                 self.remove_breakpoint(target)
-        if self.last_pc_break != target and (int(self.pc) & ~1) != target:
+        return self.last_pc_break == target or (int(self.pc) & ~1) == target
+
+    def snapshot_at(self, name: str, pc: int, *, max_instructions: int = 50_000_000,
+                    label: str = "") -> EmulatorSnapshot:
+        """Run until execution reaches address ``pc``, then snapshot there.
+
+        The one-liner for the common "boot to this point, then save" pattern we
+        do by hand in every diag. Address-first; pass ``label`` (e.g. a resolved
+        symbol) for the registry. Raises if ``pc`` is not reached within
+        ``max_instructions``.
+        """
+        target = int(pc) & ~1
+        if not self.run_until(target, max_instructions=max_instructions):
             raise RuntimeError(
                 f"snapshot_at: PC 0x{target:08X} not reached within "
                 f"{max_instructions} instructions (stopped at 0x{int(self.pc) & ~1:08X})"
