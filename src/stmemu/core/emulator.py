@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
@@ -199,6 +200,12 @@ class Emulator:
         # (e.g. on entering the scheduler loop) via set_active_throttle().
         self._active_throttle: int = 0
         self._throttle_acc: int = 0
+        # Profiling: wall-clock seconds spent in _execute, plus instruction and
+        # cycle baselines so profile_report() measures a window (since the last
+        # reset_profile()) rather than the whole emulator lifetime.
+        self._wall_elapsed: float = 0.0
+        self._profile_instr0: int = 0
+        self._profile_cycles0: int = 0
         self.trace_enabled = False
         self._disasm = ThumbDisassembler()
         # Trace (disasm) options
@@ -472,6 +479,24 @@ class Emulator:
         """
         self._active_throttle = max(0, int(instr_per_us))
         self._throttle_acc = 0
+
+    def reset_profile(self) -> None:
+        """Zero the wall-clock and instruction/cycle baseline so the next
+        :meth:`profile_report` measures only the upcoming run window."""
+        self._wall_elapsed = 0.0
+        self._profile_instr0 = int(self.time.instructions)
+        self._profile_cycles0 = int(self.time.cycles)
+
+    def profile_report(self, resolver=None, *, as_text: bool = True,
+                       top_pcs: int = 8, top_mmio: int = 6):
+        """Execution profile since the last :meth:`reset_profile` (see
+        :mod:`stmemu.core.profiler`): instructions/sec of wall time, the
+        x-real-time acceleration factor, hottest PCs, and MMIO hotspots.
+        Returns formatted text when ``as_text`` (default), else a ProfileReport.
+        ``resolver`` (addr -> name) optionally enriches the hot-PC list."""
+        from stmemu.core.profiler import profile_report as _pr
+        rep = _pr(self, top_pcs=top_pcs, top_mmio=top_mmio)
+        return rep.format(resolver) if as_text else rep
 
     def diagnose_stall(self, resolver=None, *, as_text: bool = True):
         """Explain why execution is stuck (see :mod:`stmemu.core.stall_analyzer`).
@@ -993,6 +1018,7 @@ class Emulator:
         self.last_event_break = None
         self._running = True
         err: Exception | None = None
+        _w0 = time.perf_counter()
         try:
             self._execute(count)
         except Exception as e:
@@ -1000,6 +1026,7 @@ class Emulator:
             if isinstance(e, UcError):
                 self.record_fault("uc_error", detail=str(e))
         finally:
+            self._wall_elapsed += time.perf_counter() - _w0
             self._running = False
             # Flush pending trace output (esp. for trace mmio mode).
             self.flush_trace()
@@ -1013,6 +1040,7 @@ class Emulator:
         self.last_event_break = None
         self._running = True
         err: Exception | None = None
+        _w0 = time.perf_counter()
         try:
             self._execute(max_instructions)
         except Exception as e:
@@ -1020,6 +1048,7 @@ class Emulator:
             if isinstance(e, UcError):
                 self.record_fault("uc_error", detail=str(e))
         finally:
+            self._wall_elapsed += time.perf_counter() - _w0
             self._running = False
             # Flush pending trace output (esp. for trace mmio mode).
             self.flush_trace()
