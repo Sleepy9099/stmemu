@@ -130,7 +130,8 @@ _KNOWN_EMULATOR_KEYS = {
 
 _KNOWN_UART_KEYS = {
     "peripheral", "device", "name", "mode", "lat", "lon", "alt",
-    "speed_knots", "rate_cycles", "ttff_ticks",
+    "speed_knots", "rate_cycles", "ttff_ticks", "faults",
+    "file", "hex", "loop", "tick_cycles", "bytes_per_tick",
 }
 
 _KNOWN_I2C_DEV_KEYS = {
@@ -391,7 +392,7 @@ def _apply_board_topology(
 ) -> list[str]:
     msgs: list[str] = []
     for uart_cfg in board.get("uart_devices", []):
-        msgs.append(_attach_uart_device(bus, uart_cfg))
+        msgs.append(_attach_uart_device(bus, uart_cfg, base_dir=base_dir))
     for i2c_cfg in board.get("i2c_devices", []):
         msgs.append(_attach_i2c_devices(bus, i2c_cfg))
     for spi_cfg in board.get("spi_devices", []):
@@ -521,7 +522,29 @@ def _apply_breakpoints(cfg: dict[str, Any], emu: object) -> list[str]:
 
 # ── Board topology helpers (preserved from V0) ──────────────────
 
-def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
+def _parse_fault_rules(cfg: dict[str, Any]) -> list:
+    """Build FaultRule objects from a device cfg's optional ``faults:`` list."""
+    from stmemu.external.faults import FaultRule
+
+    rules = []
+    for fc in cfg.get("faults", []) or []:
+        if not isinstance(fc, dict):
+            continue
+        reg = fc.get("reg")
+        rules.append(FaultRule(
+            kind=str(fc.get("kind", "corrupt")).lower(),
+            when=str(fc.get("when", "every")).lower(),
+            after=_parse_int(fc.get("after", 0)),
+            every=_parse_int(fc.get("every", 1)),
+            limit=_parse_int(fc.get("limit", 0)),
+            reg=(_parse_int(reg) if reg is not None else None),
+            mask=_parse_int(fc.get("mask", 0xFF)),
+            value=_parse_int(fc.get("value", 0xFF)),
+        ))
+    return rules
+
+
+def _attach_uart_device(bus: object, cfg: dict[str, Any], *, base_dir: Path | None = None) -> str:
     periph_name = str(cfg.get("peripheral", "")).upper()
     dev_type = str(cfg.get("device", "ublox")).lower()
 
@@ -531,7 +554,24 @@ def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
     if not hasattr(uart_model, "inject_rx_bytes"):
         return f"uart: {periph_name} is not a UART"
 
-    if dev_type in ("ublox", "ublox-gps"):
+    if dev_type in ("playback", "replay"):
+        from stmemu.external.playback import PlaybackSerialDevice
+        data = b""
+        if cfg.get("hex"):
+            data = bytes.fromhex("".join(str(cfg["hex"]).split()))
+        elif cfg.get("file"):
+            p = Path(str(cfg["file"])).expanduser()
+            if base_dir is not None and not p.is_absolute():
+                p = base_dir / p
+            data = p.read_bytes()
+        dev = PlaybackSerialDevice(
+            data=data,
+            tick_cycles=_parse_int(cfg.get("tick_cycles", 1000)),
+            bytes_per_tick=_parse_int(cfg.get("bytes_per_tick", 1)),
+            loop=bool(cfg.get("loop", False)),
+        )
+        dev.name = cfg.get("name", f"{periph_name.lower()}_playback")
+    elif dev_type in ("ublox", "ublox-gps"):
         from stmemu.external.ublox import UbloxGpsDevice
         dev = UbloxGpsDevice()
         dev.name = cfg.get("name", f"{periph_name.lower()}_gps")
@@ -549,10 +589,17 @@ def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
     else:
         return f"uart: unknown device type '{dev_type}'"
 
+    fault_rules = _parse_fault_rules(cfg)
+    fault_desc = ""
+    if fault_rules:
+        from stmemu.external.faults import FaultySerialDevice
+        dev = FaultySerialDevice(dev, fault_rules, name=dev.name)
+        fault_desc = f" +{len(fault_rules)} fault(s)"
+
     from stmemu.external.serial_line import SerialLine
     line = SerialLine(dev.name, uart=uart_model, device=dev, bus=bus)
     bus.attach_serial_line(line)
-    return f"uart: attached {dev_type} '{dev.name}' to {periph_name}"
+    return f"uart: attached {dev_type} '{dev.name}' to {periph_name}{fault_desc}"
 
 
 def _attach_i2c_devices(bus: object, cfg: dict[str, Any]) -> str:
@@ -642,6 +689,12 @@ def _attach_spi_device(
     dev, extra = _build_spi_device(dev_type, cfg, base_dir=base_dir)
     if dev is None:
         return f"spi: unknown device type '{dev_type}'"
+
+    fault_rules = _parse_fault_rules(cfg)
+    if fault_rules:
+        from stmemu.external.faults import FaultySpiDevice
+        dev = FaultySpiDevice(dev, fault_rules, name=dev.name)
+        extra += f" +{len(fault_rules)} fault(s)"
 
     cs_port = cfg.get("cs_port")
     cs_pin = cfg.get("cs_pin")
