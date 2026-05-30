@@ -27,7 +27,7 @@ while done<130_000_000:
     emu.run(3_000_000); done+=3_000_000
     c=tr.counts(); uart=sum(v for k,v in c.items() if k.startswith("UART5"))
     et=(emu.time.cycles-t0)/1e6; b=emu.last_pc_break; tag=MILES.get(b) if b else ""
-    print(f"[{done:>9}] et=+{et:7.2f}s pc=0x{emu.pc:08X} uartLines={uart} brk={tag}", flush=True)
+    print(f"[{done:>9}] et=+{et:7.2f}s pc=0x{emu.pc:08X} uartLines={uart} fp={emu._fp_emulated_count} brk={tag}", flush=True)
     if b==0x08043471: print(">>> FATAL"); break
     if b==0x0806280A: print(">>> CAL EXITED"); emu.remove_breakpoint(b)
     elif b in MILES:
