@@ -180,6 +180,13 @@ class I2cPeripheral(GenericRegisterFilePeripheral):
         else:
             ack = True
 
+        ctx = getattr(self, "_context", None)
+        if ctx is not None and ctx.bus is not None and getattr(ctx.bus, "_trace_active", False):
+            ctx.bus._trace({
+                "proto": "i2c", "bus": ctx.name, "addr": addr,
+                "rw": "rd" if is_read else "wr", "nbytes": nbytes, "ack": bool(ack),
+            })
+
         isr = self.read_register_value(self._ISR)
         isr |= self._ISR_BUSY
         isr &= ~(self._ISR_TC | self._ISR_NACKF | self._ISR_STOPF | self._ISR_TXIS | self._ISR_RXNE)

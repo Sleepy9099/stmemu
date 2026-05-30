@@ -326,6 +326,43 @@ class TimerShellTests(unittest.TestCase):
         self.assertIn("usage:", out)
 
 
+class TimerMultiOverflowTests(unittest.TestCase):
+    """A single advance that crosses multiple periods (accelerated idle jump)."""
+
+    def test_multi_overflow_coalesced(self):
+        bus, tim, nvic = _make_bus_timer()
+        bus.event_log_enabled = True
+        tim.write_register_value(tim._ARR, 9)   # period = 10
+        tim.write(tim._CR1, 4, tim._CR1_CEN)
+        tim.tick(35)                             # 3 full periods + 5
+        self.assertEqual(tim._update_count, 3, "all 3 overflows counted")
+        self.assertTrue(tim.read_register_value(tim._SR) & tim._SR_UIF, "UIF set")
+        self.assertEqual(tim.read_register_value(tim._CNT), 5)
+        updates = [e for e in bus.drain_event_log() if e.kind == "timer_update"]
+        self.assertEqual(len(updates), 1, "coalesced into one event")
+        self.assertEqual(updates[0].payload["overflows"], 3)
+        self.assertEqual(updates[0].payload["cnt"], 5, "payload reports settled CNT")
+
+    def test_multi_overflow_exact_mode_emits_each(self):
+        bus, tim, nvic = _make_bus_timer()
+        bus.event_log_enabled = True
+        tim.coalesce_updates = False
+        tim.write_register_value(tim._ARR, 9)
+        tim.write(tim._CR1, 4, tim._CR1_CEN)
+        tim.tick(35)
+        self.assertEqual(tim._update_count, 3)
+        updates = [e for e in bus.drain_event_log() if e.kind == "timer_update"]
+        self.assertEqual(len(updates), 3, "exact mode emits one event per overflow")
+
+    def test_one_pulse_stops_after_first_of_many_overflows(self):
+        bus, tim, nvic = _make_bus_timer()
+        tim.write_register_value(tim._ARR, 9)
+        tim.write(tim._CR1, 4, tim._CR1_CEN | tim._CR1_OPM)
+        tim.tick(35)  # spans 3 periods, but one-pulse stops after the first
+        self.assertEqual(tim._update_count, 1, "OPM = single update regardless of jump")
+        self.assertFalse(tim.read_register_value(tim._CR1) & tim._CR1_CEN, "CEN cleared")
+
+
 class TimerCyclesUntilIrqTests(unittest.TestCase):
     """The cycles_until_irq() hook that drives the emulator idle fast-forward."""
 

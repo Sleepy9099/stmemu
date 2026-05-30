@@ -1970,6 +1970,70 @@ class Commands:
         self.emu.tick_scale = value
         return f"tick_scale = {self.emu.tick_scale}"
 
+    def cmd_time(self, argv: list[str]) -> str:
+        t = getattr(self.emu, "time", None)
+        usage = (
+            "usage: time status | time mode <normal|idle|adaptive|fixed> | "
+            "time scale <cycles> | time advance <cycles> | "
+            "time fastforward [cycles] | time events"
+        )
+        if t is None:
+            return "time system not available"
+        if not argv or argv[0] == "status":
+            st = t.status()
+            return (
+                f"instructions: {st['instructions']}  cycles: {st['cycles']}\n"
+                f"mode: {st['mode']}  tick_scale: {self.emu.tick_scale}  "
+                f"idle_fast_forward: {st['idle_fast_forward']}\n"
+                f"max_fast_forward_cycles: {st['max_fast_forward_cycles']}  "
+                f"coalesce_timer_events: {st['coalesce_timer_events']}"
+            )
+        sub = argv[0]
+        if sub == "mode":
+            if len(argv) < 2:
+                return f"time mode: {t.mode}"
+            mode = argv[1].lower()
+            if mode not in ("normal", "idle", "adaptive", "fixed"):
+                return "mode must be normal|idle|adaptive|fixed"
+            t.mode = mode
+            return f"time mode set to {mode}"
+        if sub == "scale":
+            if len(argv) < 2:
+                return f"tick_scale = {self.emu.tick_scale}"
+            value = _int(argv[1])
+            if value <= 0:
+                return "scale must be >= 1"
+            self.emu.tick_scale = value
+            return f"tick_scale = {value}"
+        if sub == "advance":
+            if len(argv) < 2:
+                return "usage: time advance <cycles>"
+            n = _int(argv[1])
+            self.emu.advance_time(n, reason="manual")
+            return f"advanced {n} cycles -> cycles={t.cycles}"
+        if sub == "fastforward":
+            if len(argv) >= 2:
+                n = _int(argv[1])
+            else:
+                n = self.bus.cycles_until_irq() if hasattr(self.bus, "cycles_until_irq") else None
+                if not n:
+                    return "no scheduled interrupt to fast-forward to"
+            self.emu.advance_time(int(n), reason="fastforward")
+            return f"fast-forwarded {int(n)} cycles -> cycles={t.cycles}"
+        if sub == "events":
+            evts = self.emu.list_timed_events()
+            if not evts:
+                return "no timed events"
+            lines = []
+            for e in evts:
+                if "at" in e:
+                    when = f"@i{e['at']}"
+                else:
+                    when = f"@c{e.get('at_cycle')}"
+                lines.append(f"{when} {e.get('action')}")
+            return "\n".join(lines)
+        return usage
+
     def cmd_addr2reg(self, argv: list[str]) -> str:
         if len(argv) != 1:
             return "usage: addr2reg <addr>"

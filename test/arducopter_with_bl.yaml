@@ -92,6 +92,10 @@ board:
   uart_devices:
     - peripheral: UART5
       device: ublox
+      # 'both': respond to the ArduPilot ublox driver's UBX config (CFG-* ->
+      # ACK-ACK) and stream UBX NAV (PVT/STATUS) + NMEA, so the main-loop GPS
+      # exchange is a real two-way conversation, not just absorbed TX.
+      mode: both
       name: gps_ublox
       mode: ubx
       lat: 37.7749

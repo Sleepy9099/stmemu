@@ -110,6 +110,12 @@ class Stm32UsartPeripheral(GenericRegisterFilePeripheral):
         self._update_irq()
 
     def drain_tx_bytes(self) -> bytes:
+        # Draining an empty TX FIFO changes nothing, so skip the status
+        # refresh / IRQ / DMA-request emit. The serial-line pacing calls this
+        # every instruction; on an idle UART that was re-emitting a TX DMA
+        # request (TXFNF is always set) every cycle for no reason.
+        if not self._tx_fifo:
+            return b""
         data = bytes(self._tx_fifo)
         self._tx_fifo.clear()
         self._refresh_status()

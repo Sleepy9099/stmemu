@@ -57,6 +57,7 @@ class SerialLine:
         if tx_data:
             self._device.on_rx_from_mcu(tx_data)
             self._total_tx_bytes += len(tx_data)
+            self._trace("tx", tx_data)
 
         self._device.tick(cycles)
 
@@ -65,6 +66,16 @@ class SerialLine:
             self._uart.inject_rx_bytes(rx_data)
             self._total_rx_bytes += len(rx_data)
             self._emit_device_tx(rx_data)
+            self._trace("rx", rx_data)
+
+    def _trace(self, direction: str, data: bytes) -> None:
+        bus = self._bus
+        if bus is not None and getattr(bus, "_trace_active", False):
+            dev = self._device.name if self._device else self.name
+            bus._trace({
+                "proto": "uart", "bus": self.name, "device": dev,
+                "dir": direction, "bytes": bytes(data),
+            })
 
     def _emit_device_tx(self, data: bytes) -> None:
         if self._bus is None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
@@ -7,6 +9,7 @@ from stmemu.core.disasm import ThumbDisassembler
 from stmemu.core.loader import FirmwareSegment
 from stmemu.core.semihosting import SemihostingHandler, BKPT_SEMIHOST
 from stmemu.core.symbols import SymbolTable
+from stmemu.core.time_engine import EmulatedTime, VALID_MODES
 
 from unicorn import Uc, UcError, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS
 from unicorn.arm_const import (
@@ -145,13 +148,17 @@ class Emulator:
         self._dynamic_ram_pages: set[int] = set()
         self._snapshot_base_ranges: list[tuple[int, int]] = []
         self._snapshots: dict[str, EmulatorSnapshot] = {}
+        # In-memory registry metadata per snapshot (pc / instructions / cycles /
+        # emulated time / label). Kept separate from EmulatorSnapshot so the
+        # on-disk .snap pickle format stays backward-compatible.
+        self._snapshot_meta: dict[str, dict] = {}
         self.last_mmio_break: dict | None = None
         self.last_watch_break: dict | None = None
         self.last_pc_break: int | None = None
         self.last_event_break: dict | None = None
         self._event_breakpoints: list[dict] = []
         self._event_bp_next_id: int = 1
-        self._instruction_count: int = 0
+        self.time = EmulatedTime()
         self._timed_events: list[dict] = []
         self.rtos_trace_enabled: bool = False
         self._rtos_switch_count: int = 0
@@ -161,9 +168,6 @@ class Emulator:
         self._event_trace_max: int = 10000
         self.auto_fault_report: bool = True
         self.last_fault_report: dict[str, object] | None = None
-        # Idle fast-forward: when the CPU spins on a self-branch (`b .`),
-        # jump emulated time to the next timer IRQ instead of single-stepping.
-        self._idle_skip_enabled: bool = True
 
         # Unsupported FP/VFP instructions are emulated as NOPs so firmware can
         # boot, but that can mask real FP side effects. Track how often it
@@ -176,6 +180,36 @@ class Emulator:
         self._install_hooks()
         self._pc_hist = {}
         self._last_stuck_report = 0
+        # Count of ARMv8-M FP instructions emulated in software (Unicorn lacks
+        # VRINT*/VMAXNM/VMINNM/VCVT{A,N,P,M}); used by the EKF on Cortex-M7.
+        self._fp_emulated_count = 0
+        # Stall diagnostics: when enabled, keep a rolling window of the most
+        # recent MMIO accesses (pc, access, address, size, value) so the stall
+        # analyzer can report *which* register a stuck loop is polling. Off by
+        # default — costs one reg_read + deque append per MMIO access.
+        self.stall_diag_enabled: bool = False
+        self._mmio_ring: deque = deque(maxlen=512)
+        # Real-rate active-execution throttle (opt-in; 0 = disabled, default).
+        # When >0, ACTIVE execution advances 1 cycle (1us at cycle_hz=1MHz)
+        # every `_active_throttle` instructions, instead of tick_scale cycles
+        # every instruction. This models a real CPU running ~_active_throttle
+        # instructions per microsecond (~480 for the H743's 480MHz Cortex-M7),
+        # so a compute task's *measured* duration (micros() before/after) is
+        # realistic instead of ~tick_scale*instr us. Idle is still jumped via
+        # idle_fast_forward, so acceleration is preserved. Needed in the
+        # ArduPilot main loop: AP_Scheduler skips optional tasks (GPS, compass)
+        # when a fast task's measured time exceeds the loop budget — with the
+        # default tick_scale*instr clock the EKF "takes" ~500ms and starves
+        # them; at real rate it takes ~100us and they run. Set live mid-run
+        # (e.g. on entering the scheduler loop) via set_active_throttle().
+        self._active_throttle: int = 0
+        self._throttle_acc: int = 0
+        # Profiling: wall-clock seconds spent in _execute, plus instruction and
+        # cycle baselines so profile_report() measures a window (since the last
+        # reset_profile()) rather than the whole emulator lifetime.
+        self._wall_elapsed: float = 0.0
+        self._profile_instr0: int = 0
+        self._profile_cycles0: int = 0
         self.trace_enabled = False
         self._disasm = ThumbDisassembler()
         # Trace (disasm) options
@@ -419,6 +453,91 @@ class Emulator:
     def clear_mmio_breakpoints(self) -> None:
         self._mmio_breakpoints.clear()
 
+    # ── stall diagnostics ──────────────────────────────────────────────
+
+    def enable_stall_diagnostics(self, *, window: int = 512) -> None:
+        """Start recording recent MMIO accesses for :meth:`diagnose_stall`.
+
+        Keeps a rolling window of the last ``window`` MMIO accesses (pc,
+        access, address, size, value). Cheap but non-zero overhead, so it is
+        opt-in. Call once before running into a suspected stall.
+        """
+        if window != self._mmio_ring.maxlen:
+            self._mmio_ring = deque(self._mmio_ring, maxlen=int(window))
+        self.stall_diag_enabled = True
+
+    def disable_stall_diagnostics(self) -> None:
+        self.stall_diag_enabled = False
+
+    def set_active_throttle(self, instr_per_us: int) -> None:
+        """Pace ACTIVE execution at ~``instr_per_us`` instructions per microsecond.
+
+        0 disables (default: the tick_scale-cycles-per-instruction clock).
+        A positive value (e.g. 480 for the H743's 480MHz core) advances the
+        firmware clock by 1us every ``instr_per_us`` instructions, so a compute
+        task's measured micros() duration is realistic. Idle is still jumped
+        (idle_fast_forward), so boot/idle acceleration is unaffected. Intended
+        to be enabled on entering the ArduPilot scheduler main loop so optional
+        tasks (GPS/compass) are not starved by the EKF overrunning the loop
+        budget under the accelerated clock. Can be set live mid-run.
+        """
+        self._active_throttle = max(0, int(instr_per_us))
+        self._throttle_acc = 0
+
+    def reset_profile(self) -> None:
+        """Zero the wall-clock and instruction/cycle baseline so the next
+        :meth:`profile_report` measures only the upcoming run window."""
+        self._wall_elapsed = 0.0
+        self._profile_instr0 = int(self.time.instructions)
+        self._profile_cycles0 = int(self.time.cycles)
+
+    def profile_report(self, resolver=None, *, as_text: bool = True,
+                       top_pcs: int = 8, top_mmio: int = 6):
+        """Execution profile since the last :meth:`reset_profile` (see
+        :mod:`stmemu.core.profiler`): instructions/sec of wall time, the
+        x-real-time acceleration factor, hottest PCs, and MMIO hotspots.
+        Returns formatted text when ``as_text`` (default), else a ProfileReport.
+        ``resolver`` (addr -> name) optionally enriches the hot-PC list."""
+        from stmemu.core.profiler import profile_report as _pr
+        rep = _pr(self, top_pcs=top_pcs, top_mmio=top_mmio)
+        return rep.format(resolver) if as_text else rep
+
+    def diagnose_stall(self, resolver=None, *, as_text: bool = True):
+        """Explain why execution is stuck (see :mod:`stmemu.core.stall_analyzer`).
+
+        Returns the formatted report string (``as_text=True``, default) or the
+        :class:`~stmemu.core.stall_analyzer.StallReport` object. ``resolver`` is
+        an optional ``addr -> name`` callable for symbol enrichment; omit it for
+        a pure address report on a stripped binary.
+        """
+        from stmemu.core.stall_analyzer import analyze_stall
+
+        report = analyze_stall(self)
+        return report.format(resolver) if as_text else report
+
+    # ── transaction tracing ────────────────────────────────────────────
+
+    def enable_tracing(self, sources=None, *, decode: bool = True, limit: int = 20000):
+        """Install a decoded bus-transaction tracer (see :mod:`stmemu.peripherals.tracer`).
+
+        ``sources`` filters by bus/device name (e.g. ``["SPI1", "UART5"]`` or
+        ``["icm42688"]``); ``None`` traces everything. Returns the tracer; read
+        ``tracer.dump()`` / ``tracer.counts()`` afterwards.
+        """
+        from stmemu.peripherals.tracer import BusTracer
+
+        tracer = BusTracer(sources=sources, decode=decode, limit=limit)
+        tracer.install(self.bus)
+        self.tracer = tracer
+        return tracer
+
+    def disable_tracing(self):
+        tracer = getattr(self, "tracer", None)
+        if tracer is not None:
+            tracer.stop(self.bus)
+        self.tracer = None
+        return tracer
+
     @staticmethod
     def _normalize_watch_access(access: str) -> str:
         chars = {c for c in str(access).lower().strip() if c in "rwx"}
@@ -535,15 +654,32 @@ class Emulator:
 
     @property
     def instruction_count(self) -> int:
-        return self._instruction_count
+        return self.time.instructions
 
     def add_timed_event(self, at: int, action: str, **params) -> dict:
         """Schedule an action at a specific instruction count."""
         evt = {"at": int(at), "action": str(action), "fired": False}
         evt.update(params)
         self._timed_events.append(evt)
-        self._timed_events.sort(key=lambda e: e["at"])
+        self._timed_events.sort(key=lambda e: e.get("at", float("inf")))
         return evt
+
+    def add_timed_event_cycle(self, at_cycle: int, action: str, **params) -> dict:
+        """Schedule an action at a specific emulated cycle deadline.
+
+        Cycle deadlines share the unified timebase, so they fire even when idle
+        fast-forward jumps over millions of instructions (unlike instruction
+        deadlines, which only advance one per executed instruction).
+        """
+        evt = {"at_cycle": int(at_cycle), "action": str(action), "fired": False}
+        evt.update(params)
+        self._timed_events.append(evt)
+        return evt
+
+    def add_timed_event_ms(self, after_ms: float, action: str, **params) -> dict:
+        """Schedule an action ``after_ms`` from now, on the nominal cycle clock."""
+        deadline = self.time.cycles + self.time.ms_to_cycles(after_ms)
+        return self.add_timed_event_cycle(deadline, action, **params)
 
     def list_timed_events(self) -> list[dict]:
         return [dict(e) for e in self._timed_events]
@@ -556,18 +692,27 @@ class Emulator:
     def _check_timed_events(self) -> None:
         if not self._timed_events:
             return
-        ic = self._instruction_count
-        while self._timed_events and self._timed_events[0]["at"] <= ic:
-            evt = self._timed_events[0]
-            if evt["fired"]:
-                self._timed_events.pop(0)
+        ic = self.time.instructions
+        cyc = self.time.cycles
+        fired_any = False
+        for evt in self._timed_events:
+            if evt.get("fired"):
                 continue
-            evt["fired"] = True
-            self._timed_events.pop(0)
-            self._execute_timed_action(evt)
+            at = evt.get("at")
+            at_cycle = evt.get("at_cycle")
+            due = (at is not None and at <= ic) or (at_cycle is not None and at_cycle <= cyc)
+            if due:
+                evt["fired"] = True
+                fired_any = True
+                self._execute_timed_action(evt)
+        if fired_any:
+            self._timed_events = [e for e in self._timed_events if not e.get("fired")]
 
     def _execute_timed_action(self, evt: dict) -> None:
         action = evt.get("action", "")
+        # Events may be scheduled by instruction ("at") or cycle ("at_cycle");
+        # use whichever is present for log/snapshot naming.
+        when = evt.get("at", evt.get("at_cycle", -1))
 
         if action == "gpio_inject":
             port = str(evt.get("port", "")).upper()
@@ -576,7 +721,7 @@ class Emulator:
             model = self.bus.model_for_name(port)
             if model is not None and hasattr(model, "set_input_level"):
                 model.set_input_level(pin, level in ("high", "1", "true"))
-                log.debug("timed@%d: gpio_inject %s pin %d %s", evt["at"], port, pin, level)
+                log.debug("timed@%s: gpio_inject %s pin %d %s", when, port, pin, level)
 
         elif action == "uart_inject":
             periph = str(evt.get("peripheral", "")).upper()
@@ -586,7 +731,7 @@ class Emulator:
                 data = bytes.fromhex(str(hex_data)) if hex_data else b""
                 if data:
                     model.inject_rx_bytes(data)
-                    log.debug("timed@%d: uart_inject %s %dB", evt["at"], periph, len(data))
+                    log.debug("timed@%s: uart_inject %s %dB", when, periph, len(data))
 
         elif action == "adc_sample":
             periph = str(evt.get("peripheral", "")).upper()
@@ -594,7 +739,7 @@ class Emulator:
             if model is not None and hasattr(model, "inject_sample"):
                 value = int(evt.get("value", 0))
                 model.inject_sample(value)
-                log.debug("timed@%d: adc_sample %s %d", evt["at"], periph, value)
+                log.debug("timed@%s: adc_sample %s %d", when, periph, value)
 
         elif action == "event_emit":
             from stmemu.peripherals.bus import PeripheralEvent
@@ -603,15 +748,15 @@ class Emulator:
             self.bus.emit(PeripheralEvent(
                 kind=kind, source=source, payload=evt.get("payload"),
             ))
-            log.debug("timed@%d: event_emit %s source=%s", evt["at"], kind, source)
+            log.debug("timed@%s: event_emit %s source=%s", when, kind, source)
 
         elif action == "snapshot":
-            name = str(evt.get("name", f"timed_{evt['at']}"))
+            name = str(evt.get("name", f"timed_{when}"))
             self.save_snapshot(name)
-            log.debug("timed@%d: snapshot '%s'", evt["at"], name)
+            log.debug("timed@%s: snapshot '%s'", when, name)
 
         else:
-            log.warning("timed@%d: unknown action '%s'", evt["at"], action)
+            log.warning("timed@%s: unknown action '%s'", when, action)
 
     # --- RTOS awareness ---
 
@@ -658,7 +803,7 @@ class Emulator:
                 "psp": self._read_psp(),
                 "control": self._read_control(),
                 "active_depth": len(self._exception_stack),
-                "instruction": self._instruction_count,
+                "instruction": self.time.instructions,
             },
         ))
 
@@ -679,7 +824,7 @@ class Emulator:
                 "msp": self._read_msp(),
                 "control": self._read_control(),
                 "pc": self.pc & 0xFFFFFFFF,
-                "instruction": self._instruction_count,
+                "instruction": self.time.instructions,
             },
         ))
 
@@ -693,7 +838,7 @@ class Emulator:
             "control": self._read_control(),
             "active_exceptions": list(self._exception_stack),
             "exception_depth": len(self._exception_stack),
-            "instruction_count": self._instruction_count,
+            "instruction_count": self.time.instructions,
             "in_handler": bool(self._exception_stack),
         }
 
@@ -713,7 +858,7 @@ class Emulator:
         if not self.event_trace_enabled:
             return
         entry = {
-            "instruction": self._instruction_count,
+            "instruction": self.time.instructions,
             "pc": self.pc & 0xFFFFFFFF,
             "kind": event.kind,
             "source": getattr(event, "source", ""),
@@ -877,6 +1022,7 @@ class Emulator:
         self.last_event_break = None
         self._running = True
         err: Exception | None = None
+        _w0 = time.perf_counter()
         try:
             self._execute(count)
         except Exception as e:
@@ -884,6 +1030,7 @@ class Emulator:
             if isinstance(e, UcError):
                 self.record_fault("uc_error", detail=str(e))
         finally:
+            self._wall_elapsed += time.perf_counter() - _w0
             self._running = False
             # Flush pending trace output (esp. for trace mmio mode).
             self.flush_trace()
@@ -897,6 +1044,7 @@ class Emulator:
         self.last_event_break = None
         self._running = True
         err: Exception | None = None
+        _w0 = time.perf_counter()
         try:
             self._execute(max_instructions)
         except Exception as e:
@@ -904,6 +1052,7 @@ class Emulator:
             if isinstance(e, UcError):
                 self.record_fault("uc_error", detail=str(e))
         finally:
+            self._wall_elapsed += time.perf_counter() - _w0
             self._running = False
             # Flush pending trace output (esp. for trace mmio mode).
             self.flush_trace()
@@ -944,7 +1093,19 @@ class Emulator:
     # ---- memory helpers
 
     def mem_read(self, addr: int, size: int) -> bytes:
-        return bytes(self.uc.mem_read(addr, size))
+        try:
+            return bytes(self.uc.mem_read(addr, size))
+        except UcError:
+            # Reads of erased flash beyond the loaded image return 0xFF on
+            # real silicon. The execution hook lazily maps such pages, but a
+            # direct API read (no hook) must mirror that, or tools/tests that
+            # peek unloaded flash see a fault instead of erased bytes.
+            a = int(addr) & 0xFFFFFFFF
+            n = int(size)
+            if any(lo <= a and a + n <= hi for lo, hi in self._FLASH_WINDOWS):
+                self._maybe_map_flash(a, n)
+                return bytes(self.uc.mem_read(addr, size))
+            raise
 
     def mem_write(self, addr: int, data: bytes) -> None:
         self.uc.mem_write(addr, data)
@@ -1016,13 +1177,93 @@ class Emulator:
             ),
         )
 
-    def save_snapshot(self, name: str) -> EmulatorSnapshot:
+    def save_snapshot(self, name: str, *, label: str = "") -> EmulatorSnapshot:
         key = str(name).strip()
         if not key:
             raise ValueError("snapshot name cannot be empty")
         snap = self.capture_snapshot(name=key)
         self._snapshots[key] = snap
+        self._snapshot_meta[key] = {
+            "pc": int(self.pc) & ~1,
+            "instructions": int(self.time.instructions),
+            "cycles": int(self.time.cycles),
+            "emulated_seconds": int(self.time.cycles) / float(self.time.cycle_hz or 1_000_000),
+            "label": str(label),
+        }
         return snap
+
+    def run_until(self, pc: int, *, max_instructions: int = 50_000_000) -> bool:
+        """Run until execution reaches address ``pc``; return True if reached,
+        False if ``max_instructions`` elapsed first.
+
+        The address-first "run to symbol" primitive (resolve the symbol to an
+        address yourself; this stays usable on a stripped raw bin). A breakpoint
+        the caller already set at ``pc`` is preserved; one this adds is removed.
+        """
+        target = int(pc) & ~1
+        had_bp = target in self._breakpoints
+        self.add_breakpoint(target)
+        try:
+            self.run(max_instructions)
+        finally:
+            if not had_bp:
+                self.remove_breakpoint(target)
+        return self.last_pc_break == target or (int(self.pc) & ~1) == target
+
+    def snapshot_at(self, name: str, pc: int, *, max_instructions: int = 50_000_000,
+                    label: str = "") -> EmulatorSnapshot:
+        """Run until execution reaches address ``pc``, then snapshot there.
+
+        The one-liner for the common "boot to this point, then save" pattern we
+        do by hand in every diag. Address-first; pass ``label`` (e.g. a resolved
+        symbol) for the registry. Raises if ``pc`` is not reached within
+        ``max_instructions``.
+        """
+        target = int(pc) & ~1
+        if not self.run_until(target, max_instructions=max_instructions):
+            raise RuntimeError(
+                f"snapshot_at: PC 0x{target:08X} not reached within "
+                f"{max_instructions} instructions (stopped at 0x{int(self.pc) & ~1:08X})"
+            )
+        return self.save_snapshot(name, label=label or f"@0x{target:08X}")
+
+    def snapshot_info(self, name: str) -> dict | None:
+        """Registry metadata for a snapshot (pc, instructions, cycles,
+        emulated_seconds, label), or None if unknown."""
+        m = self._snapshot_meta.get(str(name))
+        return dict(m) if m else None
+
+    def snapshot_registry(self, resolver=None, *, as_text: bool = True):
+        """All saved snapshots with where (pc) and when (instructions / emulated
+        time) each was taken, plus its label. Returns formatted text when
+        ``as_text`` (default), else a list of metadata dicts. ``resolver``
+        (addr -> name) optionally annotates each pc with a symbol."""
+        rows: list[dict] = []
+        for key in sorted(self._snapshots):
+            m = dict(self._snapshot_meta.get(key, {}))
+            m["name"] = key
+            rows.append(m)
+        if not as_text:
+            return rows
+        if not rows:
+            return "== snapshots ==\n  (none)"
+        lines = ["== snapshots =="]
+        for m in rows:
+            pc = int(m.get("pc", 0) or 0)
+            sym = ""
+            if resolver is not None and pc:
+                try:
+                    s = resolver(pc | 1)
+                    sym = f"  {s}" if s else ""
+                except Exception:
+                    sym = ""
+            lbl = m.get("label") or ""
+            lines.append(
+                f"  {m['name']:<18} pc=0x{pc:08X}{sym}  "
+                f"instr={int(m.get('instructions', 0)):,}  "
+                f"t={float(m.get('emulated_seconds', 0.0)):.3f}s  {lbl}"
+            )
+        return "\n".join(lines)
 
     def get_snapshot(self, name: str) -> EmulatorSnapshot | None:
         return self._snapshots.get(str(name))
@@ -1381,6 +1622,8 @@ class Emulator:
     def _hook_unmapped_read(self, uc, access, address, size, value, user_data):
         if self._maybe_map_internal_ram(address, size):
             return True
+        if self._maybe_map_flash(address, size):
+            return True
         log.error("UNMAPPED READ: addr=0x%08X size=%d PC=0x%08X", address, size, self.pc)
         self.record_fault(
             "unmapped_read",
@@ -1446,6 +1689,33 @@ class Emulator:
             except Exception:
                 # Already mapped or overlaps an existing region.
                 continue
+        return mapped
+
+    # STM32 main-flash address window (alias at 0x08000000, up to 8 MB covers
+    # every family incl. H7 dual-bank 2 MB). Reads beyond the loaded image hit
+    # erased flash, which reads back as 0xFF on real silicon -- firmware does
+    # this legitimately (e.g. AP_HAL crash-dump / signature reads near the end
+    # of flash), so map those pages 0xFF-filled instead of faulting.
+    _FLASH_WINDOWS = ((0x08000000, 0x08800000),)
+
+    def _maybe_map_flash(self, address: int, size: int) -> bool:
+        addr = int(address) & 0xFFFFFFFF
+        span = max(1, int(size))
+        start = addr & ~0xFFF
+        end = (addr + span + 0xFFF) & ~0xFFF
+        if not any(lo <= start and end <= hi for lo, hi in self._FLASH_WINDOWS):
+            return False
+        mapped = False
+        for page in range(start, end, 0x1000):
+            try:
+                self.uc.mem_map(page, 0x1000, UC_PROT_ALL)
+            except Exception:
+                # Already mapped (part of the loaded image) -- leave its
+                # contents intact, never overwrite real flash data.
+                continue
+            self.uc.mem_write(page, b"\xFF" * 0x1000)
+            self._dynamic_ram_pages.add(int(page))
+            mapped = True
         return mapped
 
     def _hook_insn_invalid(self, uc, user_data):
@@ -1651,18 +1921,32 @@ class Emulator:
             if self._deliver_pending_exception():
                 continue
 
-            start = self.pc | 1
-            pre_pc = self.pc & 0xFFFFFFFF
+            cur_pc = self.pc
+            start = cur_pc | 1
+            pre_pc = cur_pc & 0xFFFFFFFF
             self._special_step_consumed = False
             try:
                 self.uc.emu_start(start, self.flash_end, count=1)
             except UcError:
-                if not self._special_step_consumed:
+                if self._special_step_consumed:
+                    pass
+                elif self._maybe_emulate_fp_insn(pre_pc):
+                    pass
+                else:
                     raise
             executed += 1
-            self._instruction_count += 1
-            self.bus.tick(self._effective_tick_scale())
-            self._check_timed_events()
+            self.time.instructions += 1
+            if self._active_throttle:
+                # Real-rate active execution: advance 1us every N instructions
+                # (models ~N instr/us). Idle is still jumped below, so only
+                # active compute is paced realistically -> ArduPilot scheduler
+                # task-time budgets behave like real HW (optional tasks run).
+                self._throttle_acc += 1
+                if self._throttle_acc >= self._active_throttle:
+                    self._throttle_acc = 0
+                    self.advance_time(1, reason="instruction")
+            else:
+                self.advance_time(self._effective_tick_scale(), reason="instruction")
 
             if (
                 self.last_mmio_break is not None
@@ -1675,12 +1959,72 @@ class Emulator:
             # Idle fast-forward: a self-branch (`b .`) leaves PC unchanged.
             # That is exactly the ChibiOS idle thread (and any wait-for-IRQ
             # spin). Rather than single-step millions of idle branches while
-            # the bus ticks tick_scale at a time, jump straight to the next
-            # timer interrupt so the waiting thread wakes promptly. This makes
-            # idle nearly free in wall-clock and lets a low tick_scale (needed
-            # for correct ChibiOS thread scheduling) stay fast.
-            if self._idle_skip_enabled and (self.pc & 0xFFFFFFFF) == pre_pc:
+            # time creeps tick_scale at a time, jump straight to the next
+            # scheduled interrupt so the waiting thread wakes promptly.
+            if self.time.idle_fast_forward and (self.pc & 0xFFFFFFFF) == pre_pc:
                 self._idle_fast_forward()
+
+    def _maybe_emulate_fp_insn(self, pc: int) -> bool:
+        """Software-emulate an ARMv8-M FP instruction Unicorn rejects.
+
+        Unicorn's Cortex-M core lacks the ARMv8-M FP additions (VRINT*,
+        VMAXNM/VMINNM, VCVT{A,N,P,M}) that ArduPilot's EKF uses. On an
+        invalid-instruction fault we decode the faulting bytes and, if they
+        are one of those ops, evaluate it against the VFP register file and
+        step over it. Returns True if handled.
+        """
+        addr = int(pc) & ~1
+        try:
+            code = bytes(self.uc.mem_read(addr, 4))
+        except Exception:
+            return False
+        try:
+            from stmemu.core.armv8m_fp import try_emulate
+            size = try_emulate(self.uc, code, addr)
+        except Exception:
+            return False
+        if not size:
+            return False
+        self.uc.reg_write(UC_ARM_REG_PC, (addr + int(size)) | 1)
+        self._fp_emulated_count += 1
+        return True
+
+    def advance_time(self, cycles: int, *, reason: str = "step") -> None:
+        """The one canonical path that advances emulated time.
+
+        Every cycle increment — per-instruction stepping, idle fast-forward,
+        an explicit ``time advance`` — flows through here so the cycle counter,
+        all peripheral clocks (core DWT/SysTick, timers, external-device pacing,
+        DMA), and cycle-deadline scheduled events stay on a single timebase.
+        """
+        cycles = int(cycles)
+        if cycles <= 0:
+            return
+        self.time.cycles += cycles
+        self.bus.tick(cycles)
+        self._check_timed_events()
+
+    def _cycles_until_timed_event(self) -> int | None:
+        """Cycles until the nearest pending cycle-deadline timed event.
+
+        Idle fast-forward must not leap past a cycle-scheduled event (which may
+        inject input / pend an IRQ and change execution); it stops at the
+        deadline so the event fires at its proper time.
+        """
+        best: int | None = None
+        now = self.time.cycles
+        for evt in self._timed_events:
+            if evt.get("fired"):
+                continue
+            at_cycle = evt.get("at_cycle")
+            if at_cycle is None:
+                continue
+            delta = int(at_cycle) - int(now)
+            if delta <= 0:
+                return 1
+            if best is None or delta < best:
+                best = delta
+        return best
 
     def _idle_fast_forward(self) -> None:
         # Don't skip while interrupts are masked -- the spin won't be broken by
@@ -1691,19 +2035,21 @@ class Emulator:
                     return
             except Exception:
                 pass
-        cyc = self.bus.cycles_until_irq() if hasattr(self.bus, "cycles_until_irq") else None
-        if not cyc or cyc <= self._effective_tick_scale():
+        irq_cyc = self.bus.cycles_until_irq() if hasattr(self.bus, "cycles_until_irq") else None
+        evt_cyc = self._cycles_until_timed_event()
+        floor = self._effective_tick_scale()
+        # Jump to whichever comes first -- the next peripheral IRQ or the next
+        # cycle-scheduled event -- so neither deadline is overshot.
+        candidates = [c for c in (irq_cyc, evt_cyc) if c is not None and c > floor]
+        if not candidates:
             return
         # Cap a single jump so a runaway never advances unbounded.
-        cyc = min(int(cyc), 50_000_000)
-        self.bus.tick(cyc)
-        # NOTE: this advances *bus/peripheral* time only. Timed events keyed to
-        # the instruction count are NOT moved forward by the skipped cycles --
-        # idle fast-forward and instruction-count scheduling are not yet on a
-        # unified timebase. _check_timed_events() is still called so any
-        # already-due events fire, but cycle/instruction unification is future
-        # work (tracked for the timer/timebase branch).
-        self._check_timed_events()
+        cyc = min(min(candidates), self.time.max_fast_forward_cycles)
+        # NOTE: advancing here moves cycle-domain time (and any at_cycle events)
+        # forward, but NOT the instruction counter -- instruction-count-scheduled
+        # events are intentionally not advanced by skipped idle cycles. Schedule
+        # by cycle (at_cycle / after_ms) when you want idle-jumped time.
+        self.advance_time(cyc, reason="idle_fast_forward")
 
     def _deliver_pending_exception(self) -> bool:
         if self.core_peripheral is None:
@@ -1935,10 +2281,19 @@ class Emulator:
         # Treat tight loops as suspicious, but let interrupt-driven idle loops run longer.
         c = self._pc_hist.get(address, 0) + 1
         self._pc_hist[address] = c
-        threshold = self._stuck_loop_threshold()
-        if threshold > 0 and c == threshold:
-            log.error("Likely stuck polling at PC=0x%08X (hit %d times)", address, c)
-            uc.emu_stop()
+        # The effective threshold is always >= stuck_loop_threshold (when set),
+        # so until the repeat count reaches that floor nothing can fire. Skip the
+        # per-instruction NVIC-state probe (pending/enabled IRQs) below it -- this
+        # runs on essentially every instruction.
+        base = self.stuck_loop_threshold
+        floor = base if base > 0 else (
+            self.interrupt_stuck_threshold if self.stuck_loop_auto else 0
+        )
+        if floor > 0 and c >= floor:
+            threshold = self._stuck_loop_threshold()
+            if threshold > 0 and c == threshold:
+                log.error("Likely stuck polling at PC=0x%08X (hit %d times)", address, c)
+                uc.emu_stop()
 
     def _stuck_loop_threshold(self) -> int:
         base = max(0, int(self.stuck_loop_threshold))
@@ -2208,6 +2563,14 @@ class Emulator:
         except Exception:
             pass
 
+        if self.stall_diag_enabled:
+            try:
+                self._mmio_ring.append(
+                    (int(uc.reg_read(UC_ARM_REG_PC)) & ~1, "r", int(address), int(size), int(val))
+                )
+            except Exception:
+                pass
+
         # If we are in "trace mmio" mode, mark the current instruction as MMIO-touching.
         if self.trace_enabled and self.trace_mmio_only:
             try:
@@ -2232,6 +2595,14 @@ class Emulator:
             uc.mem_write(address, int(value).to_bytes(size, "little"))
         except Exception:
             pass
+
+        if self.stall_diag_enabled:
+            try:
+                self._mmio_ring.append(
+                    (int(uc.reg_read(UC_ARM_REG_PC)) & ~1, "w", int(address), int(size), int(value))
+                )
+            except Exception:
+                pass
 
         # If we are in "trace mmio" mode, mark the current instruction as MMIO-touching.
         if self.trace_enabled and self.trace_mmio_only:

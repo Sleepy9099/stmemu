@@ -11,10 +11,17 @@ from stmemu.svd.model import SvdPeripheral
 @dataclass
 class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     irq: int | None = None
+    # Coalesce a multi-period advance into one update event (default) instead
+    # of emitting one event per overflow ("exact" mode).
+    coalesce_updates: bool = True
     _context: PeripheralContext | None = field(default=None, init=False, repr=False)
     _prescaler_accum: int = field(default=0, init=False, repr=False)
     _last_counter: int = field(default=0, init=False, repr=False)
     _update_count: int = field(default=0, init=False, repr=False)
+    # Cached CR1.CEN state so the per-instruction tick() can skip stopped
+    # timers with an attribute check instead of a register read. Kept in sync
+    # wherever CEN can change (CR1 write, one-pulse clear, reset, restore).
+    _running: bool = field(default=False, init=False, repr=False)
 
     _CR1 = 0x00
     _DIER = 0x0C
@@ -33,20 +40,28 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
     _SR_CC1IF = 1 << 1
     _EGR_UG = 1 << 0
 
+    def _sync_running(self) -> None:
+        self._running = bool(self.read_register_value(self._CR1) & self._CR1_CEN)
+
     def reset(self) -> None:
         super().reset()
         self._prescaler_accum = 0
         self._last_counter = 0
         self._update_count = 0
+        self._sync_running()
         self._update_irq()
 
     def attach(self, context: PeripheralContext) -> None:
         self._context = context
+        self._sync_running()
 
     def tick(self, cycles: int) -> None:
-        cr1 = self.read_register_value(self._CR1)
-        if not (cr1 & self._CR1_CEN):
+        # Stopped timers are the common case (most TIMs are disabled); skip
+        # them with a cached-flag check, no register read. _running mirrors
+        # CR1.CEN and is resynced on every write that can change it.
+        if not self._running:
             return
+        cr1 = self.read_register_value(self._CR1)
 
         prescaler = self.read_register_value(self._PSC) & 0xFFFF
         divider = max(1, prescaler + 1)
@@ -59,20 +74,37 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         arr = self.read_register_value(self._ARR) & 0xFFFFFFFF
         period = arr + 1 if arr < 0xFFFFFFFF else 0x100000000
         old_counter = self.read_register_value(self._CNT) & 0xFFFFFFFF
-        new_counter = old_counter + steps
+        total = old_counter + steps
 
-        overflowed = new_counter >= period
-        if overflowed:
-            new_counter %= period
-            self._on_update_event()
-            if cr1 & self._CR1_OPM:
-                self.write_register_value(self._CR1, cr1 & ~self._CR1_CEN)
+        # How many times the counter rolled over ARR during this advance. A
+        # large accelerated jump (idle fast-forward) can cross many periods at
+        # once; we must not silently lose them.
+        overflows = total // period
+        one_pulse = bool(overflows > 0 and (cr1 & self._CR1_OPM))
+        # One-pulse mode generates a single update then stops, regardless of how
+        # many periods the jump spanned.
+        new_counter = 0 if one_pulse else total % period
 
+        # Settle the counter *before* emitting the update event so its payload
+        # reports the final (wrapped) CNT, not the pre-overflow value.
         self.write_register_value(self._CNT, new_counter)
         self._last_counter = new_counter
 
+        if overflows > 0:
+            if one_pulse:
+                self.write_register_value(self._CR1, cr1 & ~self._CR1_CEN)
+                self._running = False
+                self._on_update_event(1)
+            elif self.coalesce_updates:
+                # Coalesce into one event carrying the overflow count, so an
+                # accelerated idle jump doesn't flood the event trace.
+                self._on_update_event(overflows)
+            else:
+                for _ in range(overflows):
+                    self._on_update_event(1)
+
         compare = self.read_register_value(self._CCR1) & 0xFFFFFFFF
-        if self._crossed_compare(old_counter, new_counter if not overflowed else old_counter + steps, compare, period):
+        if self._crossed_compare(old_counter, total, compare, period):
             self.write_register_value(self._SR, self.read_register_value(self._SR) | self._SR_CC1IF)
 
         self._update_irq()
@@ -99,6 +131,8 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
             return
 
         super().write(offset, size, value)
+        if offset == self._CR1:
+            self._sync_running()
         if offset in {self._CR1, self._DIER, self._CCR1}:
             self._catch_up_compare()
             self._update_irq()
@@ -137,20 +171,21 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         cycles = ticks * divider - self._prescaler_accum
         return max(1, int(cycles))
 
-    def _on_update_event(self) -> None:
-        self._update_count += 1
+    def _on_update_event(self, overflows: int = 1) -> None:
+        self._update_count += max(1, int(overflows))
         sr = self.read_register_value(self._SR)
         self.write_register_value(self._SR, sr | self._SR_UIF)
-        self._emit_update_event()
+        self._emit_update_event(overflows)
         self._update_irq()
 
-    def _emit_update_event(self) -> None:
+    def _emit_update_event(self, overflows: int = 1) -> None:
         if self._context is None or self._context.bus is None:
             return
         self._context.bus.emit(PeripheralEvent(
             kind="timer_update",
             source=self._context.name,
             payload={
+                "overflows": max(1, int(overflows)),
                 "cnt": self.read_register_value(self._CNT),
                 "arr": self.read_register_value(self._ARR),
                 "psc": self.read_register_value(self._PSC),
@@ -208,6 +243,7 @@ class BasicTimerPeripheral(GenericRegisterFilePeripheral):
         self._prescaler_accum = int(state.get("prescaler_accum", 0))
         self._last_counter = int(state.get("last_counter", 0)) & 0xFFFFFFFF
         self._update_count = int(state.get("update_count", 0))
+        self._sync_running()
         self._update_irq()
 
 

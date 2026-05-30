@@ -125,12 +125,13 @@ _KNOWN_TOP_KEYS = {
 
 _KNOWN_EMULATOR_KEYS = {
     "tick_scale", "stuck_threshold", "interrupt_stuck_threshold",
-    "bus_policy", "trace", "coverage",
+    "bus_policy", "trace", "coverage", "time",
 }
 
 _KNOWN_UART_KEYS = {
     "peripheral", "device", "name", "mode", "lat", "lon", "alt",
-    "speed_knots", "rate_cycles", "ttff_ticks",
+    "speed_knots", "rate_cycles", "ttff_ticks", "faults",
+    "file", "hex", "loop", "tick_cycles", "bytes_per_tick",
 }
 
 _KNOWN_I2C_DEV_KEYS = {
@@ -170,8 +171,8 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
     for te in config.get("timed_events", []):
         if isinstance(te, dict):
-            if "at" not in te:
-                warnings.append("timed_event missing 'at' field")
+            if not any(k in te for k in ("at", "at_instruction", "at_cycle", "after_ms")):
+                warnings.append("timed_event missing a deadline (at/at_instruction/at_cycle/after_ms)")
             if "action" not in te:
                 warnings.append("timed_event missing 'action' field")
 
@@ -298,14 +299,23 @@ def apply_board_config(
         msgs = _apply_breakpoints(bp_cfg, emu)
         messages.extend(msgs)
 
-    # 6. Timed events — store on emulator for later
+    # 6. Timed events — store on emulator for later. Deadlines may be given in
+    # instructions ("at"/"at_instruction"), emulated cycles ("at_cycle"), or
+    # nominal wall-clock ("after_ms"); cycle/ms deadlines fire across idle
+    # fast-forward jumps, instruction deadlines do not.
     timed = config.get("timed_events", [])
     if timed and emu is not None and hasattr(emu, "add_timed_event"):
+        _RESERVED = ("at", "at_instruction", "at_cycle", "after_ms", "action")
         for te in timed:
-            at = _parse_int(te.get("at", 0))
             action = str(te.get("action", ""))
-            params = {k: v for k, v in te.items() if k not in ("at", "action")}
-            emu.add_timed_event(at, action, **params)
+            params = {k: v for k, v in te.items() if k not in _RESERVED}
+            if "at_cycle" in te and hasattr(emu, "add_timed_event_cycle"):
+                emu.add_timed_event_cycle(_parse_int(te["at_cycle"]), action, **params)
+            elif "after_ms" in te and hasattr(emu, "add_timed_event_ms"):
+                emu.add_timed_event_ms(float(te["after_ms"]), action, **params)
+            else:
+                at = _parse_int(te.get("at_instruction", te.get("at", 0)))
+                emu.add_timed_event(at, action, **params)
         messages.append(f"timed events: {len(timed)} scheduled")
 
     # 7. Startup commands
@@ -340,6 +350,37 @@ def _apply_emulator_settings(
     if "coverage" in cfg and cfg["coverage"]:
         emu.coverage_enabled = True
         msgs.append("emulator: coverage enabled")
+    time_cfg = cfg.get("time")
+    if isinstance(time_cfg, dict) and getattr(emu, "time", None) is not None:
+        msgs.extend(_apply_time_settings(time_cfg, emu, bus))
+    return msgs
+
+
+def _apply_time_settings(cfg: dict[str, Any], emu: object, bus: object) -> list[str]:
+    msgs: list[str] = []
+    t = emu.time
+    if "mode" in cfg:
+        t.mode = str(cfg["mode"])
+        msgs.append(f"time: mode={t.mode}")
+    elif "idle_fast_forward" in cfg:
+        t.mode = "idle" if cfg["idle_fast_forward"] else "normal"
+        msgs.append(f"time: mode={t.mode}")
+    if "tick_scale" in cfg:
+        emu.tick_scale = int(cfg["tick_scale"])
+        msgs.append(f"time: tick_scale={emu.tick_scale}")
+    if "max_fast_forward_cycles" in cfg:
+        t.max_fast_forward_cycles = int(cfg["max_fast_forward_cycles"])
+        msgs.append(f"time: max_fast_forward_cycles={t.max_fast_forward_cycles}")
+    if "cycle_hz" in cfg:
+        t.cycle_hz = int(cfg["cycle_hz"])
+        msgs.append(f"time: cycle_hz={t.cycle_hz}")
+    if "coalesce_timer_events" in cfg:
+        t.coalesce_timer_events = bool(cfg["coalesce_timer_events"])
+        # Propagate to mounted timer models so the policy takes effect.
+        for mounted in getattr(bus, "_mounted", []):
+            if hasattr(mounted.model, "coalesce_updates"):
+                mounted.model.coalesce_updates = t.coalesce_timer_events
+        msgs.append(f"time: coalesce_timer_events={t.coalesce_timer_events}")
     return msgs
 
 
@@ -351,7 +392,7 @@ def _apply_board_topology(
 ) -> list[str]:
     msgs: list[str] = []
     for uart_cfg in board.get("uart_devices", []):
-        msgs.append(_attach_uart_device(bus, uart_cfg))
+        msgs.append(_attach_uart_device(bus, uart_cfg, base_dir=base_dir))
     for i2c_cfg in board.get("i2c_devices", []):
         msgs.append(_attach_i2c_devices(bus, i2c_cfg))
     for spi_cfg in board.get("spi_devices", []):
@@ -481,7 +522,29 @@ def _apply_breakpoints(cfg: dict[str, Any], emu: object) -> list[str]:
 
 # ── Board topology helpers (preserved from V0) ──────────────────
 
-def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
+def _parse_fault_rules(cfg: dict[str, Any]) -> list:
+    """Build FaultRule objects from a device cfg's optional ``faults:`` list."""
+    from stmemu.external.faults import FaultRule
+
+    rules = []
+    for fc in cfg.get("faults", []) or []:
+        if not isinstance(fc, dict):
+            continue
+        reg = fc.get("reg")
+        rules.append(FaultRule(
+            kind=str(fc.get("kind", "corrupt")).lower(),
+            when=str(fc.get("when", "every")).lower(),
+            after=_parse_int(fc.get("after", 0)),
+            every=_parse_int(fc.get("every", 1)),
+            limit=_parse_int(fc.get("limit", 0)),
+            reg=(_parse_int(reg) if reg is not None else None),
+            mask=_parse_int(fc.get("mask", 0xFF)),
+            value=_parse_int(fc.get("value", 0xFF)),
+        ))
+    return rules
+
+
+def _attach_uart_device(bus: object, cfg: dict[str, Any], *, base_dir: Path | None = None) -> str:
     periph_name = str(cfg.get("peripheral", "")).upper()
     dev_type = str(cfg.get("device", "ublox")).lower()
 
@@ -491,7 +554,24 @@ def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
     if not hasattr(uart_model, "inject_rx_bytes"):
         return f"uart: {periph_name} is not a UART"
 
-    if dev_type in ("ublox", "ublox-gps"):
+    if dev_type in ("playback", "replay"):
+        from stmemu.external.playback import PlaybackSerialDevice
+        data = b""
+        if cfg.get("hex"):
+            data = bytes.fromhex("".join(str(cfg["hex"]).split()))
+        elif cfg.get("file"):
+            p = Path(str(cfg["file"])).expanduser()
+            if base_dir is not None and not p.is_absolute():
+                p = base_dir / p
+            data = p.read_bytes()
+        dev = PlaybackSerialDevice(
+            data=data,
+            tick_cycles=_parse_int(cfg.get("tick_cycles", 1000)),
+            bytes_per_tick=_parse_int(cfg.get("bytes_per_tick", 1)),
+            loop=bool(cfg.get("loop", False)),
+        )
+        dev.name = cfg.get("name", f"{periph_name.lower()}_playback")
+    elif dev_type in ("ublox", "ublox-gps"):
         from stmemu.external.ublox import UbloxGpsDevice
         dev = UbloxGpsDevice()
         dev.name = cfg.get("name", f"{periph_name.lower()}_gps")
@@ -509,10 +589,17 @@ def _attach_uart_device(bus: object, cfg: dict[str, Any]) -> str:
     else:
         return f"uart: unknown device type '{dev_type}'"
 
+    fault_rules = _parse_fault_rules(cfg)
+    fault_desc = ""
+    if fault_rules:
+        from stmemu.external.faults import FaultySerialDevice
+        dev = FaultySerialDevice(dev, fault_rules, name=dev.name)
+        fault_desc = f" +{len(fault_rules)} fault(s)"
+
     from stmemu.external.serial_line import SerialLine
     line = SerialLine(dev.name, uart=uart_model, device=dev, bus=bus)
     bus.attach_serial_line(line)
-    return f"uart: attached {dev_type} '{dev.name}' to {periph_name}"
+    return f"uart: attached {dev_type} '{dev.name}' to {periph_name}{fault_desc}"
 
 
 def _attach_i2c_devices(bus: object, cfg: dict[str, Any]) -> str:
@@ -602,6 +689,12 @@ def _attach_spi_device(
     dev, extra = _build_spi_device(dev_type, cfg, base_dir=base_dir)
     if dev is None:
         return f"spi: unknown device type '{dev_type}'"
+
+    fault_rules = _parse_fault_rules(cfg)
+    if fault_rules:
+        from stmemu.external.faults import FaultySpiDevice
+        dev = FaultySpiDevice(dev, fault_rules, name=dev.name)
+        extra += f" +{len(fault_rules)} fault(s)"
 
     cs_port = cfg.get("cs_port")
     cs_pin = cfg.get("cs_pin")
