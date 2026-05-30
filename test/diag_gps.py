@@ -65,18 +65,29 @@ for a in MILES:
 
 hit = None
 done = 0
+gps_seen_at = None
+CHUNK = 2_000_000
 while done < budget:
-    emu.run(2_000_000)
-    done += 2_000_000
+    emu.run(CHUNK)
+    done += CHUNK
     if emu.last_pc_break is not None:
         a = emu.last_pc_break
         hit = MILES.get(a, f"0x{a:08X}")
-        print(f"[{done}] reached {hit} at pc=0x{emu.pc:08X}")
+        print(f"[{done:>10}] reached {hit} at pc=0x{emu.pc:08X}  spi={spi_counts} gps={gps}", flush=True)
         if a == 0x08043471:   # fatal config_error -> stop
             break
-        if a in (0x08053C25, 0x0805D82D):  # GPS update/detect -> keep going a bit
+        if a in (0x08053C25, 0x0805D82D):  # GPS update/detect -> note + keep going briefly
             emu.remove_breakpoint(a)
+            if gps_seen_at is None:
+                gps_seen_at = done
+    elif done % 10_000_000 == 0:
+        # heartbeat so a long run shows where it is even with no milestone
+        print(f"[{done:>10}] pc=0x{emu.pc:08X}  spi={spi_counts} gps={gps}", flush=True)
+    # once GPS phase is reached, run a bit more to capture tx/rx then stop
+    if gps_seen_at is not None and done - gps_seen_at >= 8_000_000:
+        print(f"[{done:>10}] captured GPS phase, stopping early", flush=True)
+        break
 
-print(f"\nstopped at pc=0x{emu.pc:08X} after {done} instr")
+print(f"\nstopped at pc=0x{emu.pc:08X} after {done} instr  (first GPS milestone at {gps_seen_at})")
 print("SPI device exchanges:", spi_counts or "(none)")
 print(f"UART5 GPS: tx={gps['tx']}  rx={gps['rx']}")
