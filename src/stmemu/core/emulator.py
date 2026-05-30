@@ -175,6 +175,9 @@ class Emulator:
         self._install_hooks()
         self._pc_hist = {}
         self._last_stuck_report = 0
+        # Count of ARMv8-M FP instructions emulated in software (Unicorn lacks
+        # VRINT*/VMAXNM/VMINNM/VCVT{A,N,P,M}); used by the EKF on Cortex-M7.
+        self._fp_emulated_count = 0
         # Stall diagnostics: when enabled, keep a rolling window of the most
         # recent MMIO accesses (pc, access, address, size, value) so the stall
         # analyzer can report *which* register a stuck loop is polling. Off by
@@ -1782,7 +1785,11 @@ class Emulator:
             try:
                 self.uc.emu_start(start, self.flash_end, count=1)
             except UcError:
-                if not self._special_step_consumed:
+                if self._special_step_consumed:
+                    pass
+                elif self._maybe_emulate_fp_insn(pre_pc):
+                    pass
+                else:
                     raise
             executed += 1
             self.time.instructions += 1
@@ -1803,6 +1810,31 @@ class Emulator:
             # scheduled interrupt so the waiting thread wakes promptly.
             if self.time.idle_fast_forward and (self.pc & 0xFFFFFFFF) == pre_pc:
                 self._idle_fast_forward()
+
+    def _maybe_emulate_fp_insn(self, pc: int) -> bool:
+        """Software-emulate an ARMv8-M FP instruction Unicorn rejects.
+
+        Unicorn's Cortex-M core lacks the ARMv8-M FP additions (VRINT*,
+        VMAXNM/VMINNM, VCVT{A,N,P,M}) that ArduPilot's EKF uses. On an
+        invalid-instruction fault we decode the faulting bytes and, if they
+        are one of those ops, evaluate it against the VFP register file and
+        step over it. Returns True if handled.
+        """
+        addr = int(pc) & ~1
+        try:
+            code = bytes(self.uc.mem_read(addr, 4))
+        except Exception:
+            return False
+        try:
+            from stmemu.core.armv8m_fp import try_emulate
+            size = try_emulate(self.uc, code, addr)
+        except Exception:
+            return False
+        if not size:
+            return False
+        self.uc.reg_write(UC_ARM_REG_PC, (addr + int(size)) | 1)
+        self._fp_emulated_count += 1
+        return True
 
     def advance_time(self, cycles: int, *, reason: str = "step") -> None:
         """The one canonical path that advances emulated time.
