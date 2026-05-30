@@ -148,6 +148,10 @@ class Emulator:
         self._dynamic_ram_pages: set[int] = set()
         self._snapshot_base_ranges: list[tuple[int, int]] = []
         self._snapshots: dict[str, EmulatorSnapshot] = {}
+        # In-memory registry metadata per snapshot (pc / instructions / cycles /
+        # emulated time / label). Kept separate from EmulatorSnapshot so the
+        # on-disk .snap pickle format stays backward-compatible.
+        self._snapshot_meta: dict[str, dict] = {}
         self.last_mmio_break: dict | None = None
         self.last_watch_break: dict | None = None
         self.last_pc_break: int | None = None
@@ -1173,13 +1177,83 @@ class Emulator:
             ),
         )
 
-    def save_snapshot(self, name: str) -> EmulatorSnapshot:
+    def save_snapshot(self, name: str, *, label: str = "") -> EmulatorSnapshot:
         key = str(name).strip()
         if not key:
             raise ValueError("snapshot name cannot be empty")
         snap = self.capture_snapshot(name=key)
         self._snapshots[key] = snap
+        self._snapshot_meta[key] = {
+            "pc": int(self.pc) & ~1,
+            "instructions": int(self.time.instructions),
+            "cycles": int(self.time.cycles),
+            "emulated_seconds": int(self.time.cycles) / float(self.time.cycle_hz or 1_000_000),
+            "label": str(label),
+        }
         return snap
+
+    def snapshot_at(self, name: str, pc: int, *, max_instructions: int = 50_000_000,
+                    label: str = "") -> EmulatorSnapshot:
+        """Run until execution reaches address ``pc``, then snapshot there.
+
+        The one-liner for the common "boot to this point, then save" pattern we
+        do by hand in every diag. Address-first; pass ``label`` (e.g. a resolved
+        symbol) for the registry. Raises if ``pc`` is not reached within
+        ``max_instructions``. A breakpoint the caller already set at ``pc`` is
+        left intact; one we add is removed afterwards.
+        """
+        target = int(pc) & ~1
+        had_bp = target in self._breakpoints
+        self.add_breakpoint(target)
+        try:
+            self.run(max_instructions)
+        finally:
+            if not had_bp:
+                self.remove_breakpoint(target)
+        if self.last_pc_break != target and (int(self.pc) & ~1) != target:
+            raise RuntimeError(
+                f"snapshot_at: PC 0x{target:08X} not reached within "
+                f"{max_instructions} instructions (stopped at 0x{int(self.pc) & ~1:08X})"
+            )
+        return self.save_snapshot(name, label=label or f"@0x{target:08X}")
+
+    def snapshot_info(self, name: str) -> dict | None:
+        """Registry metadata for a snapshot (pc, instructions, cycles,
+        emulated_seconds, label), or None if unknown."""
+        m = self._snapshot_meta.get(str(name))
+        return dict(m) if m else None
+
+    def snapshot_registry(self, resolver=None, *, as_text: bool = True):
+        """All saved snapshots with where (pc) and when (instructions / emulated
+        time) each was taken, plus its label. Returns formatted text when
+        ``as_text`` (default), else a list of metadata dicts. ``resolver``
+        (addr -> name) optionally annotates each pc with a symbol."""
+        rows: list[dict] = []
+        for key in sorted(self._snapshots):
+            m = dict(self._snapshot_meta.get(key, {}))
+            m["name"] = key
+            rows.append(m)
+        if not as_text:
+            return rows
+        if not rows:
+            return "== snapshots ==\n  (none)"
+        lines = ["== snapshots =="]
+        for m in rows:
+            pc = int(m.get("pc", 0) or 0)
+            sym = ""
+            if resolver is not None and pc:
+                try:
+                    s = resolver(pc | 1)
+                    sym = f"  {s}" if s else ""
+                except Exception:
+                    sym = ""
+            lbl = m.get("label") or ""
+            lines.append(
+                f"  {m['name']:<18} pc=0x{pc:08X}{sym}  "
+                f"instr={int(m.get('instructions', 0)):,}  "
+                f"t={float(m.get('emulated_seconds', 0.0)):.3f}s  {lbl}"
+            )
+        return "\n".join(lines)
 
     def get_snapshot(self, name: str) -> EmulatorSnapshot | None:
         return self._snapshots.get(str(name))
