@@ -63,6 +63,12 @@ for _ln in bus.serial_lines().values():
     if _d is not None and hasattr(_d, "mode"):
         _d.mode = gps_mode
         _d._cycle_counter = 0
+        # ArduPilot here detects a GPS by LISTENING; it doesn't probe a silent
+        # port. For a UBX detection (-> driver sends CFG, gets ACK/NAV), make
+        # the receiver stream UBX NAV-PVT with no NMEA to race the detector.
+        if gps_mode == "ubx":
+            from stmemu.external.ublox import UBX_NAV, NAV_PVT, NAV_STATUS
+            _d._ubx_periodic = {(UBX_NAV, NAV_PVT): 1, (UBX_NAV, NAV_STATUS): 1}
 print(f"ublox mode forced to {gps_mode!r}")
 
 # Also tally raw UART5 GPS bytes via the drain/inject hooks (ground truth).
