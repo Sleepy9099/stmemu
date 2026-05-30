@@ -40,6 +40,20 @@ apply_board_config(load_board_config(ROOT / "test/arducopter_with_bl.yaml"), bus
 emu.import_snapshot(str(snap), name="mainloop")
 emu.load_snapshot("mainloop")
 
+# The snapshot is in the running main loop. Without the real-rate active clock
+# the EKF's measured duration overruns AP_Scheduler's loop budget and the 50Hz
+# AP_GPS::update task is starved (memory item 23). Pace active execution at
+# ~200*ipus instructions/us so task budgets behave like real HW and GPS runs.
+ipus = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+emu.set_active_throttle(ipus)
+print(f"real-rate active clock: {ipus} (~{200 * ipus} instr/us)")
+
+# cpu-actions are NOT stored in the snapshot, so re-apply the per-loop
+# NavEKF3::convert_parameters stub (skips sources.configured()/AP_Param::scan
+# over slow FRAM every InitialiseFilter call). Without it the param scan
+# dominates the loop and re-starves the GPS task even with the real-rate clock.
+emu.add_pc_cpu_action("ret", pc=0x08070BE4, once=False)
+
 # Also tally raw UART5 GPS bytes via the drain/inject hooks (ground truth).
 u5 = bus.model_for_name("UART5")
 gps = {"tx": 0, "rx": 0}

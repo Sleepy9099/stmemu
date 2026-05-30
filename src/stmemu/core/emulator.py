@@ -184,6 +184,21 @@ class Emulator:
         # default — costs one reg_read + deque append per MMIO access.
         self.stall_diag_enabled: bool = False
         self._mmio_ring: deque = deque(maxlen=512)
+        # Real-rate active-execution throttle (opt-in; 0 = disabled, default).
+        # When >0, ACTIVE execution advances 1 cycle (1us at cycle_hz=1MHz)
+        # every `_active_throttle` instructions, instead of tick_scale cycles
+        # every instruction. This models a real CPU running ~_active_throttle
+        # instructions per microsecond (~480 for the H743's 480MHz Cortex-M7),
+        # so a compute task's *measured* duration (micros() before/after) is
+        # realistic instead of ~tick_scale*instr us. Idle is still jumped via
+        # idle_fast_forward, so acceleration is preserved. Needed in the
+        # ArduPilot main loop: AP_Scheduler skips optional tasks (GPS, compass)
+        # when a fast task's measured time exceeds the loop budget — with the
+        # default tick_scale*instr clock the EKF "takes" ~500ms and starves
+        # them; at real rate it takes ~100us and they run. Set live mid-run
+        # (e.g. on entering the scheduler loop) via set_active_throttle().
+        self._active_throttle: int = 0
+        self._throttle_acc: int = 0
         self.trace_enabled = False
         self._disasm = ThumbDisassembler()
         # Trace (disasm) options
@@ -442,6 +457,21 @@ class Emulator:
 
     def disable_stall_diagnostics(self) -> None:
         self.stall_diag_enabled = False
+
+    def set_active_throttle(self, instr_per_us: int) -> None:
+        """Pace ACTIVE execution at ~``instr_per_us`` instructions per microsecond.
+
+        0 disables (default: the tick_scale-cycles-per-instruction clock).
+        A positive value (e.g. 480 for the H743's 480MHz core) advances the
+        firmware clock by 1us every ``instr_per_us`` instructions, so a compute
+        task's measured micros() duration is realistic. Idle is still jumped
+        (idle_fast_forward), so boot/idle acceleration is unaffected. Intended
+        to be enabled on entering the ArduPilot scheduler main loop so optional
+        tasks (GPS/compass) are not starved by the EKF overrunning the loop
+        budget under the accelerated clock. Can be set live mid-run.
+        """
+        self._active_throttle = max(0, int(instr_per_us))
+        self._throttle_acc = 0
 
     def diagnose_stall(self, resolver=None, *, as_text: bool = True):
         """Explain why execution is stuck (see :mod:`stmemu.core.stall_analyzer`).
@@ -1793,7 +1823,17 @@ class Emulator:
                     raise
             executed += 1
             self.time.instructions += 1
-            self.advance_time(self._effective_tick_scale(), reason="instruction")
+            if self._active_throttle:
+                # Real-rate active execution: advance 1us every N instructions
+                # (models ~N instr/us). Idle is still jumped below, so only
+                # active compute is paced realistically -> ArduPilot scheduler
+                # task-time budgets behave like real HW (optional tasks run).
+                self._throttle_acc += 1
+                if self._throttle_acc >= self._active_throttle:
+                    self._throttle_acc = 0
+                    self.advance_time(1, reason="instruction")
+            else:
+                self.advance_time(self._effective_tick_scale(), reason="instruction")
 
             if (
                 self.last_mmio_break is not None

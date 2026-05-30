@@ -107,6 +107,34 @@ class AdvanceTimeTests(unittest.TestCase):
         self.assertEqual(emu.time.instructions, 3)
         self.assertEqual(emu.time.cycles, 3)
 
+    def test_active_throttle_off_by_default(self):
+        emu = _make_emu()
+        self.assertEqual(emu._active_throttle, 0)
+        emu.tick_scale = 1
+        emu.step(3)
+        self.assertEqual(emu.time.cycles, 3)  # default path unchanged
+
+    def test_active_throttle_paces_active_cycles(self):
+        # Real-rate active clock: advance 1 cycle every N instructions instead
+        # of tick_scale cycles every instruction (memory item 23 GPS fix).
+        emu = _make_emu()
+        emu.tick_scale = 10            # would be 30 cycles over 3 instr by default
+        emu.set_active_throttle(3)     # -> 1 cycle per 3 instructions
+        emu.step(3)
+        self.assertEqual(emu.time.instructions, 3)
+        self.assertEqual(emu.time.cycles, 1)
+
+    def test_active_throttle_accumulates_across_steps(self):
+        emu = _make_emu()
+        emu.tick_scale = 1
+        emu.set_active_throttle(3)
+        emu.step(2)                    # acc=2, no cycle yet
+        self.assertEqual(emu.time.cycles, 0)
+        emu.step(1)                    # acc hits 3 -> 1 cycle
+        self.assertEqual(emu.time.cycles, 1)
+        emu.set_active_throttle(0)     # disable resets accumulator + path
+        self.assertEqual(emu._active_throttle, 0)
+
     def test_idle_fast_forward_routes_through_advance_time(self):
         emu = _make_emu()
         emu.bus.mount(name="IRQIN", base=0x4000A000, size=0x100, model=_IrqIn(5000))
