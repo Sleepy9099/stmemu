@@ -223,12 +223,13 @@ class Icm42688Device(_SpiRegisterDevice):
 
     def _apply_defaults(self) -> None:
         self._registers[self._REG_WHOAMI] = _ICM42688_WHOAMI
-        # Stream 16-byte FIFOData frames of all-zero motion. Header 0x68 =
-        # ACCEL_EN|GYRO_EN|TMST_FIELD_EN, which the driver validates via
-        # (header & 0xFC) == 0x68 before accepting a frame. A constant zero
-        # gyro lets the startup gyro-bias calibration converge immediately.
+        # Stream 16-byte FIFOData frames: header 0x68 (ACCEL_EN|GYRO_EN|
+        # TMST_FIELD_EN, validated via (header & 0xFC)==0x68), zero gyro, and
+        # +1g on accel Z so the AHRS/EKF have a gravity vector to initialise
+        # attitude (raw 2048 @ 16g scale = 9.81 m/s^2). Layout: header(1),
+        # accel xyz int16 LE (6), gyro xyz (6), temp(1), timestamp(2).
         self._fifo_data_reg = self._REG_FIFO_DATA
-        self._fifo_frame = bytes([0x68]) + bytes(15)
+        self._fifo_frame = bytes([0x68, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08]) + bytes(9)
 
     def _read_register(self, reg: int) -> int:
         # Constant FIFO depth, little-endian count in records (INTF_CONFIG0=
@@ -276,10 +277,11 @@ class Bmi088AccelDevice(_SpiRegisterDevice):
         # Data-ready bit set so firmware doesn't hang on the status poll.
         self._registers[self._REG_ACC_STATUS] = 0x80
         # Stream variable-length FIFO frames; 0x84 marks a 7-byte accel frame
-        # (header + int16 x/y/z). Zero acceleration is constant, so it never
-        # trips the gyro-cal "platform moved" guard (accel_diff < 0.2).
+        # (header + int16 x/y/z). +1g on Z (raw 1366 @ 24g range = 9.81 m/s^2)
+        # gives the AHRS/EKF a gravity vector; constant, so it never trips the
+        # gyro-cal "platform moved" guard (accel_diff < 0.2).
         self._fifo_data_reg = self._REG_FIFO_DATA
-        self._fifo_frame = bytes([0x84]) + bytes(6)
+        self._fifo_frame = bytes([0x84, 0x00, 0x00, 0x00, 0x00, 0x56, 0x05])
 
     def _read_register(self, reg: int) -> int:
         # FIFO byte length = frames * 7, LSB then MSB; top bit clear = data.
