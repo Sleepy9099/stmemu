@@ -119,6 +119,12 @@ class PeripheralBus:
         self._event_subscribers: dict[str, list[EventHandler]] = defaultdict(list)
         self._event_log: list[PeripheralEvent] = []
         self.event_log_enabled: bool = False
+        # Transaction tracer (stmemu.peripherals.tracer.BusTracer). Peripheral
+        # models push decoded-transaction records via _trace() at their choke
+        # points; _trace_active gates that to ~one attr read when no tracer is
+        # installed.
+        self._tracer: object | None = None
+        self._trace_active: bool = False
         # Precomputed list of unique models whose tick() actually does work
         # (timers, core DWT/SysTick, ...). Rebuilt on mount. Lets tick() skip
         # the per-call dedup and the ~100 no-op ticks every instruction.
@@ -216,6 +222,27 @@ class PeripheralBus:
         events = list(self._event_log)
         self._event_log.clear()
         return events
+
+    # ── transaction tracing ────────────────────────────────────────────
+
+    def install_tracer(self, tracer: object) -> None:
+        """Install a tracer; peripheral choke points start feeding it records."""
+        self._tracer = tracer
+        self._trace_active = tracer is not None
+
+    def remove_tracer(self) -> None:
+        self._tracer = None
+        self._trace_active = False
+
+    def _trace(self, rec: dict) -> None:
+        """Push a decoded-transaction record to the installed tracer.
+
+        Called from SPI/I2C/UART choke points only when ``_trace_active`` is
+        set, so the common (untraced) path costs a single attribute read.
+        """
+        t = self._tracer
+        if t is not None:
+            t.record(rec)
 
     def add_dma_listener(self, dma_model: PeripheralModel) -> None:
         """Register a DMA controller for peripheral DMA requests.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 from stmemu.peripherals.core_cm import CortexMCorePeripheral
@@ -174,6 +175,12 @@ class Emulator:
         self._install_hooks()
         self._pc_hist = {}
         self._last_stuck_report = 0
+        # Stall diagnostics: when enabled, keep a rolling window of the most
+        # recent MMIO accesses (pc, access, address, size, value) so the stall
+        # analyzer can report *which* register a stuck loop is polling. Off by
+        # default — costs one reg_read + deque append per MMIO access.
+        self.stall_diag_enabled: bool = False
+        self._mmio_ring: deque = deque(maxlen=512)
         self.trace_enabled = False
         self._disasm = ThumbDisassembler()
         # Trace (disasm) options
@@ -416,6 +423,58 @@ class Emulator:
 
     def clear_mmio_breakpoints(self) -> None:
         self._mmio_breakpoints.clear()
+
+    # ── stall diagnostics ──────────────────────────────────────────────
+
+    def enable_stall_diagnostics(self, *, window: int = 512) -> None:
+        """Start recording recent MMIO accesses for :meth:`diagnose_stall`.
+
+        Keeps a rolling window of the last ``window`` MMIO accesses (pc,
+        access, address, size, value). Cheap but non-zero overhead, so it is
+        opt-in. Call once before running into a suspected stall.
+        """
+        if window != self._mmio_ring.maxlen:
+            self._mmio_ring = deque(self._mmio_ring, maxlen=int(window))
+        self.stall_diag_enabled = True
+
+    def disable_stall_diagnostics(self) -> None:
+        self.stall_diag_enabled = False
+
+    def diagnose_stall(self, resolver=None, *, as_text: bool = True):
+        """Explain why execution is stuck (see :mod:`stmemu.core.stall_analyzer`).
+
+        Returns the formatted report string (``as_text=True``, default) or the
+        :class:`~stmemu.core.stall_analyzer.StallReport` object. ``resolver`` is
+        an optional ``addr -> name`` callable for symbol enrichment; omit it for
+        a pure address report on a stripped binary.
+        """
+        from stmemu.core.stall_analyzer import analyze_stall
+
+        report = analyze_stall(self)
+        return report.format(resolver) if as_text else report
+
+    # ── transaction tracing ────────────────────────────────────────────
+
+    def enable_tracing(self, sources=None, *, decode: bool = True, limit: int = 20000):
+        """Install a decoded bus-transaction tracer (see :mod:`stmemu.peripherals.tracer`).
+
+        ``sources`` filters by bus/device name (e.g. ``["SPI1", "UART5"]`` or
+        ``["icm42688"]``); ``None`` traces everything. Returns the tracer; read
+        ``tracer.dump()`` / ``tracer.counts()`` afterwards.
+        """
+        from stmemu.peripherals.tracer import BusTracer
+
+        tracer = BusTracer(sources=sources, decode=decode, limit=limit)
+        tracer.install(self.bus)
+        self.tracer = tracer
+        return tracer
+
+    def disable_tracing(self):
+        tracer = getattr(self, "tracer", None)
+        if tracer is not None:
+            tracer.stop(self.bus)
+        self.tracer = None
+        return tracer
 
     @staticmethod
     def _normalize_watch_access(access: str) -> str:
@@ -2319,6 +2378,14 @@ class Emulator:
         except Exception:
             pass
 
+        if self.stall_diag_enabled:
+            try:
+                self._mmio_ring.append(
+                    (int(uc.reg_read(UC_ARM_REG_PC)) & ~1, "r", int(address), int(size), int(val))
+                )
+            except Exception:
+                pass
+
         # If we are in "trace mmio" mode, mark the current instruction as MMIO-touching.
         if self.trace_enabled and self.trace_mmio_only:
             try:
@@ -2343,6 +2410,14 @@ class Emulator:
             uc.mem_write(address, int(value).to_bytes(size, "little"))
         except Exception:
             pass
+
+        if self.stall_diag_enabled:
+            try:
+                self._mmio_ring.append(
+                    (int(uc.reg_read(UC_ARM_REG_PC)) & ~1, "w", int(address), int(size), int(value))
+                )
+            except Exception:
+                pass
 
         # If we are in "trace mmio" mode, mark the current instruction as MMIO-touching.
         if self.trace_enabled and self.trace_mmio_only:

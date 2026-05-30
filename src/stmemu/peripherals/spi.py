@@ -214,14 +214,24 @@ class SpiPeripheral(GenericRegisterFilePeripheral):
         anyway -- a single-slave bus with no CS detection (FRAM auto-CS
         before the first GPIO falling edge is seen) shouldn't go silent.
         """
-        for dev in self._devices:
-            if getattr(dev, "cs_active", False) and hasattr(dev, "exchange"):
-                return int(dev.exchange(byte)) & 0xFF
-        if len(self._devices) == 1:
+        dev = None
+        for d in self._devices:
+            if getattr(d, "cs_active", False) and hasattr(d, "exchange"):
+                dev = d
+                break
+        if dev is None and len(self._devices) == 1 and hasattr(self._devices[0], "exchange"):
             dev = self._devices[0]
-            if hasattr(dev, "exchange"):
-                return int(dev.exchange(byte)) & 0xFF
-        return 0xFF
+        if dev is None:
+            return 0xFF
+        miso = int(dev.exchange(byte)) & 0xFF
+        ctx = self._context
+        if ctx is not None and ctx.bus is not None and ctx.bus._trace_active:
+            ctx.bus._trace({
+                "proto": "spi", "bus": ctx.name,
+                "device": getattr(dev, "name", None),
+                "mosi": byte & 0xFF, "miso": miso,
+            })
+        return miso
 
     def attach_device(self, device: object) -> None:
         """Wire an SPI slave so MOSI bytes go through device.exchange().
