@@ -54,6 +54,17 @@ print(f"real-rate active clock: {ipus} (~{200 * ipus} instr/us)")
 # dominates the loop and re-starves the GPS task even with the real-rate clock.
 emu.add_pc_cpu_action("ret", pc=0x08070BE4, once=False)
 
+# The snapshot restored the ublox to a silent UBX-only state; a real receiver
+# powers up emitting NMEA+UBX so the host can auto-detect it (ArduPilot detects
+# by listening). Force 'both' so it streams and the firmware can detect/config.
+gps_mode = sys.argv[3] if len(sys.argv) > 3 else "both"
+for _ln in bus.serial_lines().values():
+    _d = getattr(_ln, "device", None)
+    if _d is not None and hasattr(_d, "mode"):
+        _d.mode = gps_mode
+        _d._cycle_counter = 0
+print(f"ublox mode forced to {gps_mode!r}")
+
 # Also tally raw UART5 GPS bytes via the drain/inject hooks (ground truth).
 u5 = bus.model_for_name("UART5")
 gps = {"tx": 0, "rx": 0}
