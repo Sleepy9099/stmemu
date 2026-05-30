@@ -46,6 +46,16 @@ apply_board_config(load_board_config(ROOT / "test/arducopter_with_bl.yaml"), bus
 emu.import_snapshot(str(ROOT / "test/snap_insinit.snap"), name="ins_init")
 emu.load_snapshot("ins_init")
 
+# The snapshot restores the ublox to whatever mode it had at capture (often a
+# silent UBX-only state), so force it to stream NMEA+UBX -- otherwise the
+# firmware never receives anything and rx stays 0 (the snapshot-overrides-mode
+# trap; same fix as diag_gps_verify.py).
+for _ln in bus.serial_lines().values():
+    _d = getattr(_ln, "device", None)
+    if _d is not None and hasattr(_d, "mode"):
+        _d.mode = "both"
+        _d._cycle_counter = 0
+
 emu.add_pc_cpu_action("setreg", pc=0x0806232C, reg="r3", value=200, once=True)
 emu.add_pc_cpu_action("ret", pc=0x08062044, once=False)
 emu.add_pc_cpu_action("ret", pc=0x08070BE4, once=False)
@@ -76,11 +86,19 @@ while done < budget:
         print(">>> CAL EXITED"); emu.remove_breakpoint(b)
     elif b == SCHED_RUN and not switched:
         emu.set_active_throttle(ipus); switched = True; emu.remove_breakpoint(b)
-        print(f">>> MAIN LOOP @~{done} -> real-rate {ipus} instr/us", flush=True)
+        # The ublox streamed into the UART5 RX buffer during boot before the
+        # firmware read it; reset the counters (and the device tx buffer) so the
+        # snapshot is taken on FRESH main-loop GPS traffic, not boot backlog.
+        gps["rx"] = 0; gps["tx"] = 0
+        for _ln in bus.serial_lines().values():
+            _dv = getattr(_ln, "device", None)
+            if _dv is not None and hasattr(_dv, "_tx_buf"):
+                _dv._tx_buf.clear()
+        print(f">>> MAIN LOOP @~{done} -> real-rate {ipus} instr/us (counters reset)", flush=True)
     et = (emu.time.cycles - t0) / 1e6
     print(f"[{done:>9}] et=+{et:8.2f}s pc=0x{emu.pc:08X} tx={gps['tx']} rx={gps['rx']} "
           f"thr={'on' if switched else 'off'}", flush=True)
-    if not snapped and gps["rx"] >= rx_thresh:
+    if not snapped and switched and gps["rx"] >= rx_thresh:
         emu.save_snapshot("mainloop_gps")
         n = emu.export_snapshot("mainloop_gps", str(ROOT / "test/snap_mainloop_gps.snap"))
         snapped = True
